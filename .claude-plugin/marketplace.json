@@ -1,0 +1,16 @@
+{
+  "name": "crossforge",
+  "description": "Cross-vendor coding orchestration with isolated worktrees, deterministic verification, and explicit shipping.",
+  "owner": {
+    "name": "Sadiq Jaffer"
+  },
+  "plugins": [
+    {
+      "name": "crossforge",
+      "source": "./",
+      "description": "Claude architects while Codex and Grok build in isolated lanes; evidence decides.",
+      "version": "0.1.0",
+      "license": "MIT"
+    }
+  ]
+}
