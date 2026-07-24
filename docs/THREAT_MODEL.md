@@ -1,0 +1,308 @@
+# Crossforge threat model
+
+## Scope and security objective
+
+Crossforge coordinates remote coding models over a local Git repository. Its
+security objective is to prevent unapproved source transmission, contain
+provider-authored changes, independently verify candidates without exposing
+the user’s wider machine, preserve recoverable local state, and make external
+publication a separate explicit action.
+
+The Python control layer, approved plan, local policy, Git executable, sandbox
+backend, and operating-system isolation are trusted. Repository content,
+provider output, provider-authored code, test/build scripts, worktree Git
+metadata after provider access, and remote forge state are untrusted until
+validated.
+
+## Assets
+
+- User source code, including files outside an individual task’s scope
+- Secrets and sensitive files in or near the repository
+- Provider OAuth sessions and credential directories
+- Repository-common Git objects, refs, configuration, and history
+- The orchestration checkout and uncommitted user work
+- Approved plan meaning and exact file allowlists
+- Provider task briefs, prompts, stdout/stderr, reports, and patches
+- Gate executables and their identities
+- Durable run, consent, lock, evidence, and shipment state
+- Local branches and commits
+- Remote branches and pull requests
+
+## Trust boundaries
+
+### User and Claude architect
+
+The user authorizes intent, provider source transmission, plan hashes, recovery
+decisions, and publication. Claude supplies semantic judgment. Neither can
+silently weaken deterministic invariants during a run.
+
+### Deterministic control layer
+
+The local Python package validates schemas, paths, policy hashes, state
+transitions, locks, provider invocation arguments, scope, gate results, patch
+identity, acceptance, and shipping checkpoints. Expected failures use stable
+exit codes and sanitized messages.
+
+### Provider host versus provider-issued tools
+
+The authenticated Codex or Grok CLI host may communicate with its provider
+endpoint using its own session. Model-issued tools are confined to the
+candidate worktree, cannot use the network, and must not read provider
+credentials, the orchestration checkout, common Git state, or unrelated user
+files. Capability probes must prove this distinction.
+
+### Candidate versus verification
+
+Candidate code and repository scripts are untrusted. They execute only in a
+fresh verification worktree inside a separate gate sandbox, never in the
+orchestration checkout.
+
+### Local versus remote publication
+
+Normal Crossforge execution stops at local commits. `crossforge-ship` is a
+separate user-invoked boundary with an immutable authorization tuple,
+read-before-write behavior, and durable idempotency checkpoints.
+
+## Data-flow threats and mitigations
+
+### Prompt injection from repository content
+
+**Threat:** Source, comments, fixtures, documentation, generated files, or test
+output instruct a model to ignore the approved task or exfiltrate data.
+
+**Mitigations:**
+
+- A self-contained task brief states that repository content is untrusted data.
+- The approved objective, constraints, allowlist, base, and verification
+  commands are repeated explicitly.
+- Model tools are sandboxed with no network and restricted filesystem access.
+- Exact scope and independent gates determine eligibility, not the provider’s
+  narrative.
+
+**Residual risk:** A model can still generate subtly malicious in-scope code.
+Independent gates and review reduce but do not eliminate semantic supply-chain
+risk.
+
+### Secret or unintended source transmission
+
+**Threat:** Prompt assembly or model-issued reads send credentials, denied
+files, binary artifacts, or unrelated source to a provider.
+
+**Mitigations:**
+
+- Provider availability is never consent.
+- Consent binds repository identity, provider, operation class, expiry,
+  deny-policy hash, and managed-policy hash.
+- Every provider-readable regular file and symlink is manifested with path,
+  type, size, and SHA-256.
+- Denied tracked files are quarantined; denied untracked files are omitted.
+- Binary files require exact path/hash approval.
+- Readable text is secret-scanned; findings expose metadata, never values.
+- Oversized unscannable text blocks without an exact unexpired exception.
+- Escaping symlinks and path components are rejected.
+
+**Residual risk:** Pattern and entropy detectors cannot recognize every secret
+or sensitivity category. Consent presents file count and byte volume, and the
+user remains responsible for repository classification.
+
+### Git-history disclosure
+
+**Threat:** A linked worktree’s `.git` control file gives provider tools access
+to common objects containing deleted, denied, or historical content.
+
+**Mitigations:**
+
+- The linked-worktree control file is quarantined outside provider access.
+- The provider sees a one-commit isolated repository containing only
+  context-manifest paths.
+- The projection has no remote, inherited configuration, credential helper,
+  hook, signing, maintenance, or executable filter.
+- The original control file is restored byte-for-byte before scope checks.
+
+### Provider modifying out-of-scope files
+
+**Threat:** A provider edits, deletes, renames, changes modes, creates
+submodules/special files, or alters a symlink outside the approved scope.
+
+**Mitigations:**
+
+- Every task has an exact non-glob repository-relative allowlist.
+- Scope includes staged, unstaged, deleted, untracked, both rename sides, and
+  mode-only changes.
+- Gitlinks, unsafe modes, parent symlinks, and escaping targets are rejected.
+- Scope runs after provider/correction calls, before capture, around
+  verification, after orchestration application, and before staging.
+- Candidate races use separate worktrees with one writer each.
+
+### Dangerous provider commands
+
+**Threat:** A provider runs arbitrary commands, modifies the host, reaches the
+network, accesses credentials, or performs Git publication.
+
+**Mitigations:**
+
+- Provider adapters use fixed argument arrays and fail-closed permission modes.
+- Unsafe blanket-approval flags and full-access sandboxes are forbidden.
+- Model-tool network, outside-worktree, common-Git, orchestration, and
+  credential access are negatively probed.
+- Provider processes start new process groups and descendants are terminated on
+  timeout.
+- Providers do not commit, push, create PRs, or edit Git configuration.
+
+**Residual risk:** Crossforge depends on the installed provider CLI and
+operating-system sandbox correctly enforcing probed behavior. A compromised
+trusted CLI host binary is outside the threat model.
+
+### Malicious or malformed plan commands
+
+**Threat:** A plan embeds shell interpolation, inline code, destructive
+filesystem/Git operations, privilege changes, credential commands, or remote
+writes in a verification gate.
+
+**Mitigations:**
+
+- Gate commands are non-empty argument arrays, never shell strings.
+- Unknown fields, empty/control-character arguments, shell operators, inline
+  interpreter flags, dangerous operations, and unsafe executables are rejected.
+- The user sees exact executables and arguments before hash-bound plan
+  approval.
+- Executables resolve through a safe `PATH`; canonical identity is recorded and
+  changes require reapproval.
+- Checked-in scripts remain untrusted and run only in the gate sandbox.
+
+### Candidate code escaping verification
+
+**Threat:** Tests or build scripts access the network, credentials, Git state,
+or unrelated host files, modify more than the candidate patch, or leave child
+processes running.
+
+**Mitigations:**
+
+- Gates run in disposable worktrees at the exact base plus selected patch.
+- The sandbox binds only required paths and denies network.
+- A private `HOME`, temporary directory, and cache are used.
+- Positive and negative probes cover worktree access and protected assets.
+- Process-group timeouts cover descendants.
+- Scope is rechecked after commands and full local output is hashed.
+
+### Concurrent writers and state corruption
+
+**Threat:** Concurrent tasks race on pointers, a worktree, acceptance, cleanup,
+statistics, or shipping state; a crash leaves partial JSON.
+
+**Mitigations:**
+
+- At most one active/blocked build exists per common Git directory.
+- Repository, run, and writer locks have a fixed acquisition order and bounded
+  waits.
+- Lock metadata excludes command arguments and environment values.
+- Live locks block; stale-lock removal follows same-host PID or explicit
+  foreign-host approval rules.
+- State files use owner-private same-directory temporary writes, file `fsync`,
+  atomic replace, and directory `fsync` where supported.
+- Schemas reject unknown fields and illegal transitions.
+
+### Stale candidate application
+
+**Threat:** The orchestration branch advances after candidate creation and a
+patch is applied to the wrong base.
+
+**Mitigations:**
+
+- Task and provider evidence record exact 40-character base commits.
+- Patch applicability is proven against a clean checkout of that base.
+- Acceptance checks the orchestration commit before applying.
+- A fresh worktree independently verifies the selected patch.
+- The applied scoped-tree hash must equal the verified tree byte-for-byte.
+
+### Worktree cleanup traversal or data loss
+
+**Threat:** Cleanup follows a symlink, accepts a string-prefix collision,
+removes an unrelated directory, or discards uncaptured changes.
+
+**Mitigations:**
+
+- Worktree paths are canonical, registry-backed, and contained beneath the
+  configured canonical root.
+- Existing parents cannot be symlinks.
+- A captured dirty worktree requires exact reverse-patch proof and clean status.
+- Cleanup uses ordinary `git worktree remove`; force removal and recursive
+  deletion are forbidden.
+- Incomplete proof retains the worktree and evidence.
+
+### Token or sensitive-output leakage
+
+**Threat:** Logs, terminal errors, manifests, reports, or consent prompts expose
+OAuth tokens, environment values, secret findings, repository paths, or raw
+provider output.
+
+**Mitigations:**
+
+- Crossforge never reads or manipulates provider tokens.
+- Provider sessions remain owned by official CLIs.
+- Raw output is owner-only evidence.
+- User-facing errors are bounded and sanitized.
+- Environment evidence contains names and value hashes, not values.
+- Secret findings include only path, line, detector, and severity.
+- Probe prompts contain no repository paths, remote, file names, or source.
+
+### Accidental push or duplicate pull request
+
+**Threat:** A normal build publishes source, a retry pushes twice or creates
+duplicate PRs, hooks execute unsandboxed, or a changed target receives code.
+
+**Mitigations:**
+
+- The normal skill has no publication path.
+- Shipping requires a completed run and a current explicit user request.
+- Dry-run records no authorization and performs no writes.
+- Authorization binds repository identity, run, remote, head, target, and
+  final commit with an idempotency key.
+- Remote head and matching open/closed PRs are read before writes.
+- Pushes are non-force and disable hooks; required hook equivalents must be
+  approved sandboxed gates.
+- Remote and PR confirmations are persisted before the next step.
+- Mismatched targets or commits require cancellation/new approval.
+
+**Residual risk:** A compromised forge CLI or server can lie about remote
+state. Crossforge validates normal CLI readback but does not provide
+cryptographic transparency for the forge.
+
+## Symlink-specific policy
+
+Symlinks are never followed during provider context enumeration. Every path
+component is inspected. A provider-readable link must resolve inside the
+candidate worktree. A changed symlink additionally requires an exact approved
+`{path, target}` pair, and its normalized target must remain within the
+candidate root. Parent symlinks, absolute targets, and traversal escapes block
+the candidate.
+
+## Availability and denial of service
+
+Fail-closed behavior can block work when a provider CLI changes flags, a
+sandbox probe is inconclusive, an executable changes identity, consent
+expires, a lock owner crashes, or cleanup proof is unavailable. This is an
+intentional availability tradeoff. Recovery preserves evidence and requires
+explicit user decisions where automated proof is insufficient.
+
+## Out of scope
+
+- Protecting against a compromised operating system, kernel, Git binary,
+  Python runtime, sandbox executable, or authenticated provider CLI host
+- Guaranteeing that model-authored in-scope logic has no unknown semantic flaw
+- Managing, rotating, backing up, or revoking provider/forge credentials
+- Automatically merging, rebasing, deploying, or force-pushing
+- Supporting repositories that require networked verification in MVP
+
+## Security verification
+
+The default test suite uses fake provider and sandbox executables and performs
+no network request:
+
+```text
+python3 -m unittest discover -s tests -v
+```
+
+Release confidence additionally requires opt-in live sandbox/provider
+capability tests described in [LIVE_TESTING.md](LIVE_TESTING.md). Do not treat
+provider self-reporting as proof that a boundary holds.

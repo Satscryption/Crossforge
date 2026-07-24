@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "TR1",
+      "prompt": "Use Crossforge to have Codex and Grok independently implement this parser, compare both with the fixture suite, and keep the winner.",
+      "shouldTrigger": true,
+      "reason": "The user explicitly requests Crossforge and competing external implementation lanes."
+    },
+    {
+      "id": "TR2",
+      "prompt": "Let Claude design the API, delegate the implementation to Codex, and ask Grok to perform an independent code review.",
+      "shouldTrigger": true,
+      "reason": "This is the core Claude-architect, external-writer, cross-vendor-review workflow."
+    },
+    {
+      "id": "TR3",
+      "prompt": "Resume my active Crossforge build from its last durable task.",
+      "shouldTrigger": true,
+      "reason": "The Crossforge skill owns recovery of an active durable run."
+    },
+    {
+      "id": "TR4",
+      "prompt": "Use Crossforge review mode for an independent Codex and Grok review of the current branch, with no edits.",
+      "shouldTrigger": true,
+      "reason": "The request explicitly asks for Crossforge cross-vendor repository review."
+    },
+    {
+      "id": "TR5",
+      "prompt": "Execute this approved six-task plan with Crossforge, committing each verified task locally.",
+      "shouldTrigger": true,
+      "reason": "Crossforge is requested to execute an approved multi-task implementation plan."
+    },
+    {
+      "id": "TR6",
+      "prompt": "Use Crossforge for this one-line typo fix and do not push it.",
+      "shouldTrigger": true,
+      "reason": "Although trivial, the user explicitly requests Crossforge, which overrides the usual trivial-task exclusion."
+    },
+    {
+      "id": "TR7",
+      "prompt": "Race Codex and Grok on the locking bug in isolated worktrees and let Claude select only after the concurrency tests pass.",
+      "shouldTrigger": true,
+      "reason": "The user requests multi-provider candidate isolation and evidence-based selection."
+    },
+    {
+      "id": "TR8",
+      "prompt": "Plan a high-risk database migration with Claude, obtain independent critiques from Codex and Grok, then implement the approved tasks.",
+      "shouldTrigger": true,
+      "reason": "The request combines high-risk planning, independent model critiques, and implementation."
+    },
+    {
+      "id": "TR9",
+      "prompt": "Show me the status and blockers for the currently active Crossforge run without probing providers.",
+      "shouldTrigger": true,
+      "reason": "Read-only status of a Crossforge run is a Crossforge mode."
+    },
+    {
+      "id": "TR10",
+      "prompt": "Use Crossforge to produce a canonical implementation plan for this feature, but stop before creating a build branch.",
+      "shouldTrigger": true,
+      "reason": "The request explicitly selects Crossforge plan mode."
+    },
+    {
+      "id": "TR11",
+      "prompt": "Change the button label from Save to Done in this component.",
+      "shouldTrigger": false,
+      "reason": "This is a trivial one-step edit with no explicit Crossforge or multi-model request."
+    },
+    {
+      "id": "TR12",
+      "prompt": "Which is better for Python work right now: Claude, Codex, or Grok?",
+      "shouldTrigger": false,
+      "reason": "The user asks for model advice, not repository orchestration."
+    },
+    {
+      "id": "TR13",
+      "prompt": "Install the Codex CLI and help me log in.",
+      "shouldTrigger": false,
+      "reason": "Provider installation and authentication are setup tasks, not Crossforge execution."
+    },
+    {
+      "id": "TR14",
+      "prompt": "Review this paragraph from my product announcement and improve its tone.",
+      "shouldTrigger": false,
+      "reason": "The request is prose editing rather than repository code review."
+    },
+    {
+      "id": "TR15",
+      "prompt": "Explain what the existing calculate_total function does.",
+      "shouldTrigger": false,
+      "reason": "A read-only explanation by Claude does not require multi-model orchestration."
+    },
+    {
+      "id": "TR16",
+      "prompt": "Draft an implementation plan for adding dark mode.",
+      "shouldTrigger": false,
+      "reason": "Ordinary planning without Crossforge, external providers, or execution should remain a normal Claude task."
+    },
+    {
+      "id": "TR17",
+      "prompt": "Run git status and tell me which files are modified.",
+      "shouldTrigger": false,
+      "reason": "A basic Git inspection is not a Crossforge run."
+    },
+    {
+      "id": "TR18",
+      "prompt": "Review my pull request for correctness and leave the code unchanged.",
+      "shouldTrigger": false,
+      "reason": "This asks for a normal single-model code review and does not request independent cross-vendor review."
+    },
+    {
+      "id": "TR19",
+      "prompt": "Ask Grok to write a funny poem about merge conflicts.",
+      "shouldTrigger": false,
+      "reason": "The named model is requested for non-repository creative writing."
+    },
+    {
+      "id": "TR20",
+      "prompt": "Compare the subscription prices and context windows of Claude, Codex, and Grok.",
+      "shouldTrigger": false,
+      "reason": "This is product research, not a request to plan, implement, or review repository work."
+    }
+  ]
+}

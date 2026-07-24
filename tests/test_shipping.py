@@ -1,0 +1,482 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = PACKAGE_ROOT / "skills" / "crossforge" / "scripts"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+sys.path.insert(0, str(SCRIPTS))
+
+from crossforge_lib.errors import PreconditionError, StateInconsistencyError  # noqa: E402
+from crossforge_lib.git import discover_repository, resolve_commit  # noqa: E402
+from crossforge_lib.shipping import (  # noqa: E402
+    CommandResult,
+    FinalGateEvidence,
+    PullRequestReadback,
+    RemoteReadback,
+    authorize_shipment,
+    cancel_shipment,
+    reconcile_pull_request,
+    reconcile_push,
+    record_shipment,
+    ship_preflight,
+)
+from crossforge_lib.util import canonical_json_bytes  # noqa: E402
+
+RUN_ID = "20260724T120000Z-1234abcd"
+KEY = "0123456789abcdef0123456789abcdef"
+
+
+class FakeStore:
+    def __init__(self, root: Path, run: dict[str, Any], tasks: dict[str, Any]) -> None:
+        self.root = root
+        self.runs_dir = root / "runs"
+        self.runs_dir.mkdir(parents=True)
+        self._run = run
+        self._tasks = tasks
+        self.mark_calls = 0
+        (self.runs_dir / RUN_ID).mkdir()
+
+    def run_dir(self, run_id: str) -> Path:
+        self.assert_run(run_id)
+        return self.runs_dir / run_id
+
+    def assert_run(self, run_id: str) -> None:
+        if run_id != RUN_ID:
+            raise AssertionError(run_id)
+
+    def load_run(self, run_id: str) -> dict[str, Any]:
+        self.assert_run(run_id)
+        return dict(self._run)
+
+    def load_tasks(self, run_id: str) -> dict[str, Any]:
+        self.assert_run(run_id)
+        return {"schemaVersion": 1, "tasks": [dict(item) for item in self._tasks["tasks"]]}
+
+    def latest_complete_run_id(self) -> str:
+        return RUN_ID
+
+    def mark_shipped(self, run_id: str) -> dict[str, Any]:
+        self.assert_run(run_id)
+        self.mark_calls += 1
+        self._run["status"] = "shipped"
+        return dict(self._run)
+
+
+class FakeRemote:
+    def __init__(self, *, head: str | None = None, target_ok: bool = True) -> None:
+        self.head = head
+        self.target = "b" * 40
+        self.target_ok = target_ok
+        self.push_calls = 0
+        self.argv: list[tuple[str, ...]] = []
+
+    def inspect(
+        self, remote: str, head: str, target: str, final: str
+    ) -> RemoteReadback:
+        return RemoteReadback(
+            head_commit=self.head,
+            target_commit=self.target,
+            head_is_ancestor=(self.head is None or self.head == final),
+            target_is_ancestor=self.target_ok,
+        )
+
+    def runner(
+        self, argv: Sequence[str], *, cwd: Path, input_text: str | None = None
+    ) -> CommandResult:
+        values = tuple(argv)
+        self.argv.append(values)
+        if "push" not in values:
+            return CommandResult(values, 2, "", "unexpected")
+        self.push_calls += 1
+        destination = values[-1]
+        self.head = destination.split(":", 1)[0]
+        return CommandResult(values, 0, "", "")
+
+
+class ShippingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo_path = self.root / "repo"
+        self.repo_path.mkdir()
+        self._git("init", "-b", "crossforge/test")
+        self._git("config", "user.name", "Test")
+        self._git("config", "user.email", "test@example.invalid")
+        (self.repo_path / "file.txt").write_text("content\n", encoding="utf-8")
+        self._git("add", "file.txt")
+        self._git("commit", "-m", "test")
+        self._git(
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/crossforge-test.git",
+        )
+        self.repository = discover_repository(self.repo_path)
+        self.commit = resolve_commit(self.repository)
+        self.run = {
+            "runId": RUN_ID,
+            "mode": "build",
+            "status": "complete",
+            "repositoryIdentity": "a" * 64,
+            "branch": "crossforge/test",
+            "targetRemote": "origin",
+            "targetBranch": "main",
+            "currentCommit": self.commit,
+            "planSha256": "d" * 64,
+            "globalVerificationCommands": [
+                {"argv": ["python3", "-m", "unittest"], "timeoutSeconds": 900}
+            ],
+            "gateSandbox": {
+                "backend": "bwrap",
+                "network": "deny",
+                "probeVersion": "1",
+            },
+            "activeTaskId": None,
+            "blockedReason": None,
+        }
+        self.tasks = {
+            "schemaVersion": 1,
+            "tasks": [{"id": "T1", "status": "complete"}],
+        }
+        self.store = FakeStore(self.root / "state", self.run, self.tasks)
+        self.remote = FakeRemote()
+        self.gh_state = self.root / "gh.json"
+        self.fake_gh = self.root / "gh"
+        self.gh_argv: list[tuple[str, ...]] = []
+        shutil.copyfile(FIXTURES / "fake_gh.py", self.fake_gh)
+        self.fake_gh.chmod(self.fake_gh.stat().st_mode | stat.S_IXUSR)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _git(self, *args: str) -> None:
+        subprocess.run(
+            ("git", *args),
+            cwd=self.repo_path,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _plan(self, *, dry_run: bool = False):
+        return ship_preflight(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            remote=None,
+            target_branch=None,
+            publication_requested=True,
+            dry_run=dry_run,
+            final_gate=self._gate_evidence,
+            inspect_remote=self.remote.inspect,
+        )
+
+    @staticmethod
+    def _digest(value: object) -> str:
+        return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+    def _gate_evidence(self, run: Mapping[str, Any]) -> FinalGateEvidence:
+        return FinalGateEvidence(
+            run_id=str(run["runId"]),
+            final_commit=str(run["currentCommit"]),
+            plan_sha256=str(run["planSha256"]),
+            global_commands_sha256=self._digest(run["globalVerificationCommands"]),
+            gate_policy_sha256=self._digest(run["gateSandbox"]),
+            sandbox_policy_sha256="e" * 64,
+            result_sha256="f" * 64,
+            provenance="independent",
+            passed=True,
+        )
+
+    def _gh_runner(
+        self, argv: Sequence[str], *, cwd: Path, input_text: str | None = None
+    ) -> CommandResult:
+        self.gh_argv.append(tuple(argv))
+        env = dict(os.environ)
+        env["FAKE_GH_STATE"] = str(self.gh_state)
+        env["FAKE_GH_HEAD_COMMIT"] = self.commit
+        result = subprocess.run(
+            tuple(argv),
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        return CommandResult(tuple(argv), result.returncode, result.stdout, result.stderr)
+
+    def _gh_data(self) -> dict[str, Any]:
+        return json.loads(self.gh_state.read_text(encoding="utf-8"))
+
+    def test_incomplete_run_and_dirty_repository_are_rejected(self) -> None:
+        self.store._run["status"] = "active"
+        with self.assertRaisesRegex(PreconditionError, "completed"):
+            self._plan()
+        self.store._run["status"] = "complete"
+        (self.repo_path / "dirty.txt").write_text("dirty", encoding="utf-8")
+        with self.assertRaisesRegex(PreconditionError, "clean"):
+            self._plan()
+
+    def test_explicit_publication_and_target_change_are_required(self) -> None:
+        with self.assertRaisesRegex(PreconditionError, "authorize publication"):
+            ship_preflight(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                remote=None,
+                target_branch=None,
+                publication_requested=False,
+                dry_run=False,
+                final_gate=self._gate_evidence,
+                inspect_remote=self.remote.inspect,
+            )
+        with self.assertRaisesRegex(PreconditionError, "explicit approval"):
+            ship_preflight(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                remote="upstream",
+                target_branch="release",
+                publication_requested=True,
+                dry_run=False,
+                final_gate=self._gate_evidence,
+                inspect_remote=self.remote.inspect,
+            )
+
+    def test_dry_run_performs_no_authorization_or_write(self) -> None:
+        plan = self._plan(dry_run=True)
+        self.assertTrue(plan.dry_run)
+        self.assertFalse((self.store.run_dir(RUN_ID) / "shipment.json").exists())
+        self.assertEqual(self.remote.push_calls, 0)
+        with self.assertRaisesRegex(PreconditionError, "dry-run"):
+            authorize_shipment(
+                self.store,  # type: ignore[arg-type]
+                plan,
+                idempotency_key=KEY,
+                publication_requested=True,
+            )
+
+    def test_remote_and_target_divergence_block(self) -> None:
+        self.remote.head = "c" * 40
+        with self.assertRaisesRegex(PreconditionError, "diverged"):
+            self._plan()
+        self.remote.head = None
+        self.remote.target_ok = False
+        with self.assertRaisesRegex(PreconditionError, "target branch"):
+            self._plan()
+
+    def test_authorization_tuple_is_immutable_and_idempotent(self) -> None:
+        plan = self._plan()
+        first = authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            plan,
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        second = authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            plan,
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        self.assertEqual(first, second)
+        with self.assertRaises(StateInconsistencyError):
+            authorize_shipment(
+                self.store,  # type: ignore[arg-type]
+                plan,
+                idempotency_key="f" * 32,
+                publication_requested=True,
+            )
+
+    def test_push_and_pr_retries_do_not_duplicate_writes(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        pushed = reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            runner=self.remote.runner,
+        )
+        self.assertEqual(pushed["push"]["result"], "performed")
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            runner=self.remote.runner,
+        )
+        self.assertEqual(self.remote.push_calls, 1)
+        self.assertTrue(all("--force" not in item for argv in self.remote.argv for item in argv))
+        created = reconcile_pull_request(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            title="Crossforge run",
+            body="Evidence",
+            draft=True,
+            gh_executable=str(self.fake_gh),
+            runner=self._gh_runner,
+        )
+        self.assertEqual(created["pullRequest"]["result"], "created")
+        reconcile_pull_request(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            title="Crossforge run",
+            body="Evidence",
+            draft=True,
+            gh_executable=str(self.fake_gh),
+            runner=self._gh_runner,
+        )
+        self.assertEqual(self._gh_data()["createCalls"], 1)
+        gh_commands = [argv for argv in self.gh_argv if str(self.fake_gh) in argv]
+        self.assertTrue(gh_commands)
+        for argv in gh_commands:
+            self.assertIn("--repo", argv)
+            self.assertEqual(argv[argv.index("--repo") + 1], "example/crossforge-test")
+        completed = record_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            push_only=False,
+            gh_executable=str(self.fake_gh),
+            runner=self._gh_runner,
+        )
+        self.assertEqual(completed["status"], "recorded")
+        self.assertEqual(self.store.mark_calls, 1)
+
+    def test_existing_remote_and_pr_are_discovered(self) -> None:
+        self.remote.head = self.commit
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        pushed = reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            runner=self.remote.runner,
+        )
+        self.assertEqual(pushed["push"]["result"], "discovered")
+        self.gh_state.write_text(
+            json.dumps(
+                {
+                    "createCalls": 0,
+                    "listCalls": 0,
+                    "prs": [
+                        {
+                            "number": 7,
+                            "url": "https://example.invalid/pull/7",
+                            "state": "CLOSED",
+                            "headRefName": "crossforge/test",
+                            "baseRefName": "main",
+                            "headRefOid": self.commit,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        pr = reconcile_pull_request(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            title="ignored",
+            body="ignored",
+            draft=False,
+            gh_executable=str(self.fake_gh),
+            runner=self._gh_runner,
+        )
+        self.assertEqual(pr["pullRequest"]["result"], "discovered")
+        self.assertEqual(self._gh_data()["createCalls"], 0)
+
+    def test_cancellation_only_before_remote_write(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        self.assertTrue(
+            cancel_shipment(
+                self.store,  # type: ignore[arg-type]
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                inspect_pull_requests=lambda _shipment: (),
+            )
+        )
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            runner=self.remote.runner,
+        )
+        with self.assertRaisesRegex(PreconditionError, "cannot be cancelled"):
+            cancel_shipment(
+                self.store,  # type: ignore[arg-type]
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                inspect_pull_requests=lambda _shipment: (),
+            )
+
+    def test_final_gate_must_return_exact_commit_and_policy_bound_evidence(self) -> None:
+        with self.assertRaisesRegex(PreconditionError, "invalid evidence"):
+            ship_preflight(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                remote=None,
+                target_branch=None,
+                publication_requested=True,
+                dry_run=False,
+                final_gate=lambda _run: True,  # type: ignore[return-value]
+                inspect_remote=self.remote.inspect,
+            )
+        evidence = self._gate_evidence(self.run)
+        forged = replace(evidence, final_commit="0" * 40)
+        with self.assertRaisesRegex(StateInconsistencyError, "not bound"):
+            ship_preflight(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                remote=None,
+                target_branch=None,
+                publication_requested=True,
+                dry_run=False,
+                final_gate=lambda _run: forged,
+                inspect_remote=self.remote.inspect,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

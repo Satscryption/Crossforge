@@ -1,0 +1,23 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environments
+.venv/
+venv/
+
+# Editor and operating-system files
+.DS_Store
+*.swp
+
+# Crossforge's repository-common runtime state
+.crossforge/
