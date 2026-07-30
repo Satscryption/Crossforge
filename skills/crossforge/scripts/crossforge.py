@@ -114,10 +114,13 @@ from crossforge_lib.shipping import (
     cancel_shipment,
     default_command_runner,
     inspect_pull_requests,
+    load_pull_request_body,
     reconcile_pull_request,
     reconcile_push,
     record_shipment,
+    resolve_forge_executable,
     ship_preflight,
+    validate_publication_text,
 )
 from crossforge_lib.state import StateStore, validate_tasks_record
 from crossforge_lib.util import (
@@ -160,6 +163,8 @@ COMMANDS = (
     "complete-run",
     "abandon-run",
     "cleanup",
+)
+SHIPPING_COMMANDS = (
     "ship-preflight",
     "authorize-shipment",
     "cancel-shipment",
@@ -453,8 +458,11 @@ def _final_gate_executor(
                 "completed run has no canonical global verification commands"
             )
         config = load_config()
+        gate_attempt = random_secrets.token_hex(8)
         evidence = EvidenceStore(
-            store.run_dir(str(run["runId"])) / "evidence" / "shipping-final-gate"
+            store.run_dir(str(run["runId"]))
+            / "evidence"
+            / f"shipping-final-gate-{gate_attempt}"
         )
         registry = evidence.independent_path("worktrees.json")
         worktree_root = (
@@ -469,7 +477,7 @@ def _final_gate_executor(
         )
         entry = manager.create(
             run_id=str(run["runId"]),
-            task_id="final-gate",
+            task_id=f"final-gate-{gate_attempt}",
             provider="shipping-verification",
             base_commit=str(run["currentCommit"]),
             evidence_dir=evidence.independent_path("worktree"),
@@ -2359,9 +2367,10 @@ def _cmd_ship_preflight(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_authorize_shipment(args: argparse.Namespace) -> CommandOutput:
-    _repository_value, store, plan = _shipping_preflight(args, dry_run=False)
+    repository, store, plan = _shipping_preflight(args, dry_run=False)
     value = authorize_shipment(
         store,
+        repository,
         plan,
         idempotency_key=args.idempotency_key or random_secrets.token_hex(16),
         publication_requested=args.publication_requested,
@@ -2371,14 +2380,16 @@ def _cmd_authorize_shipment(args: argparse.Namespace) -> CommandOutput:
 
 def _cmd_cancel_shipment(args: argparse.Namespace) -> CommandOutput:
     repository = _repository(args)
+    forge_identity = resolve_forge_executable()
     cancelled = cancel_shipment(
         _store(args, repository),
+        repository,
         run_id=args.run_id,
         inspect_remote=_remote_readback(repository),
         inspect_pull_requests=lambda shipment: inspect_pull_requests(
             shipment,
             repository=repository,
-            gh_executable=args.gh_executable,
+            forge_identity=forge_identity,
         ),
     )
     return CommandOutput(
@@ -2391,23 +2402,51 @@ def _cmd_record_shipment(args: argparse.Namespace) -> CommandOutput:
     repository = _repository(args)
     store = _store(args, repository)
     inspect_remote = _remote_readback(repository)
+    if not args.publication_requested:
+        raise PreconditionError("current user request does not authorize publication")
+    body: str | None = None
+    forge_identity = None
+    if not args.push_only:
+        if not args.body_file:
+            raise InvalidInputError("--body-file is required unless --push-only is used")
+        config = load_config()
+        body_root = ensure_private_directory(
+            store.run_dir(args.run_id) / "evidence" / "shipping"
+        )
+        body = load_pull_request_body(
+            args.body_file,
+            repository=repository,
+            deny_paths=config.deny_paths,
+            allowed_root=body_root,
+        )
+        validate_publication_text(args.title, label="pull-request title")
+        forge_identity = resolve_forge_executable()
+    final_gate = _final_gate_executor(repository, store)
     reconcile_push(
         store,
         repository,
         run_id=args.run_id,
         inspect_remote=inspect_remote,
+        publication_requested=args.publication_requested,
+        final_gate=final_gate,
+        push_only=args.push_only,
+        title=None if args.push_only else args.title,
+        body=body,
+        draft=None if args.push_only else args.draft,
+        forge_identity=forge_identity,
     )
     if not args.push_only:
-        if not args.body_file:
-            raise InvalidInputError("--body-file is required unless --push-only is used")
+        assert body is not None and forge_identity is not None
         reconcile_pull_request(
             store,
             repository,
             run_id=args.run_id,
             title=args.title,
-            body=Path(args.body_file).read_text(encoding="utf-8"),
+            body=body,
             draft=args.draft,
-            gh_executable=args.gh_executable,
+            publication_requested=args.publication_requested,
+            final_gate=final_gate,
+            forge_identity=forge_identity,
         )
     value = record_shipment(
         store,
@@ -2415,7 +2454,8 @@ def _cmd_record_shipment(args: argparse.Namespace) -> CommandOutput:
         run_id=args.run_id,
         inspect_remote=inspect_remote,
         push_only=args.push_only,
-        gh_executable=args.gh_executable,
+        publication_requested=args.publication_requested,
+        forge_identity=forge_identity,
     )
     return CommandOutput("Shipment recorded", value)
 
@@ -2669,28 +2709,6 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--evidence-durable", action="store_true")
     item.add_argument("--retain", action="store_true")
 
-    item = command("ship-preflight", "perform shipping read-only preflight")
-    _add_shipping_target(item)
-    item.add_argument("--dry-run", action="store_true")
-
-    item = command("authorize-shipment", "durably authorize an exact shipment tuple")
-    _add_shipping_target(item)
-    item.add_argument("--idempotency-key")
-
-    item = command("cancel-shipment", "cancel authorization only before external writes")
-    _add_state(item, repository=True)
-    item.add_argument("--run-id", required=True)
-    item.add_argument("--gh-executable", default="gh")
-
-    item = command("record-shipment", "reconcile push/PR and record shipment completion")
-    _add_state(item, repository=True)
-    item.add_argument("--run-id", required=True)
-    item.add_argument("--push-only", action="store_true")
-    item.add_argument("--title", default="Crossforge build")
-    item.add_argument("--body-file")
-    item.add_argument("--draft", action="store_true")
-    item.add_argument("--gh-executable", default="gh")
-
     handlers = {
         "version": _cmd_version,
         "config": _cmd_config,
@@ -2717,13 +2735,66 @@ def build_parser() -> argparse.ArgumentParser:
         "complete-run": _cmd_complete_run,
         "abandon-run": _cmd_abandon_run,
         "cleanup": _cmd_cleanup,
+    }
+    if tuple(handlers) != COMMANDS:
+        raise RuntimeError("CLI handler registry does not match required command order")
+    for name, handler in handlers.items():
+        subparsers.choices[name].set_defaults(handler=handler)
+    return parser
+
+
+def build_shipping_parser() -> argparse.ArgumentParser:
+    """Build the user-invoked publication surface, disjoint from the main CLI."""
+
+    parser = CrossforgeArgumentParser(
+        prog="crossforge_ship.py",
+        description="Crossforge explicit shipping control layer",
+    )
+    parser.add_argument("--json", action="store_true", help="emit only machine-readable JSON")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=CrossforgeArgumentParser,
+    )
+
+    def command(name: str, help_text: str) -> argparse.ArgumentParser:
+        result = subparsers.add_parser(name, help=help_text, description=help_text)
+        _add_json_option(result)
+        return result
+
+    item = command("ship-preflight", "perform shipping read-only preflight")
+    _add_shipping_target(item)
+    item.add_argument("--dry-run", action="store_true")
+
+    item = command("authorize-shipment", "durably authorize an exact shipment tuple")
+    _add_shipping_target(item)
+    item.add_argument("--idempotency-key")
+
+    item = command("cancel-shipment", "cancel authorization only before external writes")
+    _add_state(item, repository=True)
+    item.add_argument("--run-id", required=True)
+
+    item = command("record-shipment", "reconcile push/PR and record shipment completion")
+    _add_state(item, repository=True)
+    item.add_argument("--run-id", required=True)
+    item.add_argument(
+        "--publication-requested",
+        action="store_true",
+        help="assert that the current user request explicitly authorizes publication",
+    )
+    item.add_argument("--push-only", action="store_true")
+    item.add_argument("--title", default="Crossforge build")
+    item.add_argument("--body-file")
+    item.add_argument("--draft", action="store_true")
+
+    handlers = {
         "ship-preflight": _cmd_ship_preflight,
         "authorize-shipment": _cmd_authorize_shipment,
         "cancel-shipment": _cmd_cancel_shipment,
         "record-shipment": _cmd_record_shipment,
     }
-    if tuple(handlers) != COMMANDS:
-        raise RuntimeError("CLI handler registry does not match required command order")
+    if tuple(handlers) != SHIPPING_COMMANDS:
+        raise RuntimeError("shipping CLI handler registry is invalid")
     for name, handler in handlers.items():
         subparsers.choices[name].set_defaults(handler=handler)
     return parser
@@ -2749,6 +2820,17 @@ def _emit_error(error: CrossforgeError, *, use_json: bool) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
+    return _run_parser(parser, argv)
+
+
+def shipping_main(argv: Sequence[str] | None = None) -> int:
+    parser = build_shipping_parser()
+    return _run_parser(parser, argv)
+
+
+def _run_parser(
+    parser: argparse.ArgumentParser, argv: Sequence[str] | None
+) -> int:
     arguments = parser.parse_args(argv)
     use_json = bool(getattr(arguments, "json", False))
     try:

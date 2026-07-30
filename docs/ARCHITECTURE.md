@@ -21,10 +21,12 @@ User
       -> push/PR
 ```
 
-The normal skill and shipping skill are deliberately separate authorization
-surfaces. The normal skill may create local branches and commits but cannot
-publish them. The shipping skill requires a current explicit publication
-request, a completed build, and remote readback.
+The normal skill and user-invoked shipping skill use disjoint CLI surfaces.
+Skill-scoped host hooks allow each skill to call only its own deterministic
+entry point. The normal skill may create local branches and commits but cannot
+reach the supported publication surface. The shipping skill requires current
+publication intent, an unexpired authorization, a completed build, a fresh
+final gate, a URL-bound remote, and remote readback.
 
 ## Judgment and enforcement
 

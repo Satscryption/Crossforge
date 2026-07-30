@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -18,8 +19,17 @@ SCRIPTS = PACKAGE_ROOT / "skills" / "crossforge" / "scripts"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(SCRIPTS))
 
-from crossforge_lib.errors import PreconditionError, StateInconsistencyError  # noqa: E402
-from crossforge_lib.git import discover_repository, resolve_commit  # noqa: E402
+from crossforge_lib.errors import (  # noqa: E402
+    PreconditionError,
+    SecretPolicyError,
+    StateInconsistencyError,
+)
+from crossforge_lib.gates import executable_identity  # noqa: E402
+from crossforge_lib.git import (  # noqa: E402
+    discover_repository,
+    repository_identity,
+    resolve_commit,
+)
 from crossforge_lib.shipping import (  # noqa: E402
     CommandResult,
     FinalGateEvidence,
@@ -27,6 +37,7 @@ from crossforge_lib.shipping import (  # noqa: E402
     RemoteReadback,
     authorize_shipment,
     cancel_shipment,
+    load_pull_request_body,
     reconcile_pull_request,
     reconcile_push,
     record_shipment,
@@ -97,6 +108,16 @@ class FakeRemote:
     ) -> CommandResult:
         values = tuple(argv)
         self.argv.append(values)
+        if ("remote" in values and "get-url" in values) or "config" in values:
+            result = subprocess.run(
+                values,
+                cwd=cwd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            return CommandResult(values, result.returncode, result.stdout, result.stderr)
         if "push" not in values:
             return CommandResult(values, 2, "", "unexpected")
         self.push_calls += 1
@@ -129,7 +150,7 @@ class ShippingTests(unittest.TestCase):
             "runId": RUN_ID,
             "mode": "build",
             "status": "complete",
-            "repositoryIdentity": "a" * 64,
+            "repositoryIdentity": repository_identity(self.repository),
             "branch": "crossforge/test",
             "targetRemote": "origin",
             "targetBranch": "main",
@@ -157,6 +178,7 @@ class ShippingTests(unittest.TestCase):
         self.gh_argv: list[tuple[str, ...]] = []
         shutil.copyfile(FIXTURES / "fake_gh.py", self.fake_gh)
         self.fake_gh.chmod(self.fake_gh.stat().st_mode | stat.S_IXUSR)
+        self.forge_identity = executable_identity(self.fake_gh)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -265,6 +287,7 @@ class ShippingTests(unittest.TestCase):
         with self.assertRaisesRegex(PreconditionError, "dry-run"):
             authorize_shipment(
                 self.store,  # type: ignore[arg-type]
+                self.repository,
                 plan,
                 idempotency_key=KEY,
                 publication_requested=True,
@@ -279,16 +302,23 @@ class ShippingTests(unittest.TestCase):
         with self.assertRaisesRegex(PreconditionError, "target branch"):
             self._plan()
 
+    def test_live_repository_identity_mismatch_blocks_preflight(self) -> None:
+        self.store._run["repositoryIdentity"] = "f" * 64
+        with self.assertRaisesRegex(StateInconsistencyError, "repository identity"):
+            self._plan()
+
     def test_authorization_tuple_is_immutable_and_idempotent(self) -> None:
         plan = self._plan()
         first = authorize_shipment(
             self.store,  # type: ignore[arg-type]
+            self.repository,
             plan,
             idempotency_key=KEY,
             publication_requested=True,
         )
         second = authorize_shipment(
             self.store,  # type: ignore[arg-type]
+            self.repository,
             plan,
             idempotency_key=KEY,
             publication_requested=True,
@@ -297,6 +327,7 @@ class ShippingTests(unittest.TestCase):
         with self.assertRaises(StateInconsistencyError):
             authorize_shipment(
                 self.store,  # type: ignore[arg-type]
+                self.repository,
                 plan,
                 idempotency_key="f" * 32,
                 publication_requested=True,
@@ -305,6 +336,7 @@ class ShippingTests(unittest.TestCase):
     def test_push_and_pr_retries_do_not_duplicate_writes(self) -> None:
         authorize_shipment(
             self.store,  # type: ignore[arg-type]
+            self.repository,
             self._plan(),
             idempotency_key=KEY,
             publication_requested=True,
@@ -314,6 +346,13 @@ class ShippingTests(unittest.TestCase):
             self.repository,
             run_id=RUN_ID,
             inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="Crossforge run",
+            body="Evidence",
+            draft=True,
+            forge_identity=self.forge_identity,
             runner=self.remote.runner,
         )
         self.assertEqual(pushed["push"]["result"], "performed")
@@ -322,6 +361,13 @@ class ShippingTests(unittest.TestCase):
             self.repository,
             run_id=RUN_ID,
             inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="Crossforge run",
+            body="Evidence",
+            draft=True,
+            forge_identity=self.forge_identity,
             runner=self.remote.runner,
         )
         self.assertEqual(self.remote.push_calls, 1)
@@ -333,7 +379,9 @@ class ShippingTests(unittest.TestCase):
             title="Crossforge run",
             body="Evidence",
             draft=True,
-            gh_executable=str(self.fake_gh),
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            forge_identity=self.forge_identity,
             runner=self._gh_runner,
         )
         self.assertEqual(created["pullRequest"]["result"], "created")
@@ -344,11 +392,13 @@ class ShippingTests(unittest.TestCase):
             title="Crossforge run",
             body="Evidence",
             draft=True,
-            gh_executable=str(self.fake_gh),
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            forge_identity=self.forge_identity,
             runner=self._gh_runner,
         )
         self.assertEqual(self._gh_data()["createCalls"], 1)
-        gh_commands = [argv for argv in self.gh_argv if str(self.fake_gh) in argv]
+        gh_commands = [argv for argv in self.gh_argv if Path(argv[0]).name == "gh"]
         self.assertTrue(gh_commands)
         for argv in gh_commands:
             self.assertIn("--repo", argv)
@@ -359,7 +409,8 @@ class ShippingTests(unittest.TestCase):
             run_id=RUN_ID,
             inspect_remote=self.remote.inspect,
             push_only=False,
-            gh_executable=str(self.fake_gh),
+            publication_requested=True,
+            forge_identity=self.forge_identity,
             runner=self._gh_runner,
         )
         self.assertEqual(completed["status"], "recorded")
@@ -369,6 +420,7 @@ class ShippingTests(unittest.TestCase):
         self.remote.head = self.commit
         authorize_shipment(
             self.store,  # type: ignore[arg-type]
+            self.repository,
             self._plan(),
             idempotency_key=KEY,
             publication_requested=True,
@@ -378,6 +430,13 @@ class ShippingTests(unittest.TestCase):
             self.repository,
             run_id=RUN_ID,
             inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="ignored",
+            body="ignored",
+            draft=False,
+            forge_identity=self.forge_identity,
             runner=self.remote.runner,
         )
         self.assertEqual(pushed["push"]["result"], "discovered")
@@ -389,11 +448,13 @@ class ShippingTests(unittest.TestCase):
                     "prs": [
                         {
                             "number": 7,
-                            "url": "https://example.invalid/pull/7",
+                            "url": "https://github.com/example/crossforge-test/pull/7",
                             "state": "CLOSED",
                             "headRefName": "crossforge/test",
                             "baseRefName": "main",
                             "headRefOid": self.commit,
+                            "isCrossRepository": False,
+                            "headRepositoryOwner": {"login": "example"},
                         }
                     ],
                 }
@@ -407,29 +468,19 @@ class ShippingTests(unittest.TestCase):
             title="ignored",
             body="ignored",
             draft=False,
-            gh_executable=str(self.fake_gh),
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            forge_identity=self.forge_identity,
             runner=self._gh_runner,
         )
         self.assertEqual(pr["pullRequest"]["result"], "discovered")
         self.assertEqual(self._gh_data()["createCalls"], 0)
 
-    def test_cancellation_only_before_remote_write(self) -> None:
+    def test_cross_repository_pull_request_readback_is_rejected(self) -> None:
+        self.remote.head = self.commit
         authorize_shipment(
             self.store,  # type: ignore[arg-type]
-            self._plan(),
-            idempotency_key=KEY,
-            publication_requested=True,
-        )
-        self.assertTrue(
-            cancel_shipment(
-                self.store,  # type: ignore[arg-type]
-                run_id=RUN_ID,
-                inspect_remote=self.remote.inspect,
-                inspect_pull_requests=lambda _shipment: (),
-            )
-        )
-        authorize_shipment(
-            self.store,  # type: ignore[arg-type]
+            self.repository,
             self._plan(),
             idempotency_key=KEY,
             publication_requested=True,
@@ -439,14 +490,285 @@ class ShippingTests(unittest.TestCase):
             self.repository,
             run_id=RUN_ID,
             inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="Crossforge run",
+            body="Evidence",
+            draft=False,
+            forge_identity=self.forge_identity,
+            runner=self.remote.runner,
+        )
+        self.gh_state.write_text(
+            json.dumps(
+                {
+                    "createCalls": 0,
+                    "listCalls": 0,
+                    "prs": [
+                        {
+                            "number": 8,
+                            "url": "https://github.com/example/crossforge-test/pull/8",
+                            "state": "OPEN",
+                            "headRefName": "crossforge/test",
+                            "baseRefName": "main",
+                            "headRefOid": self.commit,
+                            "isCrossRepository": True,
+                            "headRepositoryOwner": {"login": "attacker"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(StateInconsistencyError, "not bound"):
+            reconcile_pull_request(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                title="Crossforge run",
+                body="Evidence",
+                draft=False,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                forge_identity=self.forge_identity,
+                runner=self._gh_runner,
+            )
+
+    def test_cancellation_only_before_remote_write(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        self.assertTrue(
+            cancel_shipment(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                inspect_pull_requests=lambda _shipment: (),
+            )
+        )
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=True,
             runner=self.remote.runner,
         )
         with self.assertRaisesRegex(PreconditionError, "cannot be cancelled"):
             cancel_shipment(
                 self.store,  # type: ignore[arg-type]
+                self.repository,
                 run_id=RUN_ID,
                 inspect_remote=self.remote.inspect,
                 inspect_pull_requests=lambda _shipment: (),
+            )
+
+    def test_remote_pushurl_change_after_authorization_blocks_before_push(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        self._git(
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            "https://github.com/attacker/redirect.git",
+        )
+        with self.assertRaisesRegex(
+            (PreconditionError, StateInconsistencyError),
+            "remote|destinations",
+        ):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=True,
+                runner=self.remote.runner,
+            )
+        self.assertEqual(self.remote.push_calls, 0)
+
+    def test_failed_write_time_gate_blocks_before_push(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        with self.assertRaisesRegex(PreconditionError, "did not pass"):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=lambda run: replace(
+                    self._gate_evidence(run), passed=False
+                ),
+                push_only=True,
+                runner=self.remote.runner,
+            )
+        self.assertEqual(self.remote.push_calls, 0)
+
+    def test_missing_or_expired_write_authority_blocks_before_push(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        with self.assertRaisesRegex(PreconditionError, "authorize publication"):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=False,
+                final_gate=self._gate_evidence,
+                push_only=True,
+                runner=self.remote.runner,
+            )
+        shipment_path = self.store.run_dir(RUN_ID) / "shipment.json"
+        shipment = json.loads(shipment_path.read_text(encoding="utf-8"))
+        authorized = datetime.now(timezone.utc) - timedelta(hours=25)
+        shipment["authorizedAt"] = authorized.isoformat().replace("+00:00", "Z")
+        shipment["expiresAt"] = (
+            authorized + timedelta(hours=24)
+        ).isoformat().replace("+00:00", "Z")
+        shipment_path.write_text(json.dumps(shipment), encoding="utf-8")
+        with self.assertRaisesRegex(PreconditionError, "expired"):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=True,
+                runner=self.remote.runner,
+            )
+        self.assertEqual(self.remote.push_calls, 0)
+
+    def test_pull_request_body_is_private_bounded_and_secret_screened(self) -> None:
+        body_root = self.root / "shipping-evidence"
+        body_root.mkdir(mode=0o700)
+        safe = body_root / "body.md"
+        safe.write_text("Summary of independently verified changes.\n", encoding="utf-8")
+        safe.chmod(0o600)
+        self.assertEqual(
+            "Summary of independently verified changes.\n",
+            load_pull_request_body(
+                safe,
+                repository=self.repository,
+                deny_paths=("**/.env", "**/*.pem"),
+                allowed_root=body_root,
+            ),
+        )
+
+        secret = body_root / "secret.md"
+        secret.write_text(
+            "api_key=sk-abcdefghijklmnopqrstuvwxyz012345\n",
+            encoding="utf-8",
+        )
+        secret.chmod(0o600)
+        with self.assertRaisesRegex(SecretPolicyError, "secret-like"):
+            load_pull_request_body(
+                secret,
+                repository=self.repository,
+                deny_paths=("**/.env",),
+                allowed_root=body_root,
+            )
+
+        denied = body_root / ".env"
+        denied.write_text("ordinary prose\n", encoding="utf-8")
+        denied.chmod(0o600)
+        with self.assertRaisesRegex(SecretPolicyError, "denied"):
+            load_pull_request_body(
+                denied,
+                repository=self.repository,
+                deny_paths=("**/.env",),
+                allowed_root=body_root,
+            )
+
+        linked = body_root / "linked.md"
+        linked.symlink_to(safe)
+        with self.assertRaisesRegex(SecretPolicyError, "regular file"):
+            load_pull_request_body(
+                linked,
+                repository=self.repository,
+                deny_paths=("**/.env",),
+                allowed_root=body_root,
+            )
+        outside = self.root / "outside.md"
+        outside.write_text("quiet private notes\n", encoding="utf-8")
+        outside.chmod(0o600)
+        with self.assertRaisesRegex(SecretPolicyError, "shipping-evidence"):
+            load_pull_request_body(
+                outside,
+                repository=self.repository,
+                deny_paths=("**/.env",),
+                allowed_root=body_root,
+            )
+
+    def test_forge_executable_replacement_is_rejected(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="Crossforge run",
+            body="Evidence",
+            draft=False,
+            forge_identity=self.forge_identity,
+            runner=self.remote.runner,
+        )
+        self.fake_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.fake_gh.chmod(0o700)
+        with self.assertRaisesRegex(StateInconsistencyError, "changed"):
+            reconcile_pull_request(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                title="Crossforge run",
+                body="Evidence",
+                draft=False,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                forge_identity=self.forge_identity,
+                runner=self._gh_runner,
             )
 
     def test_final_gate_must_return_exact_commit_and_policy_bound_evidence(self) -> None:

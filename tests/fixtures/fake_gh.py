@@ -38,11 +38,15 @@ def main() -> int:
         state["prs"].append(
             {
                 "number": number,
-                "url": f"https://example.invalid/pull/{number}",
+                "url": f"https://github.com/{option(args, '--repo')}/pull/{number}",
                 "state": "OPEN",
-                "headRefName": option(args, "--head"),
+                "headRefName": option(args, "--head").split(":", 1)[-1],
                 "baseRefName": option(args, "--base"),
                 "headRefOid": os.environ.get("FAKE_GH_HEAD_COMMIT"),
+                "isCrossRepository": False,
+                "headRepositoryOwner": {
+                    "login": option(args, "--repo").split("/", 1)[0]
+                },
             }
         )
         save(state_path, state)
