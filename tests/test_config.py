@@ -90,6 +90,172 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(discovered.budget, Budget.QUALITY)
         self.assertEqual(bound.budget, Budget.BALANCED)
 
+    def test_project_config_can_tighten_trusted_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user = root / "user.json"
+            project = root / "project.json"
+            trusted_deny_paths = [
+                *DEFAULT_CONFIG["denyPaths"],
+                "**/user-private/**",
+            ]
+            user.write_text(
+                json.dumps(
+                    {
+                        "gates": {
+                            "executableAllowlist": ["python3", "node"],
+                        },
+                        "denyPaths": trusted_deny_paths,
+                        "gateEnvironmentAllowlist": [
+                            *DEFAULT_CONFIG["gateEnvironmentAllowlist"],
+                            "SAFE_USER_FLAG",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            project.write_text(
+                json.dumps(
+                    {
+                        "budget": "quality",
+                        "gates": {
+                            "executableAllowlist": ["python3"],
+                        },
+                        "denyPaths": [
+                            *trusted_deny_paths,
+                            "**/project-private/**",
+                        ],
+                        "gateEnvironmentAllowlist": list(
+                            DEFAULT_CONFIG["gateEnvironmentAllowlist"]
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(
+                user_path=user,
+                project_path=project,
+            )
+
+            default_restriction = root / "default-project.json"
+            default_restriction.write_text(
+                json.dumps(
+                    {
+                        "gates": {
+                            "executableAllowlist": ["python3"],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            restricted_default = load_config(
+                project_path=default_restriction,
+                discover_defaults=False,
+            )
+
+        self.assertEqual(config.budget, Budget.QUALITY)
+        self.assertEqual(config.gates.executable_allowlist, ("python3",))
+        self.assertNotIn(
+            "SAFE_USER_FLAG",
+            config.gate_environment_allowlist,
+        )
+        self.assertIn("**/project-private/**", config.deny_paths)
+        self.assertEqual(
+            restricted_default.gates.executable_allowlist,
+            ("python3",),
+        )
+
+    def test_project_config_cannot_widen_trusted_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user = root / "user.json"
+            project = root / "project.json"
+            trusted_deny_paths = [
+                *DEFAULT_CONFIG["denyPaths"],
+                "**/user-private/**",
+            ]
+            user.write_text(
+                json.dumps(
+                    {
+                        "gates": {
+                            "executableAllowlist": ["python3", "node"],
+                        },
+                        "denyPaths": trusted_deny_paths,
+                        "gateEnvironmentAllowlist": [
+                            *DEFAULT_CONFIG["gateEnvironmentAllowlist"],
+                            "SAFE_USER_FLAG",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            widening_cases = (
+                (
+                    "environment",
+                    {
+                        "gateEnvironmentAllowlist": [
+                            *DEFAULT_CONFIG["gateEnvironmentAllowlist"],
+                            "SAFE_USER_FLAG",
+                            "PROJECT_FLAG",
+                        ]
+                    },
+                    "gateEnvironmentAllowlist",
+                ),
+                (
+                    "deny paths",
+                    {"denyPaths": list(DEFAULT_CONFIG["denyPaths"])},
+                    "denyPaths",
+                ),
+                (
+                    "executable addition",
+                    {
+                        "gates": {
+                            "executableAllowlist": [
+                                "python3",
+                                "node",
+                                "ruby",
+                            ]
+                        }
+                    },
+                    "executableAllowlist",
+                ),
+                (
+                    "executable restriction removal",
+                    {"gates": {"executableAllowlist": []}},
+                    "executableAllowlist",
+                ),
+            )
+            for label, value, message in widening_cases:
+                with self.subTest(label=label):
+                    project.write_text(
+                        json.dumps(value),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ConfigError, message):
+                        load_config(
+                            user_path=user,
+                            project_path=project,
+                        )
+
+    def test_implicitly_discovered_project_policy_cannot_remove_defaults(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "crossforge.json").write_text(
+                '{"denyPaths":[]}\n',
+                encoding="utf-8",
+            )
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with self.assertRaisesRegex(ConfigError, "shrink denyPaths"):
+                    load_config()
+            finally:
+                os.chdir(previous)
+
     def test_merge_replaces_arrays_in_full(self) -> None:
         merged = merge_config(
             {"nested": {"array": ["old"], "kept": True}},

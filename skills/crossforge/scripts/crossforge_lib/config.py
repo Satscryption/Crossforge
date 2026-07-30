@@ -483,6 +483,46 @@ def config_to_dict(config: CrossforgeConfig) -> dict[str, Any]:
     }
 
 
+def _enforce_tighten_only_project_policy(
+    trusted: CrossforgeConfig,
+    proposed: CrossforgeConfig,
+) -> None:
+    """Reject repository config that weakens user/default trust boundaries."""
+
+    trusted_environment = set(trusted.gate_environment_allowlist)
+    proposed_environment = set(proposed.gate_environment_allowlist)
+    added_environment = proposed_environment - trusted_environment
+    if added_environment:
+        raise ConfigError(
+            "Project configuration cannot widen gateEnvironmentAllowlist: "
+            + ", ".join(sorted(added_environment))
+        )
+
+    removed_deny_paths = set(trusted.deny_paths) - set(proposed.deny_paths)
+    if removed_deny_paths:
+        raise ConfigError(
+            "Project configuration cannot shrink denyPaths: "
+            + ", ".join(sorted(removed_deny_paths))
+        )
+
+    trusted_executables = set(trusted.gates.executable_allowlist)
+    proposed_executables = set(proposed.gates.executable_allowlist)
+    if trusted_executables and (
+        not proposed_executables
+        or not proposed_executables <= trusted_executables
+    ):
+        added_executables = proposed_executables - trusted_executables
+        detail = (
+            ", ".join(sorted(added_executables))
+            if added_executables
+            else "removing the user executable restriction"
+        )
+        raise ConfigError(
+            "Project configuration cannot widen gates.executableAllowlist: "
+            + detail
+        )
+
+
 def load_config(
     *,
     user_path: str | os.PathLike[str] | None = None,
@@ -490,7 +530,7 @@ def load_config(
     cli_overrides: Mapping[str, Any] | None = None,
     discover_defaults: bool = True,
 ) -> CrossforgeConfig:
-    """Load defaults, user config, project config, then CLI overrides."""
+    """Load config while treating repository policy as tighten-only."""
 
     merged: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
     if user_path is not None:
@@ -505,17 +545,28 @@ def load_config(
         project_source = Path.cwd() / ".claude/crossforge.json"
     else:
         project_source = None
-    sources = (
-        (user_source, user_path is not None),
-        (project_source, project_path is not None),
-    )
-    for path, explicit in sources:
-        if path is None:
-            continue
-        if path.exists():
-            merged = merge_config(merged, load_config_file(path))
-        elif explicit:
-            raise ConfigError(f"Configuration file does not exist: {path}")
+    if user_source is not None:
+        if user_source.exists():
+            merged = merge_config(merged, load_config_file(user_source))
+        elif user_path is not None:
+            raise ConfigError(
+                f"Configuration file does not exist: {user_source}"
+            )
+
+    if project_source is not None:
+        if project_source.exists():
+            trusted = normalize_config(merged)
+            project_merged = merge_config(
+                merged,
+                load_config_file(project_source),
+            )
+            proposed = normalize_config(project_merged)
+            _enforce_tighten_only_project_policy(trusted, proposed)
+            merged = project_merged
+        elif project_path is not None:
+            raise ConfigError(
+                f"Configuration file does not exist: {project_source}"
+            )
 
     if cli_overrides is not None:
         if not isinstance(cli_overrides, Mapping):

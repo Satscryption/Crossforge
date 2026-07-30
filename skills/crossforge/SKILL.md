@@ -159,6 +159,8 @@ Read only the references required for the selected mode:
    `--no-commit` build is invalid.
 2. Resolve configuration through `config`. Explicit arguments override project
    config, which overrides user config, which overrides safe defaults.
+   Repository-controlled project config may only tighten deny paths and gate
+   environment/executable allowlists.
 3. Run local-only `preflight`. Executable discovery, versions, help, and local
    login status are allowed here; no remote model or readiness call is.
 4. Resolve the canonical repository identity and the discovered managed-policy

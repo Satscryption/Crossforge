@@ -563,15 +563,9 @@ def _final_gate_executor(
                     str(path) for path in _trusted_credential_directories()
                 ],
                 "executableAllowlist": list(
-                    config.gates.executable_allowlist
-                    or sorted(
-                        {
-                            Path(str(command["argv"][0])).name
-                            for command in commands
-                            if isinstance(command, Mapping)
-                            and isinstance(command.get("argv"), list)
-                            and command["argv"]
-                        }
+                    _effective_gate_executable_allowlist(
+                        commands,
+                        config.gates.executable_allowlist,
                     )
                 ),
             }
@@ -766,6 +760,24 @@ def _acceptance_gate_factory(
         )
 
     return factory
+
+
+def _effective_gate_executable_allowlist(
+    commands: Iterable[Mapping[str, Any]],
+    configured: Iterable[str],
+) -> tuple[str, ...]:
+    """Restrict configured executables to basenames bound by the approved plan."""
+
+    planned = {
+        Path(str(command["argv"][0])).name
+        for command in commands
+        if isinstance(command, Mapping)
+        and isinstance(command.get("argv"), list)
+        and command["argv"]
+    }
+    configured_names = set(configured)
+    effective = planned & configured_names if configured_names else planned
+    return tuple(sorted(effective))
 
 
 def _cmd_version(_args: argparse.Namespace) -> CommandOutput:
@@ -2685,8 +2697,10 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         "repositoryGitDir": str(repository.common_git_dir),
         "credentialDirectories": [str(path) for path in credential_directories],
         "executableAllowlist": list(
-            config.gates.executable_allowlist
-            or sorted({Path(item["argv"][0]).name for item in gates})
+            _effective_gate_executable_allowlist(
+                gates,
+                config.gates.executable_allowlist,
+            )
         ),
     }
     result = perform_acceptance(

@@ -146,6 +146,19 @@ The managed-policy digest remains an input from managed-policy discovery and
 is displayed and bound exactly; improving that discovery trust anchor belongs
 to the managed-policy finding rather than this consent-boundary change.
 
+### DEV-004: Repository configuration is tighten-only for trust policy
+
+Project `.claude/crossforge.json` remains higher precedence for ordinary
+workflow settings, but it is untrusted repository content for provider-context
+and gate policy. The loader compares the normalized project result with the
+merged user/default policy: environment and executable allowlists may only
+narrow, while deny paths may only grow. An empty executable list represents
+the plan-approved executable set, so a project may introduce a restriction
+without gaining execution authority. Each gate intersects a configured list
+with the executable basenames in its approved plan before constructing the
+runner. Gate environment construction separately filters credential-shaped
+names even when an upstream allowlist contains them.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

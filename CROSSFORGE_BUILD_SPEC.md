@@ -602,6 +602,14 @@ Unknown arguments must produce a clear error. Never ignore them.
 3. User config at `~/.claude/crossforge.json`.
 4. Safe defaults.
 
+Treat project config as untrusted repository content. Ordinary settings retain
+the precedence above, but trust-boundary arrays are tighten-only against the
+merged user/default policy: `gateEnvironmentAllowlist` may only shrink,
+`denyPaths` may only grow, and a non-empty user
+`gates.executableAllowlist` may only shrink. An empty trusted executable list
+means the exact plan-approved executable set, so a project may introduce a
+non-empty restriction but may not later remove a user restriction.
+
 ### Configuration schema
 
 The loader must reject unknown keys by default to catch misspellings.
@@ -697,11 +705,14 @@ The loader must reject unknown keys by default to catch misspellings.
 - Model names must be `auto` or non-empty strings without control characters.
 - Deny paths must be relative glob patterns.
 - Provider sections may be disabled but not omitted after normalization.
+- Environment names matching credential categories such as tokens, secrets,
+  passwords, authentication, API/access keys, `DATABASE_URL`, or `KUBECONFIG`
+  must be removed even when allowlisted.
 
 CLI `--effort` overrides both provider effort values. `--codex-model` and
 `--grok-model` override only their named providers. Objects are merged
 recursively; arrays replace lower-precedence arrays in full and are never
-concatenated.
+concatenated. The tighten-only project-policy checks apply after replacement.
 
 ### Shipping skill arguments
 

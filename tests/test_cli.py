@@ -1249,6 +1249,33 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
 
 
 class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
+    def test_gate_executable_allowlist_is_bounded_by_the_approved_plan(
+        self,
+    ) -> None:
+        commands = [
+            {"argv": ["python3", "-m", "unittest"]},
+            {"argv": ["/usr/bin/node", "test.js"]},
+        ]
+
+        self.assertEqual(
+            ("node", "python3"),
+            crossforge_cli._effective_gate_executable_allowlist(commands, ()),
+        )
+        self.assertEqual(
+            ("python3",),
+            crossforge_cli._effective_gate_executable_allowlist(
+                commands,
+                ("python3", "curl", "bash"),
+            ),
+        )
+        self.assertEqual(
+            (),
+            crossforge_cli._effective_gate_executable_allowlist(
+                commands,
+                ("curl", "bash"),
+            ),
+        )
+
     def test_main_and_shipping_command_surfaces_are_disjoint(self) -> None:
         main_parser = crossforge_cli.build_parser()
         ship_parser = crossforge_cli.build_shipping_parser()
