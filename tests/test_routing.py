@@ -174,7 +174,7 @@ class AutomaticRoutingTests(unittest.TestCase):
         self.assertFalse(high_without_oracle.is_race)
         self.assertTrue(high_with_oracle.is_race)
         self.assertTrue(high_with_oracle.commitment_advisor)
-        self.assertEqual(("codex", "grok"), high_with_oracle.plan_critique_lanes)
+        self.assertEqual((), high_with_oracle.plan_critique_lanes)
 
     def test_lean_never_races_and_reviews_only_high_risk(self) -> None:
         medium = route_task(
@@ -197,10 +197,26 @@ class AutomaticRoutingTests(unittest.TestCase):
         self.assertEqual(("grok",), high.review_lanes)
         self.assertLessEqual(
             len(high.implementation_lanes)
-            + len(high.review_lanes)
-            + len(high.plan_critique_lanes),
+            + len(high.review_lanes),
             high.maximum_invocations,
         )
+
+    def test_release_never_routes_external_plan_critiques(self) -> None:
+        for budget in Budget:
+            for risk in Risk:
+                with self.subTest(budget=budget, risk=risk):
+                    decision = route_task(
+                        RoutingRequest(
+                            Strategy.AUTO,
+                            budget,
+                            risk,
+                            "security",
+                            oracle_strong=True,
+                        ),
+                        access=all_access(),
+                        routing_config=ROUTING,
+                    )
+                    self.assertEqual((), decision.plan_critique_lanes)
 
     def test_unknown_author_uses_least_used_available_reviewer(self) -> None:
         selected = select_review_provider(

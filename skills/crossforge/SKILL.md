@@ -157,7 +157,9 @@ Read only the references required for the selected mode:
   [worktree protocol](references/worktree-protocol.md), and
   [candidate selection](references/candidate-selection.md);
 - review:
-  provider privacy, routing policy, and worktree protocol;
+  provider privacy for context classification and quarantine rules, routing
+  policy for authorship labels, and worktree protocol for local isolation;
+  loading these references does not authorize or imply provider contact;
 - resume:
   [recovery](references/recovery.md), run state, and worktree protocol;
 - status:
@@ -175,19 +177,12 @@ Read only the references required for the selected mode:
    login status are allowed here; no remote model or readiness call is.
 4. Resolve the canonical repository identity and the discovered managed-policy
    hash from control-layer output.
-5. Before a remote readiness call, use `prepare-consent` to derive and seal the
-   provider, `probe` operation, identity and policy-hash prefixes, canonical
-   provider executable identity, expiry, and quota warning. Show the returned
-   summary, then stop and ask the user to invoke `/crossforge:crossforge-consent`
-   with the exact returned request path and SHA-256. This skill has no
-   authority to record approval.
-6. Only after the user-only consent skill records valid `probe` consent, let
-   `preflight` or `invoke` perform the
-   fixed source-free readiness call. A probe contains no path, remote, file
-   name, or source.
-7. Resolve and record provider capabilities, requested model, resolved model
-   when observable, sandbox proof, and availability. Unknown model resolution
-   is `unknown`, never an inferred claim.
+5. Stop at local checks in plan, standalone review, and status modes. Release
+   0.1.0 makes no external provider call in those modes.
+6. Provider capability evidence is bound to an active build run. In build
+   mode, complete the plan and `init-run` sequence before requesting `probe`
+   consent or calling `record-capability`; never invent a placeholder run or
+   capability record to satisfy routing.
 
 Before every source-bearing build-provider operation, use `scan-context` and
 the control-layer candidate projection, then `prepare-consent` with that exact
@@ -234,9 +229,29 @@ executable path/content change requires new consent.
 3. Validate and materialize tasks again immediately before initialization.
 4. Use `init-run` to create durable state and a dedicated non-default branch.
    Record target, start commit, repository identity, orchestration Git
-   directory, plan hash, sandbox policy, and provider capabilities.
+   directory, plan hash, sandbox policy, and initial provider configuration.
 5. If another active or blocked run exists, stop. Never overwrite its pointer
    or evidence.
+
+### Establish provider eligibility for the active run
+
+For each provider that routing may use:
+
+1. Call `prepare-consent` for the `probe` operation. It derives and seals the
+   repository/policy bindings, canonical provider executable identity, expiry,
+   and quota warning.
+2. Show the returned summary, then stop and ask the user to invoke
+   `/crossforge:crossforge-consent` with the exact request path and SHA-256.
+   This skill has no authority to record approval.
+3. After the user-only consent skill records valid `probe` consent, call
+   `record-capability` for the active run. The control layer must produce and
+   bind the fixed source-free negative-probe evidence; callers cannot supply
+   result booleans, an evidence path, or an executable override.
+4. Only then permit the fixed source-free readiness call. It contains no
+   repository path, remote, file name, or source.
+5. Record requested model, resolved model when observable, sandbox proof, and
+   availability. Unknown model resolution is `unknown`, never an inferred
+   claim.
 
 ### Execute tasks serially
 
@@ -257,9 +272,10 @@ For each task:
    recorded permission. `invoke` rejects any lane or operation differing from
    this decision. Stay within the selected budget's total provider-call limit.
 4. For high-risk tasks, use the read-only commitment advisor before execution.
-   Use external critiques/reviewers according to routing policy. Claude
-   subagents never supervise Codex or Grok lanes and never receive Bash for
-   lane execution.
+   Perform plan critique locally. The compatibility `planCritiqueLanes` field
+   remains empty in 0.1.0; use only external build-task review lanes recorded
+   by `route-task`. Claude subagents never supervise Codex or Grok lanes and
+   never receive Bash for lane execution.
 5. Call `create-candidate` for each selected lane. Race lanes may run
    concurrently only for the same task and in separate recorded worktrees.
 6. Prepare full provider-readable context with `scan-context`, obtain valid

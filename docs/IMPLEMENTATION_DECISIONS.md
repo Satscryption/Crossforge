@@ -285,12 +285,38 @@ effects, consent request bindings, independent gate receipts, patch/tree
 identity, shipping authorization tuples, and remote readback are still
 control-derived or separately user-confirmed as documented.
 
+### DEV-011: Release documentation follows implemented alpha surfaces
+
+The release documentation is audited against the post-review command surfaces
+and state contracts, not only the original product intent. Crossforge 0.1.0
+has three user-facing skills; the normal, consent, and shipping CLIs are
+disjoint. Provider capability production is active-build-run-bound. Plan mode
+and standalone review are local Claude workflows, while Codex/Grok
+transactions are limited to active build tasks. The consent schema's `plan`
+operation and routing decision's `planCritiqueLanes` field are retained for
+forward compatibility, but no 0.1.0 workflow prepares or invokes `plan`, and
+the routing field is always empty.
+
+The build specification keeps future-facing design context only where it is
+explicitly marked as deferred. Its repository tree, config schema, skill
+frontmatter, shipping launcher, assurance categories, tests, and task file
+lists now describe the implemented release. Security-review issues #3–#15 and
+their merged remediation PRs are indexed in
+[SECURITY_REVIEW_CLOSEOUT.md](SECURITY_REVIEW_CLOSEOUT.md).
+
+`CROSSFORGE_LIVE_TESTS=1` is documented only as an operator marker for the
+manual live-smoke procedure. No 0.1.0 test or control command consumes it, and
+it never substitutes for provider consent or publication intent.
+
 ## Verification limitations
 
-- The default suite uses fake provider, sandbox, and forge executables.
-- No credential-consuming Codex or Grok call was made while implementing
-  0.1.0.
-- No real push or pull request was made.
+- The default release suite uses fake provider, sandbox, and forge
+  executables.
+- The repository does not claim a credential-consuming Codex/Grok transaction
+  as release evidence.
+- The repository does not claim a real `crossforge-ship` push or pull request
+  as release evidence. Ordinary development PRs created outside that product
+  transaction do not constitute a live shipping test.
 
 These are release-evidence limitations, not weakened runtime behavior. Follow
 `LIVE_TESTING.md` before promoting the alpha for sensitive source.

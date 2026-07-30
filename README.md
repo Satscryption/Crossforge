@@ -33,6 +33,9 @@ schema and hash bindings are checked, but their human provenance is not.
 
 See the [assurance vocabulary and orchestrator boundary](docs/THREAT_MODEL.md#assurance-vocabulary-and-orchestrator-boundary)
 before using Crossforge with valuable source or publication authority.
+The completed remediation of security-review issues #3–#15 is traced from
+finding to control, documentation, and merged PR in the
+[security review closeout](docs/SECURITY_REVIEW_CLOSEOUT.md).
 
 ## How it works
 
@@ -198,13 +201,16 @@ Budgets are call/quality profiles, not spending guarantees:
 | --- | --- | ---: |
 | `lean` | One lane; review high-risk work only | 4 |
 | `balanced` | Review medium/high risk; race only eligible high-risk work | 6 |
-| `quality` | Independent critiques; race eligible medium/high-risk work | 8 |
+| `quality` | Local high-risk plan critique; independent build-task review; race eligible medium/high-risk work | 8 |
 
 ## Provider consent and source transmission
 
 Provider installation or authentication is not consent. Crossforge requests
 repository-bound, provider-specific, expiring approval for operation classes:
-`probe`, `plan`, `review`, and `implement`.
+`probe`, `plan`, `review`, and `implement`. The `plan` value is reserved for a
+future transaction type: no 0.1.0 workflow requests or executes it.
+`review` applies only to an external review lane for an active build task;
+standalone review mode remains local.
 
 A remote readiness call needs `probe` consent and uses a fixed source-free
 prompt. A source-bearing call additionally shows the provider, operation
@@ -229,16 +235,18 @@ changes. Provider-readable files count as transmitted context even if the
 prompt does not mention them.
 
 Provider capability evidence is not an operator-authored checklist.
-After repository-bound `probe` consent is valid, `record-capability` resolves
-the exact executable pinned when consent was recorded, runs a fresh source-free
-negative-probe transaction, and derives each sandbox result from observed
-filesystem and loopback-network effects. Codex runs the fixed helper directly
-through `codex sandbox`, with no model-authored result path. Grok requires an
-owner-private control-host hook receipt for the exact helper command. The
-parent also re-hashes the helper, sealed specification, hook, and hook settings
-after execution. It accepts neither an evidence file nor an executable
-override. Failed, skipped, forged, mutated, partial, or stale probe inputs
-leave the provider unavailable.
+After `init-run` creates an active build and repository-bound `probe` consent
+is valid, `record-capability` resolves the exact executable pinned when consent
+was recorded, runs a fresh source-free negative-probe transaction, and derives
+each sandbox result from observed filesystem and loopback-network effects.
+Codex runs the fixed helper directly through `codex sandbox`, with no
+model-authored result path. Grok requires an owner-private control-host hook
+receipt for the exact helper command. The parent also re-hashes the helper,
+sealed specification, hook, and hook settings after execution. It accepts
+neither an evidence file nor an executable override. Failed, skipped, forged,
+mutated, partial, or stale probe inputs leave the provider unavailable.
+Plan mode, standalone review, and status do not create this run-bound evidence
+or contact an external provider in 0.1.0.
 
 ## Configuration
 

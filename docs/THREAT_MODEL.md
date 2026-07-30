@@ -474,6 +474,11 @@ host, which remain out of scope.
 
 ## Security verification
 
+The completed disposition of the review findings that shaped these controls is
+recorded in [SECURITY_REVIEW_CLOSEOUT.md](SECURITY_REVIEW_CLOSEOUT.md). That
+matrix is a traceability index, not substitute evidence: the implementation,
+tests, and live checks remain authoritative.
+
 The default test suite uses fake provider and sandbox executables and performs
 no network request:
 
@@ -481,6 +486,6 @@ no network request:
 python3 -m unittest discover -s tests -v
 ```
 
-Release confidence additionally requires opt-in live sandbox/provider
-capability tests described in [LIVE_TESTING.md](LIVE_TESTING.md). Do not treat
-provider self-reporting as proof that a boundary holds.
+Release confidence additionally requires the manual live sandbox/provider
+capability procedure described in [LIVE_TESTING.md](LIVE_TESTING.md). Do not
+treat provider self-reporting as proof that a boundary holds.

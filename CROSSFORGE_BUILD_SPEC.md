@@ -3,8 +3,9 @@
 **Version:** 1.1
 **Status:** Approved for implementation
 **Target release:** Crossforge `0.1.0` MVP
-**Target product:** Claude Code plugin with two user-facing skills
+**Target product:** Claude Code plugin with three user-facing skills
 **Primary skill:** `crossforge`
+**Consent skill:** `crossforge-consent`
 **Shipping skill:** `crossforge-ship`
 **Tagline:** Claude architects. Independent models build. Evidence decides.
 
@@ -65,7 +66,7 @@ crossforge/
 │   │   │   └── worktree-protocol.md
 │   │   └── scripts/
 │   │       ├── crossforge.py
-│   │       └── crossforge_lib/
+│   │       ├── crossforge_lib/
 │   │           ├── __init__.py
 │   │           ├── acceptance.py
 │   │           ├── config.py
@@ -78,6 +79,7 @@ crossforge/
 │   │           ├── models.py
 │   │           ├── plan.py
 │   │           ├── preflight.py
+│   │           ├── provider_capability.py
 │   │           ├── reports.py
 │   │           ├── routing.py
 │   │           ├── scope.py
@@ -90,15 +92,20 @@ crossforge/
 │   │               ├── __init__.py
 │   │               ├── base.py
 │   │               ├── codex_cli.py
-│   │               └── grok_cli.py
+│   │               ├── grok_cli.py
+│   │               └── grok_policy.py
+│   │       ├── provider_capability_hook.py
+│   │       └── provider_capability_probe.py
 │   ├── crossforge-consent/
 │   │   ├── SKILL.md
 │   │   └── scripts/
 │   │       └── crossforge_consent.py
 │   └── crossforge-ship/
 │       ├── SKILL.md
-│       └── references/
-│           └── shipping-protocol.md
+│       ├── references/
+│       │   └── shipping-protocol.md
+│       └── scripts/
+│           └── crossforge_ship.py
 ├── hooks/
 │   └── crossforge_boundary.py
 ├── evals/
@@ -115,24 +122,28 @@ crossforge/
 │   ├── test_acceptance.py
 │   ├── test_config.py
 │   ├── test_consent.py
+│   ├── test_cli.py
 │   ├── test_evidence.py
 │   ├── test_gates.py
 │   ├── test_git.py
 │   ├── test_locking.py
 │   ├── test_plan.py
 │   ├── test_preflight.py
+│   ├── test_provider_capability.py
 │   ├── test_providers.py
 │   ├── test_reports.py
 │   ├── test_routing.py
 │   ├── test_scope.py
 │   ├── test_secrets.py
 │   ├── test_shipping.py
+│   ├── test_shipping_boundary.py
 │   ├── test_state.py
 │   └── test_worktrees.py
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── IMPLEMENTATION_DECISIONS.md
 │   ├── LIVE_TESTING.md
+│   ├── SECURITY_REVIEW_CLOSEOUT.md
 │   └── THREAT_MODEL.md
 ├── .gitignore
 ├── LICENSE
@@ -156,6 +167,10 @@ tasks using three independent model families:
 Crossforge is not an LLM gateway. It does not replace Claude Code's backend or
 translate OAuth credentials. It invokes locally authenticated provider CLIs in
 controlled worktrees.
+
+In release 0.1.0, Codex and Grok transactions are implemented only for active
+build tasks. Plan-mode critique and standalone review remain local,
+read-only Claude workflows and do not claim cross-vendor independence.
 
 ### Assurance vocabulary
 
@@ -483,7 +498,8 @@ the current branch name alone.
 - Require the directly user-invoked consent skill and an exact
   `PreToolUse` permission prompt to record that request.
 - Reconfirm for a new provider, changed repository identity, expanded operation
-  class, relaxed deny policy, managed-policy change, or expiry.
+  class, any exact transmission-policy change, managed-policy change, provider
+  executable path/content change, source-manifest change, or expiry.
 
 ### 6.6 Candidate retention
 
@@ -504,7 +520,7 @@ Implement shipping as the separate `crossforge-ship` skill in the same plugin.
 MVP supports:
 
 - Parallel read-only research.
-- Parallel plan critiques.
+- Parallel local read-only critique where the host permits it.
 - Same-task Codex/Grok races in separate worktrees.
 
 MVP does not support independent writing tasks in parallel.
@@ -535,12 +551,11 @@ The main skill supports these modes:
   hash binding but not its human provenance.
 - Writes a terminal `complete` plan-mode run directory but does not claim the
   repository `active` pointer.
-- Medium-risk plans receive one external read-only critique when available.
-- High-risk plans receive independent Codex and Grok critiques when available.
+- Medium- and high-risk plans use the bundled local read-only Claude advisors
+  as appropriate.
+- Release 0.1.0 does not invoke Codex or Grok for plan critique.
 - Claude resolves the critiques.
-- Any external critique that can inspect the repository uses the same
-  disposable read-only projection, consent, deny, secret-scan, and context
-  manifest protocol as review mode.
+- Durable external plan-critique transactions are deferred beyond 0.1.0.
 
 ### Build
 
@@ -563,7 +578,8 @@ The main skill supports these modes:
 ```
 
 - Read-only.
-- Uses a model family different from the author when known.
+- Uses the bundled local Claude reviewer. It claims family independence only
+  when the known author belongs to a different model family.
 - Validates findings against source.
 - Does not implement fixes.
 - Uses a disposable read-only review worktree with deny quarantine, sanitized
@@ -648,7 +664,7 @@ The loader must reject unknown keys by default to catch misspellings.
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 1,
   "budget": "balanced",
   "strategy": "auto",
   "providers": {
@@ -907,7 +923,7 @@ remaining unshipped completed build run or remove it when none exists.
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 1,
   "runId": "20260724T120000Z-a1b2c3d4",
   "status": "active",
   "mode": "build",
@@ -927,7 +943,7 @@ remaining unshipped completed build run or remove it when none exists.
   "planSha256": "hex",
   "planApproval": {
     "approved": true,
-    "approvedBy": "user",
+    "approvedBy": "caller-attested",
     "approvedAt": "RFC3339 UTC",
     "approvedPlanSha256": "hex"
   },
@@ -1384,7 +1400,9 @@ Otherwise return a clear blocker. Do not silently change the strategy.
 #### High risk
 
 - Consult the commitment advisor.
-- Obtain independent read-only Codex and Grok plan critiques when available.
+- Obtain a local read-only Claude plan critique. Release 0.1.0 does not call
+  Codex or Grok for plan-mode critique.
+- Keep the serialized `planCritiqueLanes` compatibility field empty.
 - Use a race only when both candidates can be objectively compared.
 - Otherwise use one implementation lane and two independent reviews.
 
@@ -1415,7 +1433,7 @@ invocations against the following maximum per task.
 
 #### Quality
 
-- Independent high-risk plan critiques.
+- Local read-only high-risk plan critique.
 - Race eligible medium and high-risk tasks.
 - Commitment advisor at architecture gates and before final completion.
 - Maximum eight provider invocations per task.
@@ -1956,7 +1974,6 @@ and explicit-port examples.
       "approved": true,
       "operationClasses": [
         "probe",
-        "plan",
         "review",
         "implement"
       ],
@@ -1974,7 +1991,6 @@ and explicit-port examples.
       "approved": true,
       "operationClasses": [
         "probe",
-        "plan",
         "review"
       ],
       "denyPolicySha256": "hex",
@@ -1990,6 +2006,11 @@ and explicit-port examples.
   }
 }
 ```
+
+The schema recognizes `plan` as a reserved operation class for forward
+compatibility, but the 0.1.0 skill never prepares or invokes it. `review` in
+this schema means an external review lane attached to an active build task;
+standalone review mode is local.
 
 The normal Python control layer reports missing consent and exposes
 `prepare-consent`, not `record-consent`. Preparation derives the live
@@ -2737,8 +2758,17 @@ maxTurns: 8
 ```yaml
 ---
 name: crossforge
-description: Orchestrate Claude, OpenAI Codex, and xAI Grok for cross-vendor planning, isolated coding, testing, review, and local task commits. Use whenever the user asks to use multiple coding models, delegate work to Codex or Grok, compare implementations, have Claude architect while another model writes code, execute an approved multi-task plan, resume a Crossforge run, or obtain independent cross-vendor code review. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
+description: Orchestrate Claude architecture with isolated Codex/xAI Grok build lanes, testing, evidence, and local task commits. Use for multi-model implementation, comparing build candidates, executing an approved multi-task plan, or resuming a Crossforge build. Version 0.1.0 plan and standalone review modes are local Claude workflows and do not claim cross-vendor independence. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
 compatibility: Requires Claude Code 2.1.216+, Python 3.11+, Git 2.39+, a supported local gate-sandbox backend, and at least one authenticated external provider CLI for cross-vendor execution.
+hooks:
+  PreToolUse:
+    - matcher: "*"
+      hooks:
+        - type: command
+          command: python3
+          args:
+            - "${CLAUDE_PLUGIN_ROOT}/hooks/crossforge_boundary.py"
+            - main
 ---
 ```
 
@@ -2749,12 +2779,15 @@ The body must:
 1. Classify mode.
 2. Read only the references needed for that mode.
 3. Resolve configuration and run local-only preflight.
-4. Obtain provider `probe` consent before any remote model/readiness call.
-5. Resolve provider capabilities and availability.
-6. Plan or load the canonical plan and obtain a caller-attested, hash-bound
+4. Plan or load the canonical plan and obtain a caller-attested, hash-bound
    approval record; do not describe it as independently user-verified.
-7. Validate and materialize tasks.
-8. Initialize the build run and dedicated branch.
+5. Validate and materialize tasks.
+6. For build mode, initialize the active run and dedicated branch before
+   producing provider capability evidence.
+7. Obtain provider `probe` consent before any remote provider transaction.
+8. Produce and bind provider capabilities to the active run, then resolve
+   readiness and availability. Plan, standalone review, and status modes stop
+   before this step in 0.1.0.
 9. Run tasks serially.
 10. Route each task.
 11. Invoke candidate lanes.
@@ -2768,6 +2801,7 @@ The skill must clearly distinguish:
 
 - Claude judgment.
 - Script-enforced invariants.
+- User-confirmed provider consent.
 - Caller/model attestations.
 - Provider claims.
 - Independently verified evidence.
@@ -2783,6 +2817,16 @@ The skill must clearly distinguish:
 name: crossforge-ship
 description: Ship a completed Crossforge run by revalidating its recorded evidence, running the final repository gate, pushing its branch, and opening or reusing exactly one pull request when a supported forge CLI is available. Use only when the user explicitly asks to push, publish, ship, or open a PR for completed Crossforge work.
 compatibility: Requires a completed Crossforge run, Git, and a configured forge CLI such as gh.
+disable-model-invocation: true
+hooks:
+  PreToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: python3
+          args:
+            - "${CLAUDE_PLUGIN_ROOT}/hooks/crossforge_boundary.py"
+            - ship
 ---
 ```
 
@@ -2795,8 +2839,11 @@ compatibility: Requires a completed Crossforge run, Git, and a configured forge 
 5. Recreate a clean verification worktree at the final commit and run the
    canonical structured global gate in the gate sandbox.
 6. Resolve remote and target from explicit shipping arguments or the recorded
-   plan. Reject mismatches unless the user explicitly approves the new target.
-7. Confirm the current user request includes external publication, then invoke
+   plan. Reject mismatches unless the user-invoked workflow supplies a
+   caller-attested `--target-change-approved` value; do not describe that flag
+   as proof of the original user prompt.
+7. Require the supported user-scoped shipping entry and a fresh
+   caller-attested `--publication-requested` value, then invoke
    `authorize-shipment` with the run ID, remote, head branch, target branch,
    final commit, and a random idempotency key. The main skill cannot call this
    command.
@@ -3006,6 +3053,9 @@ All tests must run without real provider credentials or network access.
 - Default normalization.
 - Precedence.
 - Recursive object merge and array replacement.
+- Repository policy can only tighten deny-path and gate
+  environment/executable policy.
+- Credential-shaped environment names are removed even when allowlisted.
 - Unknown-key rejection.
 - Invalid bounds and enums.
 - Gate sandbox/backend validation.
@@ -3057,13 +3107,16 @@ All tests must run without real provider credentials or network access.
 - Resume success.
 - Resume stale-HEAD failure.
 - Changed-plan-hash failure.
+- Every explicit Git-common state path is bound to the supplied repository.
+- Interrupted multi-record recovery is lock-held, snapshot-bound, and cannot
+  resurrect a terminal run or task.
 
 #### Locks
 
 - Exclusive acquisition.
 - Second writer rejected.
 - Same-host stale lock detection.
-- Different-host lock requires approval.
+- Different-host lock requires caller-attested recovery approval.
 
 #### Consent
 
@@ -3110,6 +3163,11 @@ Use fake executables to test:
 - Codex dangerous flags never used.
 - Grok always-approve never used.
 - Mandatory provider sandbox and network-denial capability probes.
+- Capability evidence is produced only by the fixed nonce-bound helper and
+  cannot be supplied as caller-authored booleans, paths, or executable
+  overrides.
+- Executable/helper/specification/hook mutation and missing Grok control-host
+  receipts fail closed.
 - Provider model-tool credential, orchestration-checkout,
   repository-common-Git, and outside-sentinel read-denial probes.
 - Grok fail-closed `dontAsk` allow rules.
@@ -3128,6 +3186,8 @@ Use fake executables to test:
   provider Git projection.
 - Capture new, modified, deleted, renamed, and binary files.
 - Patch application check.
+- External-provider capture and selection require the active run's canonical
+  registry and exact invocation-report digest.
 - Cleanup only for recorded safe paths.
 - Cleanup through proven patch reversal without force.
 - Missing worktree recovery.
@@ -3146,6 +3206,7 @@ Use fake executables to test:
 - Positive and negative sandbox probes.
 - Network denial and outside-worktree denial.
 - Provider credential-directory denial.
+- Every Git global option before the subcommand is rejected.
 
 #### Routing
 
@@ -3174,6 +3235,10 @@ Use fake executables to test:
 - One commit per task.
 - Multi-task no-commit plan rejection.
 - No push.
+- Selection gates are replayed from durable policy and bound in a
+  descriptor-validated receipt; caller gate-result objects are rejected.
+- Acceptance intent makes interrupted exact commit/no-commit binding
+  retry-safe.
 
 #### Evidence and reports
 
@@ -3189,6 +3254,12 @@ Use fake executables to test:
 
 - Authorization is impossible from the main skill.
 - Dry run performs no write and records no authorization.
+- Repository identity and the exact effective fetch/push URL are re-derived
+  before each write.
+- Authorization expires after 24 hours, and `record-shipment` requires fresh
+  caller-attested publication intent and a fresh final gate.
+- PR title/body input is owner-private, run-contained, bounded, and
+  secret-screened; the forge executable is path/hash pinned.
 - Crash after push resumes without a second push.
 - Crash after PR creation discovers and reuses the existing PR.
 - Open and closed matching PR lookup.
@@ -3198,7 +3269,10 @@ Use fake executables to test:
 
 ### Optional live smoke tests
 
-Run only when:
+Release 0.1.0 documents a manual live-smoke procedure; it does not ship an
+automated credential-consuming test runner. The following environment variable
+is an operator convention for a future or local harness, not a control-layer
+authorization gate:
 
 ```text
 CROSSFORGE_LIVE_TESTS=1
@@ -3673,13 +3747,18 @@ crossforge/tests/test_secrets.py
 
 ```text
 crossforge/skills/crossforge/scripts/crossforge_lib/preflight.py
+crossforge/skills/crossforge/scripts/crossforge_lib/provider_capability.py
+crossforge/skills/crossforge/scripts/provider_capability_hook.py
+crossforge/skills/crossforge/scripts/provider_capability_probe.py
 crossforge/skills/crossforge/scripts/crossforge_lib/providers/__init__.py
 crossforge/skills/crossforge/scripts/crossforge_lib/providers/base.py
 crossforge/skills/crossforge/scripts/crossforge_lib/providers/codex_cli.py
 crossforge/skills/crossforge/scripts/crossforge_lib/providers/grok_cli.py
+crossforge/skills/crossforge/scripts/crossforge_lib/providers/grok_policy.py
 crossforge/tests/fixtures/fake_codex.py
 crossforge/tests/fixtures/fake_grok.py
 crossforge/tests/test_preflight.py
+crossforge/tests/test_provider_capability.py
 crossforge/tests/test_providers.py
 ```
 
@@ -3791,9 +3870,9 @@ crossforge/skills/crossforge/scripts/crossforge.py
 
 **Do:**
 
-- Expose every required non-shipping subcommand. T14 adds `ship-preflight`,
-  `authorize-shipment`, `cancel-shipment`, and `record-shipment` after the
-  shipping policy exists.
+- Expose every required non-shipping subcommand. Shipping handlers remain
+  shared Python code but are reachable only through T14's dedicated shipping
+  launcher.
 - Map operational failures to exit codes.
 - Support JSON and human output.
 - Avoid tracebacks for expected errors.
@@ -3860,17 +3939,20 @@ crossforge/skills/crossforge/SKILL.md
 ```text
 crossforge/skills/crossforge-ship/SKILL.md
 crossforge/skills/crossforge-ship/references/shipping-protocol.md
+crossforge/skills/crossforge-ship/scripts/crossforge_ship.py
 crossforge/skills/crossforge/scripts/crossforge.py
 crossforge/skills/crossforge/scripts/crossforge_lib/shipping.py
+crossforge/hooks/crossforge_boundary.py
 crossforge/tests/fixtures/fake_gh.py
 crossforge/tests/test_shipping.py
+crossforge/tests/test_shipping_boundary.py
 ```
 
 **Do:**
 
 - Implement explicit shipping workflow.
 - Add `ship-preflight`, `authorize-shipment`, `cancel-shipment`, and
-  `record-shipment` to the control CLI.
+  `record-shipment` to the dedicated shipping CLI, not the normal CLI.
 - Use fake `gh` in dedicated shipping tests.
 - Test incomplete-run rejection, dirty-repository rejection, upstream
   divergence, explicit-intent enforcement, dry-run behavior, and shipment
@@ -3890,6 +3972,7 @@ crossforge/README.md
 crossforge/docs/ARCHITECTURE.md
 crossforge/docs/IMPLEMENTATION_DECISIONS.md
 crossforge/docs/LIVE_TESTING.md
+crossforge/docs/SECURITY_REVIEW_CLOSEOUT.md
 crossforge/docs/THREAT_MODEL.md
 ```
 

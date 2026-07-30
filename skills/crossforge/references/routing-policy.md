@@ -18,9 +18,11 @@ fixed lane.
 - **Medium risk:** use one implementation lane and, when available, a different
   provider family for read-only review. Quality may race when gates provide a
   strong oracle.
-- **High risk:** consult the commitment advisor and obtain independent Codex
-  and Grok plan critiques when available. Race only with objective comparison;
-  otherwise use one implementation lane and two independent reviews.
+- **High risk:** consult the commitment advisor and use a local read-only
+  Claude plan critique. Release 0.1.0 does not call Codex or Grok in plan mode.
+  During build execution, race only with objective comparison; otherwise use
+  one implementation lane and the independently eligible review strategy
+  recorded for the task.
 
 The control layer directly invokes Codex and Grok. Do not route through a
 Bash-capable Claude subagent. The Claude independent reviewer is used only when
@@ -33,10 +35,13 @@ that fact and do not claim family independence.
 | --- | --- | ---: |
 | `lean` | One lane; review high-risk work only | 4 |
 | `balanced` | Review medium/high risk; race only eligible high-risk work | 6 |
-| `quality` | Independent critiques; race eligible medium/high-risk work | 8 |
+| `quality` | Local high-risk plan critique; independent build-task review; race eligible medium/high-risk work | 8 |
 
-Implementation, correction, critique, and review calls all count. Stop before
-the limit. This is a call/quality profile, not a monetary guarantee.
+External implementation, correction, and build-task review calls count. Local
+Claude advisors do not count as provider invocations. The serialized
+`planCritiqueLanes` compatibility field remains empty in 0.1.0 because no
+external plan transaction exists. Stop before the limit. This is a
+call/quality profile, not a monetary guarantee.
 
 Automatic fallback is allowed only when `routing.json` records
 `fallbackAllowed: true`; record the failed lane, failure category, replacement,

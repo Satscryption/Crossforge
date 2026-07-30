@@ -386,10 +386,10 @@ def route_task(
             reason = "auto Codex cold-start default"
 
     primary = implementation[0]
+    # Kept in the serialized decision for schema compatibility. Release 0.1.0
+    # performs plan critique locally and has no executable external plan lane.
     plan_critiques: tuple[str, ...] = ()
     commitment = request.risk is Risk.HIGH
-    if request.risk is Risk.HIGH:
-        plan_critiques = tuple(name for name in PROVIDERS if providers[name].usable)
 
     if len(implementation) > 1:
         reviews: tuple[str, ...] = ()
@@ -403,12 +403,6 @@ def route_task(
         reviews = _reviewer(primary, providers, review_calls)
     else:
         reviews = ()
-
-    # High-risk lean work can use at most two critiques + implementation +
-    # review.  Other combinations are naturally within their profile.
-    provider_call_count = len(implementation) + len(plan_critiques) + len(reviews)
-    if provider_call_count > maximum:
-        plan_critiques = plan_critiques[: max(0, maximum - len(implementation) - len(reviews))]
 
     return RoutingDecision(
         strategy=request.strategy,

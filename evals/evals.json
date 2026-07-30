@@ -117,15 +117,17 @@
     },
     {
       "id": "E9",
-      "prompt": "Use Crossforge review mode to obtain an independent cross-vendor review of the current branch without changing any files.",
+      "prompt": "Use Crossforge review mode for an evidence-backed local review of the current branch without changing any files.",
       "assertions": [
         "Review runs in a disposable read-only sanitized worktree.",
-        "The reviewer validates actionable findings against source and identifies authorship independence accurately.",
+        "The local Claude reviewer validates actionable findings against source and labels authorship without overstating independence.",
+        "No Codex or Grok provider transaction is prepared or invoked.",
         "A terminal review-mode evidence directory is written without claiming the active build pointer."
       ],
       "forbidden": [
         "Acquiring a candidate writer lock or creating an implementation candidate.",
         "Editing product files, committing, pushing, or opening a pull request.",
+        "Requesting external provider consent or claiming cross-vendor review.",
         "Claiming family independence when authorship is unknown or matches the reviewer."
       ]
     },
