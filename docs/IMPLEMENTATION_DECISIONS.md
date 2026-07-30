@@ -194,6 +194,18 @@ results. The task stores the receipt's canonical path and exact SHA-256.
 Acceptance revalidates the receipt and referenced result, output, and sandbox
 policy files before independently rerunning acceptance gates.
 
+The state layer rejects generic transitions into `candidate_ready`; only the
+selection compare-and-swap binder may create that status. Its stale-state check
+freezes selection/security fields while permitting independently durable
+routing, attempt counters, and timestamps to advance during the gate run.
+
+Acceptance persists a versioned intent before changing orchestration. The
+intent binds the patch, verified scoped tree, quarantine digest, selected gate
+receipt, commit message, provider, base, and commit mode. Successful binding
+retains the intent as audit/retry evidence. If a process stops after staging or
+commit, the next identical request must revalidate repository, candidate, and
+evidence state, then finish or idempotently bind the exact result.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

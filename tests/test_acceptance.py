@@ -595,8 +595,13 @@ class AcceptanceTests(AcceptanceCase):
     def test_acceptance_finalizer_runs_inside_repository_transaction(self):
         candidate, patch = self.candidate()
         finalized = []
+        events = []
+
+        def record_intent(_tree, _quarantine):
+            events.append(("intent", resolve_commit(self.repository, "HEAD")))
 
         def finalize(result):
+            events.append(("finalize", resolve_commit(self.repository, "HEAD")))
             finalized.append(result.commit)
             with self.assertRaises(LockHeldError):
                 with repository_lock(self.state_root, timeout=0):
@@ -605,9 +610,16 @@ class AcceptanceTests(AcceptanceCase):
         self.accept(
             candidate,
             patch,
+            acceptance_intent_recorder=record_intent,
             acceptance_finalizer=finalize,
         )
         self.assertEqual(1, len(finalized))
+        self.assertEqual("intent", events[0][0])
+        self.assertEqual(self.base, events[0][1])
+        self.assertEqual(
+            [("finalize", finalized[0])],
+            events[1:],
+        )
 
     def test_gate_failure_leaves_orchestration_clean_at_base(self):
         candidate, patch = self.candidate()

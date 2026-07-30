@@ -317,6 +317,12 @@ artifacts. Receipt reads reject symlinks, hard links, non-private ownership or
 permissions, and descriptor swaps. Selection and acceptance bind their state
 with repository-then-run compare-and-swap locking; acceptance finalizes its task
 record before releasing the lock that protects patch application and commit.
+Before orchestration changes, it persists an acceptance intent bound to the
+candidate patch, verified tree, quarantine set, gate receipt, commit message,
+and commit mode. A retry can therefore prove and bind an already-created
+commit or exact staged no-commit result after interruption. Generic task
+transitions cannot create `candidate_ready`, and selection CAS ignores only
+non-policy routing/attempt bookkeeping.
 
 Acceptance repeats patch application, exact scope, and gates in a fresh
 worktree. The control layer then applies the verified patch to a clean

@@ -153,7 +153,36 @@ def runtime_task(
     task["id"] = task_id
     task["title"] = f"Task {task_id}"
     task["status"] = status
+    if (
+        status in {"candidate_ready", "accepted", "committed"}
+        and selected is None
+    ):
+        selected = "claude-microfix"
     task["selectedCandidate"] = selected
+    if status in {"candidate_ready", "accepted", "committed"}:
+        task["selectedCandidatePath"] = "/tmp/crossforge-test-candidate"
+        task["selectedGateEvidencePath"] = "/tmp/crossforge-test-gates.json"
+        task["selectedGateEvidenceSha256"] = "a" * 64
+        if selected in {"codex", "grok"}:
+            task["selectedInvocationEvidencePath"] = (
+                "/tmp/crossforge-test-invocation.json"
+            )
+            task["selectedInvocationEvidenceSha256"] = "b" * 64
+        if status in {"accepted", "committed"}:
+            task["acceptanceIntent"] = {
+                "schemaVersion": 1,
+                "provider": selected,
+                "candidatePath": task["selectedCandidatePath"],
+                "baseCommit": commit,
+                "capturedPatchSha256": "c" * 64,
+                "verifiedScopedTreeSha256": "d" * 64,
+                "quarantinePathsSha256": "e" * 64,
+                "selectedGateEvidenceSha256": (
+                    task["selectedGateEvidenceSha256"]
+                ),
+                "commitMessageSha256": "f" * 64,
+                "noCommit": status == "accepted",
+            }
     task["commit"] = commit if status in {"committed", "complete"} else None
     return task
 
@@ -1575,42 +1604,30 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
             manager.registry.get(candidate_path),
             patch,
         )
-        store.transition_task(
-            run_id,
-            "T1",
-            TaskStatus.CANDIDATE_READY,
-            updates={
-                "selectedCandidate": "codex",
-                "selectedCandidatePath": str(candidate_path.resolve()),
-                "selectedInvocationEvidencePath": str(forged_report.resolve()),
-                "selectedInvocationEvidenceSha256": (
-                    captured.invocation_evidence_sha256
-                ),
-            },
-        )
-        unattested_acceptance = self.root / "unattested-acceptance.json"
-        atomic_write_json(
-            unattested_acceptance,
-            {
-                "repository": str(self.repository),
-                "gitCommonDir": str(self.common),
-                "worktreeRoot": str(worktree_root),
-                "registry": str(registry),
-                "runId": run_id,
-                "taskId": "T1",
-                "candidatePath": str(candidate_path),
-            },
-        )
-        code, stdout, stderr = invoke_cli(
-            "accept-candidate",
-            "--request",
-            str(unattested_acceptance),
-            "--json",
-        )
-        self.assertNotEqual(0, code)
-        self.assertIn(
-            "no bound independent gate evidence",
-            stdout + stderr,
+        with self.assertRaisesRegex(
+            StateInconsistencyError,
+            "bind_candidate_selection",
+        ):
+            store.transition_task(
+                run_id,
+                "T1",
+                TaskStatus.CANDIDATE_READY,
+                updates={
+                    "selectedCandidate": "codex",
+                    "selectedCandidatePath": str(
+                        candidate_path.resolve()
+                    ),
+                    "selectedInvocationEvidencePath": str(
+                        forged_report.resolve()
+                    ),
+                    "selectedInvocationEvidenceSha256": (
+                        captured.invocation_evidence_sha256
+                    ),
+                },
+            )
+        self.assertEqual(
+            "in_progress",
+            store.load_tasks(run_id)["tasks"][0]["status"],
         )
 
     def test_blocked_run_can_cleanup_a_captured_candidate(self) -> None:
@@ -1896,6 +1913,7 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
         )
         atomic_write_bytes(receipt, original_receipt)
 
+        original_report = canonical_report.read_bytes()
         raw = json.loads(canonical_report.read_text(encoding="utf-8"))
         raw["objective"] = "forged after selection"
         atomic_write_json(canonical_report, raw)
@@ -1907,6 +1925,99 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
         )
         self.assertNotEqual(0, code)
         self.assertIn("invoke-bound evidence", stdout + stderr)
+
+        atomic_write_bytes(canonical_report, original_report)
+        atomic_write_json(
+            accept_request,
+            {
+                "repository": str(self.repository),
+                "gitCommonDir": str(self.common),
+                "worktreeRoot": str(worktree_root),
+                "registry": str(registry),
+                "repositoryIdPrefix": identity[:12],
+                "runId": run_id,
+                "taskId": "T1",
+                "candidatePath": str(candidate.path),
+                "patchPath": str(patch_path),
+                "evidenceRoot": str(
+                    store.run_dir(run_id)
+                    / "evidence"
+                    / "T1"
+                    / "acceptance"
+                ),
+                "commitMessage": "fix: recover accepted candidate",
+            },
+        )
+        original_bind = (
+            StateStore.bind_candidate_acceptance_in_transaction
+        )
+        failed_once = False
+
+        def fail_after_commit(store_instance, *bind_args, **bind_kwargs):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise StateInconsistencyError(
+                    "simulated crash before durable acceptance bind"
+                )
+            return original_bind(
+                store_instance, *bind_args, **bind_kwargs
+            )
+
+        with mock.patch.object(
+            crossforge_cli,
+            "detect_sandbox_backend",
+            return_value=("bwrap", str(sandbox)),
+        ), mock.patch.object(
+            crossforge_cli,
+            "probe_sandbox",
+            side_effect=passed_probe,
+        ), mock.patch.object(
+            StateStore,
+            "bind_candidate_acceptance_in_transaction",
+            autospec=True,
+            side_effect=fail_after_commit,
+        ):
+            code, stdout, stderr = invoke_cli(
+                "accept-candidate",
+                "--request",
+                str(accept_request),
+                "--json",
+            )
+            self.assertNotEqual(0, code)
+            self.assertIn(
+                "simulated crash before durable acceptance bind",
+                stdout + stderr,
+            )
+            interrupted = store.load_tasks(run_id)["tasks"][0]
+            self.assertEqual("candidate_ready", interrupted["status"])
+            self.assertIsNotNone(interrupted["acceptanceIntent"])
+            committed_head = resolve_commit(self.discovered, "HEAD")
+            self.assertNotEqual(self.commit, committed_head)
+
+            code, stdout, stderr = invoke_cli(
+                "accept-candidate",
+                "--request",
+                str(accept_request),
+                "--json",
+            )
+        self.assertEqual(0, code, stdout + stderr)
+        recovered = json.loads(stdout)["result"]
+        self.assertTrue(recovered["acceptance"]["recovered"])
+        self.assertEqual("committed", recovered["task"]["status"])
+        self.assertEqual(committed_head, recovered["task"]["commit"])
+        self.assertIsNotNone(recovered["task"]["acceptanceIntent"])
+
+        code, stdout, stderr = invoke_cli(
+            "accept-candidate",
+            "--request",
+            str(accept_request),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        repeated = json.loads(stdout)["result"]
+        self.assertTrue(repeated["acceptance"]["recovered"])
+        self.assertEqual(committed_head, repeated["task"]["commit"])
 
     def test_gate_executable_allowlist_is_bounded_by_the_approved_plan(
         self,

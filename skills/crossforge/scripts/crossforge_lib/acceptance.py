@@ -80,6 +80,7 @@ class GateRunnerLike(Protocol):
 GateRunnerFactory = Callable[[Path, EvidenceStore], GateRunnerLike]
 QuarantineResolver = Callable[[Path], Sequence[str]]
 PreApplyValidator = Callable[[str, str], None]
+AcceptanceIntentRecorder = Callable[[str, str], None]
 AcceptanceFinalizer = Callable[["AcceptanceResult"], None]
 
 
@@ -273,11 +274,34 @@ def validate_acceptance_state(
         raise StateInconsistencyError("candidate acceptance requires an active build run")
     if run["activeTaskId"] != task_id:
         raise StateInconsistencyError("task is not the active run task")
-    if task["status"] != "candidate_ready":
+    if task["status"] not in {
+        "candidate_ready",
+        "accepted",
+        "committed",
+    }:
         raise StateInconsistencyError("task is not ready for candidate acceptance")
     if task["baseCommit"] != run["currentCommit"]:
         raise StateInconsistencyError("task base and run current commit disagree")
-    if resolve_commit(repository, "HEAD") != task["baseCommit"]:
+    head = resolve_commit(repository, "HEAD")
+    terminal_replay = (
+        task["status"] == "committed"
+        and task.get("commit") == head
+        and task.get("acceptanceIntent") is not None
+    ) or (
+        task["status"] == "accepted"
+        and run["noCommit"] is True
+        and head == task["baseCommit"]
+        and task.get("acceptanceIntent") is not None
+    )
+    if task["status"] in {"accepted", "committed"} and not terminal_replay:
+        raise StateInconsistencyError(
+            "durably accepted task does not match orchestration state"
+        )
+    if (
+        head != task["baseCommit"]
+        and task.get("acceptanceIntent") is None
+        and not terminal_replay
+    ):
         raise StateInconsistencyError("orchestration HEAD is stale for this task")
     if run["noCommit"] and len(tasks) != 1:
         raise StateInconsistencyError("no-commit mode requires exactly one task")
@@ -858,6 +882,7 @@ def accept_candidate(
     quarantine_paths: Sequence[str] = (),
     quarantine_resolver: QuarantineResolver | None = None,
     pre_apply_validator: PreApplyValidator | None = None,
+    acceptance_intent_recorder: AcceptanceIntentRecorder | None = None,
     acceptance_finalizer: AcceptanceFinalizer | None = None,
     no_commit: bool = False,
     task_count: int = 1,
@@ -1094,6 +1119,11 @@ def accept_candidate(
             )
         if pre_apply_validator is not None:
             pre_apply_validator(
+                verified_hash,
+                quarantine_paths_sha256,
+            )
+        if acceptance_intent_recorder is not None:
+            acceptance_intent_recorder(
                 verified_hash,
                 quarantine_paths_sha256,
             )

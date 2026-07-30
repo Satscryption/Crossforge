@@ -72,6 +72,7 @@ from crossforge_lib.git import (
     repository_identity,
     resolve_commit,
     run_git,
+    stage_allowlist_filter_free,
 )
 from crossforge_lib.locking import repository_lock, run_lock
 from crossforge_lib.models import (
@@ -677,6 +678,7 @@ def _active_candidate_context(
     git_common_dir: str | None,
     run_id: str | None,
     allowed_run_statuses: Iterable[str] = (RunStatus.ACTIVE.value,),
+    acceptance_recovery_task_id: str | None = None,
 ) -> _ActiveCandidateContext:
     """Bind a candidate lifecycle operation to the active repository run."""
 
@@ -699,6 +701,28 @@ def _active_candidate_context(
         )
     run = store.load_run(active_run_id)
     identity = repository_identity(repository)
+    head_matches_run = (
+        resolve_commit(repository, "HEAD") == run["currentCommit"]
+    )
+    recoverable_acceptance = False
+    if not head_matches_run and acceptance_recovery_task_id is not None:
+        matches = [
+            task
+            for task in store.load_tasks(active_run_id)["tasks"]
+            if task["id"] == acceptance_recovery_task_id
+        ]
+        recoverable_acceptance = (
+            len(matches) == 1
+            and run["activeTaskId"] == acceptance_recovery_task_id
+            and matches[0]["status"]
+            in {
+                TaskStatus.CANDIDATE_READY.value,
+                TaskStatus.ACCEPTED.value,
+                TaskStatus.COMMITTED.value,
+            }
+            and matches[0]["baseCommit"] == run["currentCommit"]
+            and isinstance(matches[0].get("acceptanceIntent"), Mapping)
+        )
     if (
         run["status"] not in set(allowed_run_statuses)
         or run["mode"] != "build"
@@ -706,7 +730,7 @@ def _active_candidate_context(
         or Path(str(run["gitCommonDir"])).resolve()
         != repository.common_git_dir
         or run["repositoryIdentity"] != identity
-        or resolve_commit(repository, "HEAD") != run["currentCommit"]
+        or not (head_matches_run or recoverable_acceptance)
     ):
         raise StateInconsistencyError(
             "candidate operation repository differs from the active durable run"
@@ -3490,6 +3514,7 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         repository_id_prefix=value.get("repositoryIdPrefix"),
         git_common_dir=_request_value(value, "gitCommonDir", str),
         run_id=run_id,
+        acceptance_recovery_task_id=task_id,
     )
     repository = context.repository
     store = context.store
@@ -3598,7 +3623,27 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         fresh_matches = [
             item for item in fresh_tasks if item["id"] == task_id
         ]
-        if len(fresh_matches) != 1 or fresh_matches[0] != task:
+        ignored_bookkeeping = {
+            "routing",
+            "attempts",
+            "updatedAt",
+            "acceptanceIntent",
+        }
+        fresh_stable = (
+            {
+                key: item
+                for key, item in fresh_matches[0].items()
+                if key not in ignored_bookkeeping
+            }
+            if len(fresh_matches) == 1
+            else None
+        )
+        expected_stable = {
+            key: item
+            for key, item in task.items()
+            if key not in ignored_bookkeeping
+        }
+        if fresh_stable != expected_stable:
             raise StateInconsistencyError(
                 "selected task changed during acceptance"
             )
@@ -3625,6 +3670,295 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         if candidate.provider in {"codex", "grok"}:
             _load_bound_provider_report(context, candidate)
 
+    def acceptance_intent(
+        verified_tree_sha256: str,
+        quarantine_paths_sha256: str,
+    ) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "provider": candidate.provider,
+            "candidatePath": str(candidate.path.resolve()),
+            "baseCommit": candidate.base_commit,
+            "capturedPatchSha256": candidate.captured_patch_sha256,
+            "verifiedScopedTreeSha256": verified_tree_sha256,
+            "quarantinePathsSha256": quarantine_paths_sha256,
+            "selectedGateEvidenceSha256": task[
+                "selectedGateEvidenceSha256"
+            ],
+            "commitMessageSha256": sha256_bytes(
+                commit_message.rstrip("\n").encode("utf-8")
+            ),
+            "noCommit": bool(run["noCommit"]),
+        }
+
+    def recover_completed_acceptance() -> Mapping[str, Any] | None:
+        durable_intent = task.get("acceptanceIntent")
+        if not isinstance(durable_intent, Mapping):
+            return None
+        known_intent = acceptance_intent(
+            str(durable_intent["verifiedScopedTreeSha256"]),
+            str(durable_intent["quarantinePathsSha256"]),
+        )
+        if dict(durable_intent) != known_intent:
+            raise StateInconsistencyError(
+                "durable acceptance intent differs from this request"
+            )
+        with repository_lock(store.root, timeout=store.lock_timeout):
+            validate_selection_evidence(
+                str(durable_intent["verifiedScopedTreeSha256"]),
+                str(durable_intent["quarantinePathsSha256"]),
+            )
+            head = resolve_commit(repository, "HEAD")
+            status = run_git(
+                repository.root,
+                [
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                ],
+                git_executable=repository.git_executable,
+            ).stdout_bytes
+            if not run["noCommit"] and head == candidate.base_commit:
+                if not status:
+                    return None
+            canonical_allowlist = parse_allowlist(task["allowedFiles"])
+            enforce_scope(
+                repository,
+                base_commit=candidate.base_commit,
+                allowlist=canonical_allowlist,
+                approved_symlinks=task["approvedSymlinks"],
+            )
+            applied_tree = scoped_tree_hash(
+                repository.root,
+                canonical_allowlist,
+                approved_symlinks={
+                    item["path"]: item["target"]
+                    for item in task["approvedSymlinks"]
+                },
+            )
+            if (
+                applied_tree
+                != durable_intent["verifiedScopedTreeSha256"]
+            ):
+                raise StateInconsistencyError(
+                    "recovered orchestration tree differs from "
+                    "durable acceptance intent"
+                )
+            if run["noCommit"]:
+                if head != candidate.base_commit:
+                    raise StateInconsistencyError(
+                        "no-commit acceptance advanced orchestration HEAD"
+                    )
+                staged_diff = run_git(
+                    repository.root,
+                    [
+                        "diff",
+                        "--cached",
+                        "--binary",
+                        "--no-ext-diff",
+                        "--no-renames",
+                        candidate.base_commit,
+                        "--",
+                    ],
+                    git_executable=repository.git_executable,
+                ).stdout_bytes
+                if (
+                    sha256_bytes(staged_diff)
+                    != candidate.captured_patch_sha256
+                ):
+                    raise StateInconsistencyError(
+                        "recovered orchestration index differs from "
+                        "durable acceptance intent"
+                    )
+                recovered_commit = None
+            else:
+                if head == candidate.base_commit:
+                    interrupted_diff = run_git(
+                        repository.root,
+                        [
+                            "diff",
+                            "--binary",
+                            "--no-ext-diff",
+                            "--no-renames",
+                            candidate.base_commit,
+                            "--",
+                        ],
+                        git_executable=repository.git_executable,
+                    ).stdout_bytes
+                    if (
+                        sha256_bytes(interrupted_diff)
+                        != candidate.captured_patch_sha256
+                    ):
+                        raise StateInconsistencyError(
+                            "interrupted orchestration change differs "
+                            "from durable acceptance intent"
+                        )
+                    stage_allowlist_filter_free(
+                        repository,
+                        canonical_allowlist,
+                        approved_symlinks={
+                            item["path"]: item["target"]
+                            for item in task["approvedSymlinks"]
+                        },
+                    )
+                    staged_diff = run_git(
+                        repository.root,
+                        [
+                            "diff",
+                            "--cached",
+                            "--binary",
+                            "--no-ext-diff",
+                            "--no-renames",
+                            candidate.base_commit,
+                            "--",
+                        ],
+                        git_executable=repository.git_executable,
+                    ).stdout_bytes
+                    if (
+                        sha256_bytes(staged_diff)
+                        != candidate.captured_patch_sha256
+                    ):
+                        raise StateInconsistencyError(
+                            "recovered orchestration index differs "
+                            "from durable acceptance intent"
+                        )
+                    empty_hooks = ensure_private_directory(
+                        evidence.independent_path(
+                            "acceptance/recovery-empty-hooks"
+                        )
+                    )
+                    run_git(
+                        repository.root,
+                        [
+                            "-c",
+                            f"core.hooksPath={empty_hooks}",
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "--no-verify",
+                            "--no-gpg-sign",
+                            "-m",
+                            commit_message,
+                        ],
+                        environment={
+                            "GIT_CONFIG_NOSYSTEM": "1",
+                            "GIT_OPTIONAL_LOCKS": "0",
+                        },
+                        git_executable=repository.git_executable,
+                    )
+                    head = resolve_commit(repository, "HEAD")
+                    status = run_git(
+                        repository.root,
+                        [
+                            "status",
+                            "--porcelain=v1",
+                            "-z",
+                            "--untracked-files=all",
+                        ],
+                        git_executable=repository.git_executable,
+                    ).stdout_bytes
+                if (
+                    resolve_commit(repository, "HEAD^")
+                    != candidate.base_commit
+                    or status
+                ):
+                    raise StateInconsistencyError(
+                        "recovered acceptance commit is not the exact "
+                        "clean child of the task base"
+                    )
+                committed_diff = run_git(
+                    repository.root,
+                    [
+                        "diff",
+                        "--binary",
+                        "--no-ext-diff",
+                        "--no-renames",
+                        candidate.base_commit,
+                        head,
+                        "--",
+                    ],
+                    git_executable=repository.git_executable,
+                ).stdout_bytes
+                if (
+                    sha256_bytes(committed_diff)
+                    != candidate.captured_patch_sha256
+                ):
+                    raise StateInconsistencyError(
+                        "recovered commit differs from the captured patch"
+                    )
+                committed_message = run_git(
+                    repository.root,
+                    ["log", "-1", "--format=%B"],
+                    git_executable=repository.git_executable,
+                ).stdout.rstrip("\n")
+                if (
+                    sha256_bytes(committed_message.encode("utf-8"))
+                    != durable_intent["commitMessageSha256"]
+                ):
+                    raise StateInconsistencyError(
+                        "recovered commit message differs from "
+                        "durable acceptance intent"
+                    )
+                recovered_commit = head
+            if task["status"] in {
+                TaskStatus.ACCEPTED.value,
+                TaskStatus.COMMITTED.value,
+            }:
+                expected_status = (
+                    TaskStatus.ACCEPTED.value
+                    if run["noCommit"]
+                    else TaskStatus.COMMITTED.value
+                )
+                if (
+                    task["status"] != expected_status
+                    or task.get("commit") != recovered_commit
+                ):
+                    raise StateInconsistencyError(
+                        "durable acceptance result differs from "
+                        "recovered orchestration state"
+                    )
+                return task
+            return store.bind_candidate_acceptance_in_transaction(
+                run_id,
+                task_id,
+                expected_run=run,
+                expected_task=task,
+                selected_provider=candidate.provider,
+                commit=recovered_commit,
+                expected_intent=durable_intent,
+                validate_evidence=lambda: validate_selection_evidence(
+                    str(durable_intent["verifiedScopedTreeSha256"]),
+                    str(durable_intent["quarantinePathsSha256"]),
+                ),
+            )
+
+    recovered_task = recover_completed_acceptance()
+    if recovered_task is not None:
+        return CommandOutput(
+            "Candidate acceptance recovered",
+            {
+                "acceptance": {
+                    "taskId": task_id,
+                    "provider": candidate.provider,
+                    "patchSha256": candidate.captured_patch_sha256,
+                    "verifiedScopedTreeSha256": task[
+                        "acceptanceIntent"
+                    ]["verifiedScopedTreeSha256"],
+                    "appliedScopedTreeSha256": task[
+                        "acceptanceIntent"
+                    ]["verifiedScopedTreeSha256"],
+                    "quarantinePathsSha256": task[
+                        "acceptanceIntent"
+                    ]["quarantinePathsSha256"],
+                    "commit": recovered_task.get("commit"),
+                    "noCommit": bool(run["noCommit"]),
+                    "recovered": True,
+                },
+                "task": recovered_task,
+            },
+        )
+
     backend_request = (
         run["gateSandbox"].get("backend", "auto")
         if isinstance(run.get("gateSandbox"), Mapping)
@@ -3647,6 +3981,28 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         ),
     }
     accepted_holder: dict[str, Mapping[str, Any]] = {}
+    intent_holder: dict[str, Mapping[str, Any]] = {}
+
+    def record_acceptance_intent(
+        verified_tree_sha256: str,
+        quarantine_paths_sha256: str,
+    ) -> None:
+        intent = acceptance_intent(
+            verified_tree_sha256,
+            quarantine_paths_sha256,
+        )
+        store.record_candidate_acceptance_intent_in_transaction(
+            run_id,
+            task_id,
+            expected_run=run,
+            expected_task=task,
+            intent=intent,
+            validate_evidence=lambda: validate_selection_evidence(
+                verified_tree_sha256,
+                quarantine_paths_sha256,
+            ),
+        )
+        intent_holder["intent"] = intent
 
     def finalize_acceptance(acceptance_result: Any) -> None:
         expected_head = (
@@ -3710,6 +4066,7 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
                 expected_task=task,
                 selected_provider=candidate.provider,
                 commit=acceptance_result.commit,
+                expected_intent=intent_holder["intent"],
                 validate_evidence=lambda: validate_selection_evidence(
                     acceptance_result.verified_scoped_tree_sha256,
                     acceptance_result.quarantine_paths_sha256,
@@ -3737,6 +4094,7 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         approved_binary_outputs=(),
         quarantine_resolver=resolve_quarantine,
         pre_apply_validator=validate_selection_evidence,
+        acceptance_intent_recorder=record_acceptance_intent,
         acceptance_finalizer=finalize_acceptance,
         no_commit=bool(run["noCommit"]),
         task_count=len(store.load_tasks(run_id)["tasks"]),

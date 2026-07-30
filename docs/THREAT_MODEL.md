@@ -106,6 +106,12 @@ selection record even though acceptance would later rerun real gates.
 - Selection and acceptance use repository/run compare-and-swap transactions;
   acceptance writes task state before releasing the repository lock used for
   isolated verification, patch application, and commit.
+- Only the selection binder may enter `candidate_ready`; task-state validation
+  requires selected candidate and gate-receipt bindings for selected states.
+- Before applying in orchestration, acceptance records a durable intent bound
+  to the exact patch, verified tree, quarantine set, gate receipt, commit
+  message, and no-commit policy. Retries prove and bind an interrupted exact
+  commit or staged result instead of duplicating it or becoming stranded.
 - Acceptance re-hashes and validates the receipt before its separate fresh
   verification pass.
 

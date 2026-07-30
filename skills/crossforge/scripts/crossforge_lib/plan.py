@@ -769,6 +769,7 @@ def materialize_tasks(
                 "selectedCandidatePath": None,
                 "selectedGateEvidencePath": None,
                 "selectedGateEvidenceSha256": None,
+                "acceptanceIntent": None,
                 "selectedInvocationEvidencePath": None,
                 "selectedInvocationEvidenceSha256": None,
                 "commit": None,
