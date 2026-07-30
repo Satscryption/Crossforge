@@ -262,7 +262,9 @@ supply booleans, an evidence path, or an executable override. Missing, forged,
 mutated, partial, failed, or inconclusive output is rejected and never bound.
 Every provider attempt writes to an immutable
 `provider/attempt-NN/` directory containing its own brief, context, runtime,
-policy, raw output, patch, and validated report.
+policy, raw output, patch, and validated report. The control layer hashes the
+exact report bytes it validates and records both that digest and the canonical
+report path on the candidate entry in the active run registry.
 
 ### 6. Restoration, scope, and capture
 
@@ -274,7 +276,13 @@ restricted evidence and makes the candidate ineligible.
 
 For an eligible-scope worktree, Crossforge captures a binary Git patch, hashes
 it, proves it applies to a clean base, and confirms index cleanup does not
-change the patch. Providers do not commit.
+change the patch. Candidate creation, capture, selection, acceptance, and
+cleanup all require the repository identity, current commit, task, and registry
+to match the active durable run. External-provider capture additionally
+revalidates the canonical invocation report and requires its patch hash to
+equal the newly captured patch. Selection durably binds the candidate and
+report paths plus report digest; acceptance rechecks that full binding.
+Providers do not commit.
 
 ### 7. Independent verification
 
@@ -297,7 +305,9 @@ locally with hashes; provider-reported verification cannot replace it.
 Hard-gate failures remove a candidate before comparison. Claude compares only
 eligible candidates using requirement completeness, correctness, test quality,
 security, interface fidelity, conventions, maintainability, complexity,
-performance, and diff economy.
+performance, and diff economy. Selection parses only report bytes matching the
+candidate's invocation digest and requires report provider, base, and patch
+identity to match the recorded candidate.
 
 Acceptance repeats patch application, exact scope, and gates in a fresh
 worktree. The control layer then applies the verified patch to a clean

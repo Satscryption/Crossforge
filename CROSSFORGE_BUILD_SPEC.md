@@ -2139,6 +2139,7 @@ directory.
       "status": "active",
       "writerLockPath": "/evidence/T1/codex/writer.lock",
       "capturedPatchSha256": null,
+      "invocationEvidenceSha256": null,
       "createdAt": "RFC3339 UTC",
       "cleanedAt": null
     }
@@ -2149,6 +2150,16 @@ directory.
 Entry status is `creating`, `active`, `captured`, `retained`, or `cleaned`.
 Canonical path equality, not string-prefix matching, is required for every
 cleanup operation.
+
+`create-candidate`, `capture-candidate`, `record-selection`,
+`accept-candidate`, and `cleanup` must resolve the repository-common active run
+and reject a registry other than that run's canonical `worktrees.json`. They
+must also bind repository identity, orchestration commit, active task, and task
+base. After a successful provider invocation, the control layer records the
+SHA-256 of the exact validated report bytes as
+`invocationEvidenceSha256`. External-provider capture requires this value.
+Selection must parse the digest-bound report and require its provider, base
+commit, and patch hash to match the recorded candidate.
 
 ---
 

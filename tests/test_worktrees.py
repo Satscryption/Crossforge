@@ -92,6 +92,12 @@ class CreationAndRegistryTests(WorktreeCase):
         self.assertEqual(str(self.root.resolve()), recorded["worktreeRoot"])
         self.assertEqual(str(entry.path), recorded["entries"][0]["path"])
         self.assertEqual("active", recorded["entries"][0]["status"])
+        self.assertIsNone(
+            recorded["entries"][0]["invocationEvidenceSha256"]
+        )
+        self.assertIsNone(
+            recorded["entries"][0]["invocationEvidencePath"]
+        )
 
     def test_existing_destination_and_escape_are_refused(self) -> None:
         self.create()
@@ -109,6 +115,22 @@ class CreationAndRegistryTests(WorktreeCase):
         self.create()
         value = json.loads(self.registry_path.read_text(encoding="utf-8"))
         value["unexpected"] = True
+        self.registry_path.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaises(WorktreeStateError):
+            self.manager.registry.load()
+
+    def test_registry_rejects_invalid_invocation_evidence_hash(self) -> None:
+        self.create()
+        value = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        value["entries"][0]["invocationEvidenceSha256"] = "not-a-hash"
+        self.registry_path.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaises(WorktreeStateError):
+            self.manager.registry.load()
+
+    def test_registry_rejects_invalid_invocation_evidence_path(self) -> None:
+        self.create()
+        value = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        value["entries"][0]["invocationEvidencePath"] = ""
         self.registry_path.write_text(json.dumps(value), encoding="utf-8")
         with self.assertRaises(WorktreeStateError):
             self.manager.registry.load()
@@ -142,6 +164,8 @@ class CreationAndRegistryTests(WorktreeCase):
                 status="creating",
                 writer_lock_path=path / ".crossforge-writer.lock",
                 captured_patch_sha256=None,
+                invocation_evidence_sha256=None,
+                invocation_evidence_path=None,
                 created_at="2026-07-24T12:00:00Z",
                 cleaned_at=None,
             )

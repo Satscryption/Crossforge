@@ -7,6 +7,7 @@ results are accepted separately and are never inferred from the report's
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -438,6 +439,7 @@ def load_provider_report(
     *,
     require_evidence_files: bool = True,
     verify_hashes: bool = True,
+    expected_sha256: str | None = None,
 ) -> ProviderReport:
     """Read and validate ``report.json`` relative to its containing directory."""
 
@@ -445,7 +447,15 @@ def load_provider_report(
     if candidate.is_symlink() or not candidate.is_file():
         raise PreconditionError(f"Provider report is missing: {candidate}")
     try:
-        raw = json.loads(candidate.read_text(encoding="utf-8"))
+        raw_bytes = candidate.read_bytes()
+        if expected_sha256 is not None and (
+            _HEX_64.fullmatch(expected_sha256) is None
+            or hashlib.sha256(raw_bytes).hexdigest() != expected_sha256
+        ):
+            raise PreconditionError(
+                "Provider report bytes do not match invoke-bound evidence"
+            )
+        raw = json.loads(raw_bytes)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise InvalidInputError(f"Provider report is not valid UTF-8 JSON: {candidate}") from error
     return validate_provider_report(

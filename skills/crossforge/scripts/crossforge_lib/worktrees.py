@@ -41,8 +41,14 @@ _ENTRY_KEYS = {
     "status",
     "writerLockPath",
     "capturedPatchSha256",
+    "invocationEvidenceSha256",
+    "invocationEvidencePath",
     "createdAt",
     "cleanedAt",
+}
+_ENTRY_REQUIRED_KEYS = _ENTRY_KEYS - {
+    "invocationEvidenceSha256",
+    "invocationEvidencePath",
 }
 _REGISTRY_KEYS = {"schemaVersion", "worktreeRoot", "entries"}
 _ENTRY_STATUSES = {
@@ -74,6 +80,8 @@ class WorktreeEntry:
     status: str
     writer_lock_path: Path
     captured_patch_sha256: str | None
+    invocation_evidence_sha256: str | None
+    invocation_evidence_path: Path | None
     created_at: str
     cleaned_at: str | None
 
@@ -86,6 +94,12 @@ class WorktreeEntry:
             "status": self.status,
             "writerLockPath": str(self.writer_lock_path),
             "capturedPatchSha256": self.captured_patch_sha256,
+            "invocationEvidenceSha256": self.invocation_evidence_sha256,
+            "invocationEvidencePath": (
+                str(self.invocation_evidence_path)
+                if self.invocation_evidence_path is not None
+                else None
+            ),
             "createdAt": self.created_at,
             "cleanedAt": self.cleaned_at,
         }
@@ -93,7 +107,7 @@ class WorktreeEntry:
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "WorktreeEntry":
         unknown = set(value) - _ENTRY_KEYS
-        missing = _ENTRY_KEYS - set(value)
+        missing = _ENTRY_REQUIRED_KEYS - set(value)
         if unknown or missing:
             raise WorktreeStateError(
                 "Invalid worktree entry keys",
@@ -106,12 +120,20 @@ class WorktreeEntry:
             raise WorktreeStateError(f"Invalid worktree status: {value['status']}")
         if not _COMMIT_RE.fullmatch(value["baseCommit"]):
             raise WorktreeStateError("Worktree baseCommit must be a 40-character lowercase SHA-1")
-        for name in ("capturedPatchSha256",):
-            field = value[name]
+        for name in ("capturedPatchSha256", "invocationEvidenceSha256"):
+            field = value.get(name)
             if field is not None and (
                 not isinstance(field, str) or not re.fullmatch(r"[0-9a-f]{64}", field)
             ):
                 raise WorktreeStateError(f"Invalid worktree entry field: {name}")
+        invocation_evidence_path = value.get("invocationEvidencePath")
+        if invocation_evidence_path is not None and (
+            not isinstance(invocation_evidence_path, str)
+            or not invocation_evidence_path
+        ):
+            raise WorktreeStateError(
+                "Invalid worktree entry field: invocationEvidencePath"
+            )
         if value["cleanedAt"] is not None and not isinstance(value["cleanedAt"], str):
             raise WorktreeStateError("Invalid worktree entry field: cleanedAt")
         return cls(
@@ -122,6 +144,12 @@ class WorktreeEntry:
             status=value["status"],
             writer_lock_path=Path(value["writerLockPath"]),
             captured_patch_sha256=value["capturedPatchSha256"],
+            invocation_evidence_sha256=value.get("invocationEvidenceSha256"),
+            invocation_evidence_path=(
+                Path(invocation_evidence_path)
+                if invocation_evidence_path is not None
+                else None
+            ),
             created_at=value["createdAt"],
             cleaned_at=value["cleanedAt"],
         )
@@ -299,6 +327,8 @@ class WorktreeManager:
             status="creating",
             writer_lock_path=evidence / "writer.lock",
             captured_patch_sha256=None,
+            invocation_evidence_sha256=None,
+            invocation_evidence_path=None,
             created_at=utc_now(),
             cleaned_at=None,
         )

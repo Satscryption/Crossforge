@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,14 +25,18 @@ if str(SCRIPTS) not in sys.path:
 import crossforge as crossforge_cli  # noqa: E402
 from crossforge_lib.config import load_config  # noqa: E402
 from crossforge_lib.consent import deny_policy_hash, record_consent  # noqa: E402
-from crossforge_lib.errors import InvalidInputError, PreconditionError  # noqa: E402
+from crossforge_lib.errors import (  # noqa: E402
+    InvalidInputError,
+    PreconditionError,
+    StateInconsistencyError,
+)
 from crossforge_lib.gates import ProbeCheck, SandboxProbeResult  # noqa: E402
 from crossforge_lib.git import (  # noqa: E402
     discover_repository,
     repository_identity,
     resolve_commit,
 )
-from crossforge_lib.models import ProviderStatus  # noqa: E402
+from crossforge_lib.models import ProviderStatus, TaskStatus  # noqa: E402
 from crossforge_lib.plan import load_plan, materialize_tasks, plan_sha256  # noqa: E402
 from crossforge_lib.providers.base import (  # noqa: E402
     CapabilityProbe,
@@ -151,6 +156,92 @@ def runtime_task(
     task["selectedCandidate"] = selected
     task["commit"] = commit if status in {"committed", "complete"} else None
     return task
+
+
+def write_provider_report_fixture(
+    directory: Path,
+    *,
+    provider: str,
+    base_commit: str,
+    patch_bytes: bytes,
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    fixtures = {
+        "spec.md": b"task brief\n",
+        "context-manifest.json": b'{"files":[]}\n',
+        "runtime-manifest.json": (
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "providerExecutableIdentity": {
+                        "path": f"/usr/bin/{provider}",
+                        "sha256": "a" * 64,
+                    },
+                    "providerArgvSha256": "b" * 64,
+                }
+            ).encode()
+            + b"\n"
+        ),
+        "sandbox-policy.json": b'{"network":"deny"}\n',
+        "final.txt": b"done\n",
+        "candidate.patch": patch_bytes,
+        "stdout.raw": b"",
+        "stderr.raw": b"",
+        "tests.txt": b"ok\n",
+    }
+    for name, contents in fixtures.items():
+        atomic_write_bytes(directory / name, contents)
+    report = {
+        "schemaVersion": 1,
+        "status": "complete",
+        "provider": provider,
+        "requestedModel": "auto",
+        "resolvedModel": "test-model",
+        "cliVersion": "test-1",
+        "baseCommit": base_commit,
+        "objective": "Implement T1",
+        "taskBriefSha256": sha256_file(directory / "spec.md"),
+        "contextManifestSha256": sha256_file(
+            directory / "context-manifest.json"
+        ),
+        "runtimeManifestSha256": sha256_file(
+            directory / "runtime-manifest.json"
+        ),
+        "sandboxPolicySha256": sha256_file(
+            directory / "sandbox-policy.json"
+        ),
+        "startedAt": "2026-07-24T12:00:00Z",
+        "completedAt": "2026-07-24T12:00:01Z",
+        "durationMs": 1000,
+        "exitCode": 0,
+        "timedOut": False,
+        "changedFiles": [
+            {
+                "path": "app.txt",
+                "status": "modified",
+                "summary": "Updated behavior",
+            }
+        ],
+        "scopeCheck": {"passed": True, "violations": []},
+        "verification": [
+            {
+                "argv": ["python3", "-m", "unittest"],
+                "exitCode": 0,
+                "durationMs": 100,
+                "outputPath": "tests.txt",
+            }
+        ],
+        "gaps": [],
+        "risks": [],
+        "finalMessagePath": "final.txt",
+        "patchPath": "candidate.patch",
+        "patchSha256": sha256_file(directory / "candidate.patch"),
+        "rawStdoutPath": "stdout.raw",
+        "rawStderrPath": "stderr.raw",
+    }
+    report_path = directory / "report.json"
+    atomic_write_json(report_path, report)
+    return report_path
 
 
 def load_plan_value(value: dict):
@@ -798,6 +889,18 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         result = json.loads(stdout)["result"]["lanes"][0]
         report = load_provider_report(result["reportPath"])
         self.assertEqual("complete", report.status)
+        self.assertEqual(
+            sha256_file(result["reportPath"]),
+            result["invocationEvidenceSha256"],
+        )
+        self.assertEqual(
+            result["invocationEvidenceSha256"],
+            manager.registry.get(candidate.path).invocation_evidence_sha256,
+        )
+        self.assertEqual(
+            Path(result["reportPath"]).resolve(),
+            manager.registry.get(candidate.path).invocation_evidence_path,
+        )
         self.assertEqual(["app.txt"], [item["path"] for item in report.data["changedFiles"]])
         self.assertEqual(1, store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"])
         self.assertTrue((candidate.path / ".git").is_file())
@@ -860,6 +963,30 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         self.assertEqual(
             2,
             store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"],
+        )
+        (candidate.path / "app.txt").write_text(
+            "provider change\n",
+            encoding="utf-8",
+        )
+        captured_patch = self.root / "invoke-bound.patch"
+        code, stdout, stderr = invoke_cli(
+            "capture-candidate",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--worktree",
+            str(candidate.path),
+            "--patch",
+            str(captured_patch),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        self.assertEqual(
+            report.data["patchSha256"],
+            json.loads(stdout)["result"]["capturedPatchSha256"],
         )
 
     def test_forged_capability_cannot_invoke_without_durable_boundary(self) -> None:
@@ -1249,6 +1376,467 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
 
 
 class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
+    def test_candidate_lifecycle_requires_active_registry_and_invoke_evidence(
+        self,
+    ) -> None:
+        task = runtime_task(self.commit, status="in_progress")
+        store, run_id = self.seed_state(tasks=[task], active_task="T1")
+        identity = repository_identity(self.discovered)
+        run = store.load_run(run_id)
+        run["repositoryIdentity"] = identity
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+        worktree_root = self.root / "worktrees"
+        registry = store.run_dir(run_id) / "worktrees.json"
+        atomic_write_json(
+            registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        forged_registry = self.root / "forged-worktrees.json"
+        atomic_write_json(
+            forged_registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        record_request = self.root / "forged-selection.json"
+        accept_request = self.root / "forged-acceptance.json"
+        for path in (record_request, accept_request):
+            atomic_write_json(
+                path,
+                {
+                    "repository": str(self.repository),
+                    "gitCommonDir": str(self.common),
+                    "worktreeRoot": str(worktree_root),
+                    "registry": str(forged_registry),
+                    "runId": run_id,
+                    "taskId": "T1",
+                },
+            )
+        lifecycle_calls = (
+            (
+                "create-candidate",
+                "--repository",
+                str(self.repository),
+                "--worktree-root",
+                str(worktree_root),
+                "--registry",
+                str(forged_registry),
+                "--run-id",
+                run_id,
+                "--task-id",
+                "T1",
+                "--provider",
+                "codex",
+                "--base-commit",
+                self.commit,
+                "--evidence-dir",
+                str(self.root / "evidence"),
+            ),
+            (
+                "capture-candidate",
+                "--repository",
+                str(self.repository),
+                "--worktree-root",
+                str(worktree_root),
+                "--registry",
+                str(forged_registry),
+                "--worktree",
+                str(worktree_root / "candidate"),
+                "--patch",
+                str(self.root / "candidate.patch"),
+            ),
+            (
+                "record-selection",
+                "--request",
+                str(record_request),
+            ),
+            (
+                "accept-candidate",
+                "--request",
+                str(accept_request),
+            ),
+            (
+                "cleanup",
+                "--repository",
+                str(self.repository),
+                "--worktree-root",
+                str(worktree_root),
+                "--registry",
+                str(forged_registry),
+                "--worktree",
+                str(worktree_root / "candidate"),
+                "--patch",
+                str(self.root / "candidate.patch"),
+                "--evidence-durable",
+            ),
+        )
+        for arguments in lifecycle_calls:
+            with self.subTest(command=arguments[0]):
+                code, stdout, stderr = invoke_cli(*arguments, "--json")
+                self.assertNotEqual(0, code)
+                self.assertIn(
+                    "candidate registry is not the active run registry",
+                    stdout + stderr,
+                )
+
+        code, stdout, stderr = invoke_cli(
+            "create-candidate",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--run-id",
+            run_id,
+            "--task-id",
+            "T1",
+            "--provider",
+            "codex",
+            "--base-commit",
+            self.commit,
+            "--evidence-dir",
+            str(self.root / "evidence"),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        candidate_path = Path(
+            json.loads(stdout)["result"]["path"]
+        )
+        self.addCleanup(
+            lambda: subprocess.run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(candidate_path),
+                ],
+                cwd=self.repository,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        )
+        (candidate_path / "app.txt").write_text(
+            "unattested change\n",
+            encoding="utf-8",
+        )
+        patch = self.root / "candidate.patch"
+        capture_arguments = (
+            "capture-candidate",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--worktree",
+            str(candidate_path),
+            "--patch",
+            str(patch),
+            "--json",
+        )
+        code, stdout, stderr = invoke_cli(*capture_arguments)
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "candidate has no invoke-bound provider evidence",
+            stdout + stderr,
+        )
+        manager = WorktreeManager(
+            self.repository,
+            worktree_root,
+            registry,
+            repository_id_prefix=identity[:12],
+        )
+        recorded = manager.registry.get(candidate_path)
+        forged_report = self.root / "forged-report.json"
+        forged_report.write_text('{"forged":true}\n', encoding="utf-8")
+        manager.registry.update(
+            replace(
+                recorded,
+                invocation_evidence_sha256=sha256_file(forged_report),
+                invocation_evidence_path=forged_report,
+            )
+        )
+        code, stdout, stderr = invoke_cli(*capture_arguments)
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "outside active run evidence",
+            stdout + stderr,
+        )
+        captured = manager.capture_patch(
+            manager.registry.get(candidate_path),
+            patch,
+        )
+        store.transition_task(
+            run_id,
+            "T1",
+            TaskStatus.CANDIDATE_READY,
+            updates={
+                "selectedCandidate": "codex",
+                "selectedCandidatePath": str(candidate_path.resolve()),
+                "selectedInvocationEvidencePath": str(forged_report.resolve()),
+                "selectedInvocationEvidenceSha256": (
+                    captured.invocation_evidence_sha256
+                ),
+            },
+        )
+        unattested_acceptance = self.root / "unattested-acceptance.json"
+        atomic_write_json(
+            unattested_acceptance,
+            {
+                "repository": str(self.repository),
+                "gitCommonDir": str(self.common),
+                "worktreeRoot": str(worktree_root),
+                "registry": str(registry),
+                "runId": run_id,
+                "taskId": "T1",
+                "candidatePath": str(candidate_path),
+            },
+        )
+        code, stdout, stderr = invoke_cli(
+            "accept-candidate",
+            "--request",
+            str(unattested_acceptance),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "outside active run evidence",
+            stdout + stderr,
+        )
+
+    def test_blocked_run_can_cleanup_a_captured_candidate(self) -> None:
+        task = runtime_task(self.commit, status="in_progress")
+        store, run_id = self.seed_state(tasks=[task], active_task="T1")
+        identity = repository_identity(self.discovered)
+        run = store.load_run(run_id)
+        run["repositoryIdentity"] = identity
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+        worktree_root = self.root / "worktrees"
+        registry = store.run_dir(run_id) / "worktrees.json"
+        atomic_write_json(
+            registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        manager = WorktreeManager(
+            self.repository,
+            worktree_root,
+            registry,
+            repository_id_prefix=identity[:12],
+        )
+        candidate = manager.create(
+            run_id=run_id,
+            task_id="T1",
+            provider="codex",
+            base_commit=self.commit,
+            evidence_dir=store.run_dir(run_id) / "evidence" / "T1" / "worktree",
+        )
+        (candidate.path / "app.txt").write_text(
+            "provider change\n",
+            encoding="utf-8",
+        )
+        patch = self.root / "blocked-candidate.patch"
+        manager.capture_patch(candidate, patch)
+        store.transition_task(run_id, "T1", TaskStatus.BLOCKED)
+        run = store.load_run(run_id)
+        run["status"] = "blocked"
+        run["blockedReason"] = "provider attempts exhausted"
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+
+        code, stdout, stderr = invoke_cli(
+            "cleanup",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--worktree",
+            str(candidate.path),
+            "--patch",
+            str(patch),
+            "--evidence-durable",
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        self.assertEqual("cleaned", json.loads(stdout)["result"]["status"])
+        self.assertFalse(candidate.path.exists())
+
+    def test_selection_report_must_match_invoke_bound_candidate(self) -> None:
+        task = runtime_task(self.commit, status="in_progress")
+        store, run_id = self.seed_state(tasks=[task], active_task="T1")
+        identity = repository_identity(self.discovered)
+        run = store.load_run(run_id)
+        run["repositoryIdentity"] = identity
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+        worktree_root = self.root / "worktrees"
+        registry = store.run_dir(run_id) / "worktrees.json"
+        atomic_write_json(
+            registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        manager = WorktreeManager(
+            self.repository,
+            worktree_root,
+            registry,
+            repository_id_prefix=identity[:12],
+        )
+        candidate = manager.create(
+            run_id=run_id,
+            task_id="T1",
+            provider="codex",
+            base_commit=self.commit,
+            evidence_dir=store.run_dir(run_id) / "evidence" / "T1" / "worktree",
+        )
+        self.addCleanup(
+            lambda: subprocess.run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(candidate.path),
+                ],
+                cwd=self.repository,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        )
+        (candidate.path / "app.txt").write_text(
+            "provider change\n",
+            encoding="utf-8",
+        )
+        patch_path = self.root / "candidate.patch"
+        candidate = manager.capture_patch(candidate, patch_path)
+        canonical_report = write_provider_report_fixture(
+            (
+                store.run_dir(run_id)
+                / "evidence"
+                / "T1"
+                / "codex"
+                / "attempt-01"
+            ),
+            provider="codex",
+            base_commit=self.commit,
+            patch_bytes=patch_path.read_bytes(),
+        )
+        outside_report = write_provider_report_fixture(
+            self.root / "fabricated-report",
+            provider="codex",
+            base_commit=self.commit,
+            patch_bytes=patch_path.read_bytes(),
+        )
+        candidate = replace(
+            candidate,
+            invocation_evidence_sha256=sha256_file(canonical_report),
+            invocation_evidence_path=canonical_report,
+        )
+        manager.registry.update(candidate)
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("app.txt\n", encoding="utf-8")
+        request_path = self.root / "record-selection.json"
+        request = {
+            "repository": str(self.repository),
+            "gitCommonDir": str(self.common),
+            "worktreeRoot": str(worktree_root),
+            "registry": str(registry),
+            "repositoryIdPrefix": identity[:12],
+            "runId": run_id,
+            "taskId": "T1",
+            "candidatePath": str(candidate.path),
+            "allowlistPath": str(allowlist),
+            "approvedSymlinks": {},
+            "taskBaseCommit": self.commit,
+            "providerReport": str(outside_report),
+            "independentGateResults": [
+                {
+                    "passed": True,
+                    "provenance": "independent",
+                    "argv": ["python3", "-m", "unittest"],
+                    "exitCode": 0,
+                    "durationMs": 1,
+                    "outputPath": "tests.txt",
+                }
+            ],
+            "patchPath": str(patch_path),
+            "planGuardrailsPassed": True,
+            "publicContractApproved": True,
+            "generatedAndBinaryContentExplained": True,
+        }
+        atomic_write_json(request_path, request)
+        code, stdout, stderr = invoke_cli(
+            "record-selection",
+            "--request",
+            str(request_path),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "differs from invoke-bound candidate evidence",
+            stdout + stderr,
+        )
+
+        request["providerReport"] = str(canonical_report)
+        atomic_write_json(request_path, request)
+        code, stdout, stderr = invoke_cli(
+            "record-selection",
+            "--request",
+            str(request_path),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        selected = json.loads(stdout)["result"]["task"]
+        self.assertEqual(
+            sha256_file(canonical_report),
+            selected["selectedInvocationEvidenceSha256"],
+        )
+        self.assertEqual(
+            str(canonical_report.resolve()),
+            selected["selectedInvocationEvidencePath"],
+        )
+
+        raw = json.loads(canonical_report.read_text(encoding="utf-8"))
+        raw["objective"] = "forged after selection"
+        atomic_write_json(canonical_report, raw)
+        accept_request = self.root / "accept.json"
+        atomic_write_json(
+            accept_request,
+            {
+                "repository": str(self.repository),
+                "gitCommonDir": str(self.common),
+                "worktreeRoot": str(worktree_root),
+                "registry": str(registry),
+                "runId": run_id,
+                "taskId": "T1",
+                "candidatePath": str(candidate.path),
+            },
+        )
+        code, stdout, stderr = invoke_cli(
+            "accept-candidate",
+            "--request",
+            str(accept_request),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn("invoke-bound evidence", stdout + stderr)
+
     def test_gate_executable_allowlist_is_bounded_by_the_approved_plan(
         self,
     ) -> None:

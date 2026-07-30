@@ -48,13 +48,18 @@ git diff --binary --no-ext-diff <base-commit> --
 
 Record the patch SHA-256, prove it applies to a clean base, clear intent-to-add
 without changing working files, and confirm the hash is unchanged. Providers
-never commit.
+never commit. For Codex and Grok candidates, first re-hash and validate the
+canonical report written by `invoke`; after capture, require the patch hash to
+equal the report's patch hash.
 
 Acceptance uses a fresh worktree at the same base: check and apply the exact
 patch, re-check scope and the full diff, run gates in the sandbox, and hash the
-verified scoped tree. Only then may the control layer apply that patch to a
-clean orchestration branch and require byte-identical scoped-tree hashes.
-Candidate code never executes in the orchestration checkout.
+verified scoped tree. Before doing so, require the selected candidate path,
+invocation-report path, and report digest to equal the durable task selection,
+then revalidate the report's provider, base, and patch. Only then may the
+control layer apply that patch to a clean orchestration branch and require
+byte-identical scoped-tree hashes. Candidate code never executes in the
+orchestration checkout.
 
 ## Cleanup
 
@@ -65,5 +70,7 @@ it, and confirm a clean status before ordinary `git worktree remove`.
 
 Never force-remove or recursively delete a candidate path. If containment,
 patch reversal, cleanliness, or capture proof fails, mark it `retained`.
+Cleanup remains available when provider exhaustion has blocked the active run
+and task.
 Allowed entry states are `creating`, `active`, `captured`, `retained`, and
 `cleaned`.

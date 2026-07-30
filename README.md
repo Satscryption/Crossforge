@@ -335,7 +335,9 @@ It contains repository consent, short-lived unapproved consent requests,
 provider statistics, locks, `active` and `latest-complete` pointers, and a
 directory per run. Run records include the canonical plan and approval hash,
 task state, decisions, interfaces, worktree registry, shipment checkpoints,
-and owner-only evidence. Do not edit these files by hand.
+and owner-only evidence. Candidate lifecycle commands accept only the active
+run's registry. External-provider entries bind the exact validated invocation
+report hash before capture or selection. Do not edit these files by hand.
 
 Candidate worktrees default to:
 

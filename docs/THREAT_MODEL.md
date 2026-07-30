@@ -247,6 +247,28 @@ patch is applied to the wrong base.
 - A fresh worktree independently verifies the selected patch.
 - The applied scoped-tree hash must equal the verified tree byte-for-byte.
 
+### Forged provider attribution
+
+**Threat:** A caller uses a separate worktree registry, authors candidate bytes
+without invoking Codex or Grok, and supplies a fabricated provider report so
+the selection and commit history claim independent provider authorship.
+
+**Mitigations:**
+
+- Candidate creation, capture, selection, acceptance, and cleanup resolve the
+  repository-common active run and reject every other registry.
+- The active run's repository identity, current commit, active task, task base,
+  and repository-ID prefix are rechecked for each lifecycle operation.
+- `invoke` records the canonical run-evidence report path and hashes the exact
+  validated report bytes on the candidate registry entry.
+- External-provider capture revalidates those report bytes and requires the
+  newly captured patch to have the report's exact patch hash.
+- Selection parses only the digest-bound report bytes and requires its
+  canonical path, provider, base commit, and patch hash to match the recorded
+  candidate, then durably binds candidate path, report path, and report digest.
+- Acceptance requires the candidate and evidence to equal that durable
+  selection and revalidates the report and patch before applying anything.
+
 ### Worktree cleanup traversal or data loss
 
 **Threat:** Cleanup follows a symlink, accepts a string-prefix collision,
