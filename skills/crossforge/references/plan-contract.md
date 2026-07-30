@@ -3,7 +3,10 @@
 `plan.json` is the only canonical plan. `plan.md` is a deterministic rendering
 for people and is never parsed as authority. Convert an imported Markdown plan
 to candidate JSON, validate it, show it to the user, and record approval of the
-exact canonical JSON SHA-256 before initializing a build.
+exact canonical JSON SHA-256 before initializing a build. The approval record
+is model-attested: the control layer validates its schema and exact hash
+binding but does not independently observe or authenticate the user's
+response.
 
 ## Required plan shape
 
@@ -33,6 +36,7 @@ Use `validate-plan`, `render-plan`, and `materialize-tasks`. Deterministic code
 may validate and add runtime fields but must not infer product meaning. Any
 change to canonical JSON invalidates approval, even when it appears stricter.
 The approved hash stored in run state must equal the current canonical bytes.
+That equality proves byte consistency, not human provenance.
 
 `shippingIntent` is either `local-only` or
 `publish-on-later-explicit-request`; neither authorizes publication. A

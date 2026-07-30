@@ -7,6 +7,12 @@ to the shipping launcher. The shipping skill is user-invocable only and never
 invokes remote-writing Git or forge commands directly.
 `record-shipment` is the sole write reconciler.
 
+Direct skill invocation is the supported user-scoped host boundary.
+`--publication-requested` and `--target-change-approved` are still
+caller-attested inputs to Python: they do not independently prove the original
+user prompt or the identity of the caller. The controls below verify the exact
+authorization tuple and remote effects after those assertions are supplied.
+
 ## Preconditions
 
 `ship-preflight` is read-only and must prove:
@@ -16,8 +22,8 @@ invokes remote-writing Git or forge commands directly.
 - repository identity, checked-out branch, and `HEAD` match durable state;
 - the orchestration checkout is clean;
 - isolated final verification passed at the exact final commit;
-- the remote and target match the approved plan, or the user approved the
-  changed destination explicitly;
+- the remote and target match the approved plan, or a caller-attested flag in
+  this user-invoked workflow asserts approval of the changed destination;
 - the remote head is absent, exact, or a proven ancestor of the final commit;
 - the remote target is a proven ancestor of the final commit.
 
@@ -46,8 +52,8 @@ authorization is idempotent only when the tuple and key both match. A mismatch
 must not overwrite an unexpired record. After expiry, a fresh preflight,
 current publication intent, and a new key may renew the exact tuple while
 preserving any durable checkpoints. Cancel an unwritten authorization, obtain
-explicit approval for any destination change, repeat preflight, and create a
-new authorization.
+a caller-attested destination approval, repeat preflight, and create a new
+authorization.
 
 `--dry-run` ends before this boundary. It writes neither authorization nor
 remote state. `record-shipment` requires a fresh `--publication-requested`

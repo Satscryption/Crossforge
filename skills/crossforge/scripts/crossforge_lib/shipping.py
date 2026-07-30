@@ -329,7 +329,7 @@ def _assert_publication_authority(
     publication_requested: bool,
 ) -> None:
     if not publication_requested:
-        raise PreconditionError("current user request does not authorize publication")
+        raise PreconditionError("caller-attested publication intent is required")
 
 
 def _assert_authorization_fresh(shipment: Mapping[str, Any]) -> None:
@@ -670,7 +670,7 @@ def ship_preflight(
     """Perform all read-only checks. This function never authorizes or writes."""
 
     if not publication_requested:
-        raise PreconditionError("current user request does not authorize publication")
+        raise PreconditionError("caller-attested publication intent is required")
     selected_run = run_id or store.latest_complete_run_id()
     if selected_run is None:
         raise PreconditionError("there is no completed Crossforge build to ship")
@@ -686,7 +686,8 @@ def ship_preflight(
         or selected_target != run["targetBranch"]
     ) and not target_change_approved:
         raise PreconditionError(
-            "shipping target differs from the approved plan and needs explicit approval"
+            "shipping target differs from the accepted plan and requires "
+            "caller-attested destination approval"
         )
     head_branch = _validate_name(run["branch"], "head branch")
     final_commit = run["currentCommit"]
@@ -732,7 +733,7 @@ def authorize_shipment(
     if plan.dry_run:
         raise PreconditionError("dry-run cannot record shipping authorization")
     if not publication_requested:
-        raise PreconditionError("current user request does not authorize publication")
+        raise PreconditionError("caller-attested publication intent is required")
     if not _KEY.fullmatch(idempotency_key):
         raise InvalidInputError("idempotency key must be 32 lowercase hexadecimal characters")
     run = store.load_run(plan.run_id)

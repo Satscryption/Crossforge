@@ -11,9 +11,12 @@ CROSSFORGE_LIVE_TESTS=1
 ```
 
 Setting the variable is necessary but not sufficient authorization. Provider
-consent through `/crossforge:crossforge-consent` and any publication request
-through `/crossforge:crossforge-ship` remain separate explicit user actions.
-Never set this variable in ordinary CI.
+consent through `/crossforge:crossforge-consent` and publication through
+`/crossforge:crossforge-ship` remain separate user-invoked surfaces.
+Consent additionally forces a user confirmation over a sealed disclosure.
+Shipping's Python publication/destination flags remain caller-attested even
+though the shipping skill itself requires direct user invocation. Never set
+this variable in ordinary CI.
 
 ## Before testing
 

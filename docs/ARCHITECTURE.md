@@ -34,26 +34,32 @@ reach the supported publication surface. The consent skill is not
 model-invocable, allows only its canonical Bash transaction, and forces an
 exact disclosure prompt. Normal-skill file-mutation and subagent tools are
 blocked so durable consent cannot be hand-written around the CLI. The shipping
-skill requires current publication intent, an unexpired authorization, a
-completed build, a fresh final gate, a URL-bound remote, and remote readback.
+skill requires a fresh caller-attested publication-intent flag, an unexpired
+authorization, a completed build, a fresh final gate, a URL-bound remote, and
+remote readback.
 
 ## Judgment and enforcement
 
 | Concern | Owner |
 | --- | --- |
-| User intent, architecture, assumptions, risk classification | Claude architect |
-| Canonical schema, approval hash, transitions, locks | Control layer |
+| User intent, architecture, assumptions, risk classification | Claude architect; semantic judgment |
+| Plan content and `planApproval` provenance | Claude/caller attestation; hash consistency only |
+| Provider source-transmission consent | User-confirmed host prompt plus control-layer revalidation |
+| Publication intent and destination override | User-invoked shipping boundary plus caller-attested flags |
+| Canonical schema, plan hash binding, transitions, locks | Control layer |
 | Candidate source changes | Codex or Grok in one isolated lane |
 | Provider summary and self-reported checks | Provider claim |
 | Scope, executable identity, sandboxed gates, patch/tree hashes | Independent control-layer evidence |
 | Comparison among eligible candidates | Claude architect |
 | Local patch application and commit | Control layer |
-| External publication authorization | User through `crossforge-ship` |
+| Publication tuple and remote effects | Control layer after the user-scoped entry and caller attestations |
 
 Claude cannot waive a failed invariant. A provider cannot make its work
 eligible by claiming success. Deterministic code does not infer product
 meaning, broaden a file allowlist, expand consent, or silently change provider
-strategy.
+strategy. It also does not authenticate the human provenance of a
+schema-valid plan approval, publication flag, destination override, or
+recovery decision. Those attestations rely on the documented host workflow.
 
 ## Components
 
@@ -93,7 +99,8 @@ removes credential-shaped names after allowlist resolution.
 2. validates exact file paths, task IDs, dependencies, and cycles;
 3. validates every verification command as an argument array;
 4. renders `plan.md` deterministically;
-5. hashes the canonical JSON and checks explicit approval of that hash;
+5. hashes the canonical JSON and checks that the caller-attested approval
+   record names that hash; this proves byte binding, not human provenance;
 6. materializes `tasks.json` by adding runtime fields without semantic
    inference.
 
@@ -371,7 +378,8 @@ repository.lock -> run.lock -> writer.lock
 ```
 
 A live lock blocks. A same-host stale lock can be cleared only after proving
-its PID is absent; a foreign-host stale lock needs explicit user approval.
+its PID is absent; a foreign-host stale lock needs a caller-attested recovery
+approval whose human provenance is not independently authenticated.
 
 ## Recovery and cleanup
 
@@ -399,6 +407,13 @@ recursively deletes a candidate; uncertain cleanup retains it.
 `crossforge-ship` loads a completed run, checks branch/history/cleanliness,
 re-runs the global gate in a clean sandbox, and binds authorization to
 repository identity, run, remote, head, target, and final commit.
+
+Direct invocation of the non-model-invocable shipping skill establishes the
+supported user-scoped entry boundary. The Python
+`--publication-requested` and `--target-change-approved` values remain
+caller-attested; deterministic shipping proves the resulting authorization
+tuple and remote effects, not the original prompt or identity of the caller
+who supplied those flags.
 
 It performs remote readback before each write, never force-pushes, durably
 records a confirmed remote commit before PR work, and creates no PR when an

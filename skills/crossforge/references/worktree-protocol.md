@@ -14,7 +14,7 @@ before use.
 
 Acquire an exclusive writer lock containing PID, hostname, provider, path, and
 start time. Respect the lock order in [run state](run-state.md). A live lock
-blocks; a foreign-host stale lock needs explicit approval.
+blocks; a foreign-host stale lock needs a caller-attested recovery approval.
 
 ## Quarantine and sanitized Git projection
 

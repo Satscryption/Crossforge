@@ -3,16 +3,51 @@
 ## Scope and security objective
 
 Crossforge coordinates remote coding models over a local Git repository. Its
-security objective is to prevent unapproved source transmission, contain
-provider-authored changes, independently verify candidates without exposing
-the user’s wider machine, preserve recoverable local state, and make external
-publication a separate explicit action.
+security objective is to prevent source transmission outside its supported
+user-confirmed consent surface, contain provider-authored changes,
+independently verify candidates without exposing the user’s wider machine,
+preserve recoverable local state, and make external publication a separate
+user-invoked action.
 
-The Python control layer, approved plan, local policy, Git executable, sandbox
-backend, and operating-system isolation are trusted. Repository content,
-provider output, provider-authored code, test/build scripts, worktree Git
-metadata after provider access, and remote forge state are untrusted until
-validated.
+The Python control layer, canonical plan bytes once accepted as policy, local
+policy, Git executable, sandbox backend, and operating-system isolation are
+trusted. Plan semantics and approval provenance are not independently verified.
+Repository content, provider output, provider-authored code, test/build
+scripts, worktree Git metadata after provider access, and remote forge state
+are untrusted until validated.
+
+## Assurance vocabulary and orchestrator boundary
+
+Crossforge uses these terms precisely:
+
+- **Control-verified** means the Python layer derives a result from observed
+  bytes, process effects, repository state, or remote readback and does not
+  accept an equivalent caller-authored result. Capability probes, exact scope,
+  replayed gates, patch/tree hashes, selection receipts, and shipping readback
+  are control-verified.
+- **User-confirmed** means the supported host boundary forces a user prompt
+  over a control-generated disclosure. Provider consent has this assurance:
+  the non-model-invocable consent skill and its hook force an `ask` decision,
+  then the control layer revalidates the sealed request.
+- **Caller-attested** or **model-attested** means the control layer validates
+  schema and internal consistency but cannot prove that the statement came
+  from the user or is semantically true. Plan content and `planApproval`,
+  publication-intent and destination-override flags, recovery decisions, and
+  micro-fix semantic inputs are in this category.
+- **Provider claim** is untrusted provider-authored narrative or reported
+  status. It never substitutes for control-verified evidence.
+
+The `crossforge-ship` skill is non-model-invocable, so direct user invocation
+establishes a supported host-level publication boundary. The Python
+`--publication-requested` and `--target-change-approved` flags are still
+caller attestations; they prove neither the original prompt nor who supplied
+the assertion. Likewise, plan approval is hash-bound but has no separate
+user-only approval hook.
+
+Honest framing: Crossforge strongly defends the user against provider and
+repository misbehavior. It constrains a misaligned orchestrating model with
+deterministic invariants after policy is recorded, but relies on workflow
+convention for model-attested intent, plan semantics, and recovery assertions.
 
 ## Assets
 
@@ -21,7 +56,7 @@ validated.
 - Provider OAuth sessions and credential directories
 - Repository-common Git objects, refs, configuration, and history
 - The orchestration checkout and uncommitted user work
-- Approved plan meaning and exact file allowlists
+- Accepted canonical plan meaning and exact file allowlists
 - Provider task briefs, prompts, stdout/stderr, reports, and patches
 - Gate executables and their identities
 - Durable run, consent, lock, evidence, and shipment state
@@ -32,9 +67,13 @@ validated.
 
 ### User and Claude architect
 
-The user authorizes intent, provider source transmission, plan hashes, recovery
-decisions, and publication. Claude supplies semantic judgment. Neither can
-silently weaken deterministic invariants during a run.
+The user supplies intent and Claude translates it into plans, selections, and
+control-layer requests. The consent hook obtains a distinct user confirmation
+for provider source transmission. Plan approval, recovery decisions, and
+shipping intent/override flags remain model-attested within their documented
+host workflows. Claude cannot waive a failed deterministic invariant, but a
+schema-valid attestation does not prove that Claude represented the user’s
+meaning faithfully.
 
 ### Deterministic control layer
 
@@ -61,7 +100,34 @@ orchestration checkout.
 
 Normal Crossforge execution stops at local commits. `crossforge-ship` is a
 separate user-invoked boundary with an immutable authorization tuple,
-read-before-write behavior, and durable idempotency checkpoints.
+read-before-write behavior, and durable idempotency checkpoints. Its host
+invocation is user-scoped; its Python intent and target-override flags are
+caller-attested.
+
+### Misaligned orchestrating model
+
+**Threat:** The orchestrating model creates a schema-valid plan or approval,
+asserts publication or recovery intent that the user did not grant, or
+misrepresents semantic judgment while all byte-level bindings remain valid.
+
+**Mitigations:**
+
+- Provider consent uses a sealed, control-generated disclosure and a forced
+  user confirmation outside the model-invocable skill.
+- Normal build mode cannot access the shipping CLI, and the shipping skill
+  requires direct user invocation.
+- Once recorded, plan hashes, task policy, scope, gates, state transitions,
+  acceptance, and shipping tuples are deterministic and cannot be waived by
+  model text.
+- Caller-attested fields are labeled as such and are not described as
+  independently verified user decisions.
+
+**Residual risk:** There is no separate user-only hook for plan approval,
+publication-intent flags, destination overrides, foreign-host recovery
+approval, or other recovery decisions. A misaligned orchestrator can fabricate
+those attestations when it can reach the corresponding supported surface.
+Operators must inspect them; Crossforge cannot authenticate their semantic
+provenance.
 
 ## Data-flow threats and mitigations
 
@@ -340,7 +406,8 @@ duplicate PRs, hooks execute unsandboxed, or a changed target receives code.
 **Mitigations:**
 
 - The normal skill has no publication path.
-- Shipping requires a completed run and a current explicit user request.
+- Shipping requires a completed run, direct invocation of the user-scoped
+  shipping skill, and a fresh caller-attested publication-intent flag.
 - Dry-run records no authorization and performs no writes.
 - The normal, consent, and shipping skills expose disjoint CLIs; scoped host
   hooks block cross-surface and direct publication commands during supported
@@ -355,7 +422,9 @@ duplicate PRs, hooks execute unsandboxed, or a changed target receives code.
 - Pushes are non-force and disable hooks; required hook equivalents must be
   approved sandboxed gates.
 - Remote and PR confirmations are persisted before the next step.
-- Mismatched targets or commits require cancellation/new approval.
+- Mismatched targets or commits require cancellation and a new
+  caller-attested destination approval within the user-invoked shipping
+  workflow.
 
 **Residual risk:** A compromised forge CLI or server can lie about remote
 state. Crossforge validates normal CLI readback but does not provide
@@ -376,7 +445,7 @@ Fail-closed behavior can block work when a provider CLI changes flags, a
 sandbox probe is inconclusive, an executable changes identity, consent
 expires, a lock owner crashes, or cleanup proof is unavailable. This is an
 intentional availability tradeoff. Recovery preserves evidence and requires
-explicit user decisions where automated proof is insufficient.
+caller-attested operator decisions where automated proof is insufficient.
 
 Provider capability booleans are derived by the control layer, not accepted
 from a caller-authored or model-writable result alone. The producer uses a
@@ -397,6 +466,8 @@ host, which remain out of scope.
 - Protecting against a compromised operating system, kernel, Git binary,
   Python runtime, sandbox executable, or authenticated provider CLI host
 - Guaranteeing that model-authored in-scope logic has no unknown semantic flaw
+- Detecting a misaligned orchestrator that fabricates a schema-valid
+  caller-attested decision where no forced user-confirmation hook exists
 - Managing, rotating, backing up, or revoking provider/forge credentials
 - Automatically merging, rebasing, deploying, or force-pushing
 - Supporting repositories that require networked verification in MVP

@@ -101,7 +101,7 @@ class FileLockTests(unittest.TestCase):
             FileLock(path, kind="repository").acquire()
         self.assertTrue(path.exists())
 
-    def test_foreign_host_requires_explicit_approval(self) -> None:
+    def test_foreign_host_requires_caller_attested_recovery_approval(self) -> None:
         path = self.root / "repository.lock"
         value = {
             "pid": 123,

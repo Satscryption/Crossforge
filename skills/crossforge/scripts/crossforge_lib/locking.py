@@ -235,7 +235,8 @@ class FileLock:
         if foreign:
             if self.approve_foreign_stale is None or not self.approve_foreign_stale(holder):
                 raise LockHeldError(
-                    "lock belongs to another host and requires explicit approval",
+                    "lock belongs to another host and requires "
+                    "caller-attested recovery approval",
                     details={"holder": asdict(holder), "path": str(self.path)},
                 )
         elif _pid_is_alive(holder.pid):

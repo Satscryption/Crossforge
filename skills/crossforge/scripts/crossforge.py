@@ -4329,7 +4329,7 @@ def _cmd_record_shipment(args: argparse.Namespace) -> CommandOutput:
     store = _store(args, repository)
     inspect_remote = _remote_readback(repository)
     if not args.publication_requested:
-        raise PreconditionError("current user request does not authorize publication")
+        raise PreconditionError("caller-attested publication intent is required")
     body: str | None = None
     forge_identity = None
     if not args.push_only:
@@ -4423,9 +4423,13 @@ def _add_shipping_target(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--publication-requested",
         action="store_true",
-        help="assert that the current user request explicitly authorizes publication",
+        help="supply caller-attested publication intent from the user-scoped workflow",
     )
-    parser.add_argument("--target-change-approved", action="store_true")
+    parser.add_argument(
+        "--target-change-approved",
+        action="store_true",
+        help="supply caller-attested approval for a changed publication destination",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4754,7 +4758,7 @@ def build_shipping_parser() -> argparse.ArgumentParser:
     item.add_argument(
         "--publication-requested",
         action="store_true",
-        help="assert that the current user request explicitly authorizes publication",
+        help="supply caller-attested publication intent from the user-scoped workflow",
     )
     item.add_argument("--push-only", action="store_true")
     item.add_argument("--title", default="Crossforge build")
