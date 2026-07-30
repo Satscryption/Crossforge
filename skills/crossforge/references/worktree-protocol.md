@@ -39,8 +39,7 @@ base. Failed restoration blocks the candidate and retains evidence.
 
 ## Capture
 
-After scope and candidate gates pass, mark allowlisted untracked files
-intent-to-add and capture:
+After scope passes, mark allowlisted untracked files intent-to-add and capture:
 
 ```text
 git diff --binary --no-ext-diff <base-commit> --
@@ -51,6 +50,11 @@ without changing working files, and confirm the hash is unchanged. Providers
 never commit. For Codex and Grok candidates, first re-hash and validate the
 canonical report written by `invoke`; after capture, require the patch hash to
 equal the report's patch hash.
+
+Selection then creates a fresh verification worktree at the recorded base,
+applies that exact captured patch, and runs every durable task gate in order.
+The control layer derives gate inputs and writes a hash-bound receipt; request
+JSON cannot assert gate results or provenance.
 
 Acceptance uses a fresh worktree at the same base: check and apply the exact
 patch, re-check scope and the full diff, run gates in the sandbox, and hash the

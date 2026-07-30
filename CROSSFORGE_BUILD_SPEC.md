@@ -2088,7 +2088,7 @@ quarantined control file and repository-common Git directory.
 
 ### Candidate capture
 
-After scope and candidate gates:
+After scope:
 
 1. Mark untracked allowlisted files intent-to-add so they appear in diff.
 2. Capture:
@@ -2104,6 +2104,20 @@ After scope and candidate gates:
    the captured patch hash is unchanged.
 
 Do not commit from inside the provider invocation.
+
+After capture, selection must apply the exact recorded patch to a fresh
+verification worktree and run every durable task gate in order. Gate commands,
+allowlist, symlink approvals, sandbox policy, evidence root, and provenance are
+control-derived; `record-selection` must reject caller-supplied gate-result
+objects. Record a receipt bound to the repository, run, plan, task policy,
+candidate, provider, base, patch hash, scoped-tree hash, sandbox policy, and
+complete result/output hashes. Bind its canonical path and exact digest to the
+selected task and revalidate it during acceptance. Only the selection
+compare-and-swap operation may transition a task to `candidate_ready`; the
+generic task transition API must reject that target. Selection policy and
+identity fields remain frozen during verification, while routing, invocation
+attempt counters, and timestamps may advance without invalidating a successful
+bind.
 
 ### Cleanup
 
@@ -2359,13 +2373,23 @@ silently hand-merge them.
 6. Run scope checks and inspect the full diff before executing gates.
 7. Run all task gates in the verified gate sandbox.
 8. Re-run scope and calculate the verified scoped-tree hash.
-9. Run `git apply --check` and apply the same patch to the orchestration branch.
-10. Run scope and confirm the scoped-tree hash equals the verified hash.
-11. Stage only exact allowlisted files using the filter-free staging protocol.
-12. Commit unless `--no-commit`.
-13. Update interfaces from committed source.
-14. Update task and provider statistics.
-15. Clean candidate and verification worktrees per policy.
+9. Persist an acceptance intent bound to the selected gate receipt, patch,
+   verified tree, quarantine digest, commit message, provider, base, and
+   commit/no-commit mode.
+10. Run `git apply --check` and apply the same patch to the orchestration branch.
+11. Run scope and confirm the scoped-tree hash equals the verified hash.
+12. Stage only exact allowlisted files using the filter-free staging protocol.
+13. Commit unless `--no-commit`.
+14. Bind the exact accepted result before releasing the repository lock.
+15. Update interfaces from committed source.
+16. Update task and provider statistics.
+17. Clean candidate and verification worktrees per policy.
+
+If acceptance is interrupted after the intent becomes durable, an identical
+retry must prove the current orchestration tree, index or commit, commit
+message, candidate, and evidence bindings. It may then finish an exact staged
+commit or idempotently bind an already-created exact result. Mismatched or
+partial state fails closed.
 
 Crossforge commits with repository hooks and commit signing disabled for the
 Git subprocess (`core.hooksPath` set to an empty owner-only directory and

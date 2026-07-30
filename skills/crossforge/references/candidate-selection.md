@@ -18,6 +18,21 @@ A candidate is ineligible if any of these is true:
 Do not weigh an ineligible candidate against an eligible one. Record the
 hard-gate reason without exposing file contents or secrets.
 
+Capture the candidate patch before selection. `record-selection` obtains the
+allowlist, symlink approvals, ordered verification commands, and sandbox
+policy from durable run/task state. It applies the exact captured patch in a
+fresh verification worktree and runs the gates itself; caller-supplied
+`independentGateResults` are invalid. The resulting receipt is bound to the
+repository, run, task policy, candidate path, provider, base, patch, and gate
+policy, replay-derived quarantine set, and exact gate artifacts. It is
+descriptor-read and revalidated during acceptance. The task transition is a
+repository/run compare-and-swap; acceptance binds its result before releasing
+the repository transaction that applies the patch. Generic state transitions
+cannot enter `candidate_ready`. Before orchestration changes, acceptance stores
+a durable intent binding the verified patch/tree, gate receipt, quarantine
+digest, commit message, and mode, so an identical retry can prove and bind an
+interrupted exact commit or staged no-commit result.
+
 ## Compare eligible candidates
 
 Consider, in order:

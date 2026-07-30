@@ -281,8 +281,10 @@ cleanup all require the repository identity, current commit, task, and registry
 to match the active durable run. External-provider capture additionally
 revalidates the canonical invocation report and requires its patch hash to
 equal the newly captured patch. Selection durably binds the candidate and
-report paths plus report digest; acceptance rechecks that full binding.
-Providers do not commit.
+report paths plus report digest. It also replays that captured patch in a fresh
+verification worktree, derives every gate from durable task policy, proves the
+gates leave the patch/tree unchanged, and binds a receipt path and digest.
+Acceptance rechecks both bindings. Providers do not commit.
 
 ### 7. Independent verification
 
@@ -307,7 +309,20 @@ eligible candidates using requirement completeness, correctness, test quality,
 security, interface fidelity, conventions, maintainability, complexity,
 performance, and diff economy. Selection parses only report bytes matching the
 candidate's invocation digest and requires report provider, base, and patch
-identity to match the recorded candidate.
+identity to match the recorded candidate. It never accepts caller-authored gate
+results: the control layer runs the complete ordered gate suite against the
+exact captured patch and records a receipt bound to the run, task policy,
+candidate, patch, sandbox policy, replay-derived quarantine set, and exact gate
+artifacts. Receipt reads reject symlinks, hard links, non-private ownership or
+permissions, and descriptor swaps. Selection and acceptance bind their state
+with repository-then-run compare-and-swap locking; acceptance finalizes its task
+record before releasing the lock that protects patch application and commit.
+Before orchestration changes, it persists an acceptance intent bound to the
+candidate patch, verified tree, quarantine set, gate receipt, commit message,
+and commit mode. A retry can therefore prove and bind an already-created
+commit or exact staged no-commit result after interruption. Generic task
+transitions cannot create `candidate_ready`, and selection CAS ignores only
+non-policy routing/attempt bookkeeping.
 
 Acceptance repeats patch application, exact scope, and gates in a fresh
 worktree. The control layer then applies the verified patch to a clean

@@ -218,6 +218,153 @@ class StateStoreTests(unittest.TestCase):
         with self.assertRaises(StateInconsistencyError):
             self.store.transition_task(run_id, "T1", TaskStatus.COMPLETE)
 
+    def test_selection_and_acceptance_bindings_are_compare_and_swap(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        self.store.start_task(run_id, "T1")
+        run = self.store.load_run(run_id)
+        task = self.store.load_tasks(run_id)["tasks"][0]
+        self.store.record_task_routing(
+            run_id,
+            "T1",
+            {
+                "implementationLanes": ["codex"],
+                "reviewLanes": [],
+                "providerSettings": {
+                    "codex": {
+                        "model": "auto",
+                        "effort": "high",
+                        "timeoutSeconds": 60,
+                    }
+                },
+            },
+        )
+        self.store.reserve_provider_invocations(
+            run_id, "T1", ("codex",)
+        )
+        validated = []
+        updates = {
+            "selectedCandidate": "codex",
+            "selectedCandidatePath": str(self.repository / "candidate"),
+            "selectedGateEvidencePath": str(
+                self.store.run_dir(run_id) / "selection.json"
+            ),
+            "selectedGateEvidenceSha256": "2" * 64,
+            "selectedInvocationEvidencePath": str(
+                self.store.run_dir(run_id) / "invocation.json"
+            ),
+            "selectedInvocationEvidenceSha256": "3" * 64,
+        }
+        selected = self.store.bind_candidate_selection(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=task,
+            updates=updates,
+            validate_evidence=lambda: validated.append("selection"),
+        )
+        self.assertEqual("candidate_ready", selected["status"])
+        self.assertEqual(1, selected["attempts"]["codex"])
+        self.assertIsNotNone(selected["routing"])
+        self.assertEqual(["selection"], validated)
+        with self.assertRaisesRegex(
+            StateInconsistencyError,
+            "acceptanceIntent is required",
+        ):
+            self.store.transition_task(
+                run_id,
+                "T1",
+                TaskStatus.ACCEPTED,
+            )
+
+        intent = {
+            "schemaVersion": 1,
+            "provider": "codex",
+            "candidatePath": updates["selectedCandidatePath"],
+            "baseCommit": COMMIT_A,
+            "capturedPatchSha256": "4" * 64,
+            "verifiedScopedTreeSha256": "5" * 64,
+            "quarantinePathsSha256": "6" * 64,
+            "selectedGateEvidenceSha256": "2" * 64,
+            "commitMessageSha256": "7" * 64,
+            "noCommit": False,
+        }
+        selected_with_intent = (
+            self.store.record_candidate_acceptance_intent_in_transaction(
+                run_id,
+                "T1",
+                expected_run=run,
+                expected_task=selected,
+                intent=intent,
+                validate_evidence=lambda: validated.append("intent"),
+            )
+        )
+        accepted = self.store.bind_candidate_acceptance(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=selected_with_intent,
+            selected_provider="codex",
+            commit=COMMIT_B,
+            expected_intent=intent,
+            validate_evidence=lambda: validated.append("acceptance"),
+        )
+        self.assertEqual("committed", accepted["status"])
+        self.assertEqual(COMMIT_B, accepted["commit"])
+        self.assertEqual(
+            ["selection", "intent", "acceptance"], validated
+        )
+
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "selected task changed"
+        ):
+            self.store.bind_candidate_acceptance(
+                run_id,
+                "T1",
+                expected_run=run,
+                expected_task=selected,
+                selected_provider="codex",
+                commit=COMMIT_B,
+                expected_intent=intent,
+                validate_evidence=lambda: validated.append("stale"),
+            )
+        self.assertNotIn("stale", validated)
+
+    def test_generic_transition_cannot_forge_candidate_ready(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        self.store.start_task(run_id, "T1")
+        with self.assertRaisesRegex(
+            StateInconsistencyError,
+            "bind_candidate_selection",
+        ):
+            self.store.transition_task(
+                run_id,
+                "T1",
+                TaskStatus.CANDIDATE_READY,
+                updates={
+                    "selectedCandidate": "codex",
+                    "selectedCandidatePath": str(
+                        self.repository / "candidate"
+                    ),
+                },
+            )
+        self.assertEqual(
+            "in_progress",
+            self.store.load_tasks(run_id)["tasks"][0]["status"],
+        )
+
+    def test_candidate_ready_record_requires_bound_gate_evidence(self) -> None:
+        forged = make_task(status="candidate_ready")
+        forged["selectedCandidate"] = "codex"
+        forged["selectedCandidatePath"] = str(
+            self.repository / "candidate"
+        )
+        with self.assertRaisesRegex(
+            StateInconsistencyError,
+            "selectedGateEvidencePath is required",
+        ):
+            self.create_run(tasks=[forged])
+        self.assertIsNone(self.store.active_run_id())
+
     def test_resume_succeeds_for_consistent_state(self) -> None:
         task = make_task(status="in_progress")
         run_id, _ = self.create_run(tasks=[task])
@@ -299,11 +446,54 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual("in_progress", task["status"])
         self.assertEqual("T1", run["activeTaskId"])
 
-        self.store.transition_task(run_id, "T1", TaskStatus.CANDIDATE_READY)
-        self.store.transition_task(run_id, "T1", TaskStatus.ACCEPTED)
-        tasks = self.store.load_tasks(run_id)
-        tasks["tasks"][0]["commit"] = COMMIT_B
-        atomic_write_json(self.store.run_dir(run_id) / "tasks.json", tasks)
+        selection = {
+            "selectedCandidate": "claude-microfix",
+            "selectedCandidatePath": str(self.repository / "candidate"),
+            "selectedGateEvidencePath": str(
+                self.store.run_dir(run_id) / "selection.json"
+            ),
+            "selectedGateEvidenceSha256": "2" * 64,
+            "selectedInvocationEvidencePath": None,
+            "selectedInvocationEvidenceSha256": None,
+        }
+        selected = self.store.bind_candidate_selection(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=task,
+            updates=selection,
+            validate_evidence=lambda: None,
+        )
+        intent = {
+            "schemaVersion": 1,
+            "provider": "claude-microfix",
+            "candidatePath": selection["selectedCandidatePath"],
+            "baseCommit": COMMIT_A,
+            "capturedPatchSha256": "3" * 64,
+            "verifiedScopedTreeSha256": "4" * 64,
+            "quarantinePathsSha256": "5" * 64,
+            "selectedGateEvidenceSha256": "2" * 64,
+            "commitMessageSha256": "6" * 64,
+            "noCommit": False,
+        }
+        selected = self.store.record_candidate_acceptance_intent_in_transaction(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=selected,
+            intent=intent,
+            validate_evidence=lambda: None,
+        )
+        self.store.bind_candidate_acceptance(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=selected,
+            selected_provider="claude-microfix",
+            commit=COMMIT_B,
+            expected_intent=intent,
+            validate_evidence=lambda: None,
+        )
         task, run = self.store.finish_task(
             run_id,
             "T1",
