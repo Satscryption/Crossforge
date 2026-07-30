@@ -96,18 +96,42 @@ class GateTests(unittest.TestCase):
             )
 
     def test_minimal_environment_excludes_credentials_and_hashes_values(self) -> None:
+        sensitive = {
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_KEY",
+            "APP_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "CONNECTION_STRING",
+            "DATABASE_URL",
+            "DOCKER_CONFIG",
+            "ENCRYPTION_KEY",
+            "KUBECONFIG",
+            "KUBE_CONFIG",
+            "MONGODB_URI",
+            "MYSQL_PWD",
+            "NETRC",
+            "OPENAI_API_KEY",
+            "OPENAI_KEY",
+            "PGPASSFILE",
+            "POSTGRES_URL",
+            "REDIS_URL",
+            "SSLKEYLOGFILE",
+            "STRIPE_KEY",
+            "XAI_APIKEY",
+        }
+        safe = {
+            "CONFIG_PATH": "/tmp/config",
+            "KEYBOARD_LAYOUT": "gb",
+            "MONKEY": "capuchin",
+            "PUBLIC_URL": "https://example.invalid",
+        }
         inherited = {
             "PATH": "/usr/bin:/bin",
             "LANG": "C",
             "CI": "1",
             "PROVIDER_TOKEN": "secret-value",
-            "OPENAI_API_KEY": "openai-secret",
-            "ANTHROPIC_API_KEY": "anthropic-secret",
-            "XAI_APIKEY": "xai-secret",
-            "AWS_ACCESS_KEY_ID": "aws-secret",
-            "DATABASE_URL": "database-secret",
-            "KUBECONFIG": "/private/kubeconfig",
-            "KEYBOARD_LAYOUT": "gb",
+            **{name: f"sensitive-{name}" for name in sensitive},
+            **safe,
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -115,31 +139,16 @@ class GateTests(unittest.TestCase):
                 (root / name).mkdir()
             environment = minimal_gate_environment(
                 inherited,
-                allowlist=(
-                    "LANG",
-                    "OPENAI_API_KEY",
-                    "ANTHROPIC_API_KEY",
-                    "XAI_APIKEY",
-                    "AWS_ACCESS_KEY_ID",
-                    "DATABASE_URL",
-                    "KUBECONFIG",
-                    "KEYBOARD_LAYOUT",
-                ),
+                allowlist=("LANG", *sorted(sensitive), *sorted(safe)),
                 home=root / "home",
                 tmpdir=root / "tmp",
                 cache=root / "cache",
             )
         self.assertNotIn("PROVIDER_TOKEN", environment)
-        for name in (
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "XAI_APIKEY",
-            "AWS_ACCESS_KEY_ID",
-            "DATABASE_URL",
-            "KUBECONFIG",
-        ):
+        for name in sensitive:
             self.assertNotIn(name, environment)
-        self.assertEqual(environment["KEYBOARD_LAYOUT"], "gb")
+        for name, value in safe.items():
+            self.assertEqual(environment[name], value)
         recorded = environment_evidence(environment)
         self.assertNotIn("secret-value", repr(recorded))
         self.assertTrue(all(set(item) == {"name", "valueSha256"} for item in recorded))

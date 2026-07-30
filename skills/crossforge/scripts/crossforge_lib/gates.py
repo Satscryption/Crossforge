@@ -27,12 +27,30 @@ SUPPORTED_BACKENDS = frozenset({"auto", "sandbox-exec", "bwrap"})
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SHELL_SHORT_INLINE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 _SHELL_EXPRESSION = re.compile(r"(?:\$\(|`|&&|\|\||(?:^|[0-9])>>?|<<|[|;])")
-_SENSITIVE_ENVIRONMENT = re.compile(
-    r"(?:"
-    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH|PRIVATE_KEY|"
-    r"SSH_AUTH_SOCK|API_?KEY|ACCESS_?KEY|DATABASE_URL|KUBECONFIG"
-    r")",
+_SENSITIVE_ENVIRONMENT_CATEGORY = re.compile(
+    r"(?:^|_)(?:"
+    r"TOKENS?|SECRETS?|PASSWORDS?|PASSWD|PWD|CREDENTIALS?|COOKIES?|"
+    r"AUTH(?:ORIZATION)?|PRIVATE_KEY|SSH_AUTH_SOCK|"
+    r"API_?KEYS?|ACCESS_?KEYS?|KEYS?"
+    r")(?:_|$)",
     re.IGNORECASE,
+)
+_SENSITIVE_ENVIRONMENT_CONNECTION = re.compile(
+    r"(?:^|_)(?:"
+    r"DATABASE|POSTGRES(?:QL)?|MYSQL|MONGO(?:DB)?|REDIS|JDBC"
+    r")_?(?:URL|URI)(?:_|$)",
+    re.IGNORECASE,
+)
+_SENSITIVE_ENVIRONMENT_EXACT = frozenset(
+    {
+        "CONNECTION_STRING",
+        "DOCKER_CONFIG",
+        "KUBECONFIG",
+        "KUBE_CONFIG",
+        "NETRC",
+        "PGPASSFILE",
+        "SSLKEYLOGFILE",
+    }
 )
 _SHELLS = frozenset(
     {"sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh", "cmd", "powershell", "pwsh"}
@@ -528,7 +546,7 @@ def minimal_gate_environment(
     result = {
         name: inherited[name]
         for name in sorted(names)
-        if name in inherited and not _SENSITIVE_ENVIRONMENT.search(name)
+        if name in inherited and not _is_sensitive_environment_name(name)
     }
     path_value = result.get("PATH", os.defpath)
     validate_path_environment(path_value)
@@ -538,6 +556,15 @@ def minimal_gate_environment(
     result["XDG_CACHE_HOME"] = str(Path(cache).resolve())
     result["PYTHONNOUSERSITE"] = "1"
     return result
+
+
+def _is_sensitive_environment_name(name: str) -> bool:
+    normalized = name.upper()
+    return (
+        normalized in _SENSITIVE_ENVIRONMENT_EXACT
+        or _SENSITIVE_ENVIRONMENT_CATEGORY.search(normalized) is not None
+        or _SENSITIVE_ENVIRONMENT_CONNECTION.search(normalized) is not None
+    )
 
 
 def environment_evidence(environment: Mapping[str, str]) -> tuple[dict[str, str], ...]:

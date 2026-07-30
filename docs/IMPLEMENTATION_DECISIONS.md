@@ -154,8 +154,10 @@ and gate policy. The loader compares the normalized project result with the
 merged user/default policy: environment and executable allowlists may only
 narrow, while deny paths may only grow. An empty executable list represents
 the plan-approved executable set, so a project may introduce a restriction
-without gaining execution authority. Gate environment construction separately
-filters credential-shaped names even when an upstream allowlist contains them.
+without gaining execution authority. Each gate intersects a configured list
+with the executable basenames in its approved plan before constructing the
+runner. Gate environment construction separately filters credential-shaped
+names even when an upstream allowlist contains them.
 
 ## Verification limitations
 

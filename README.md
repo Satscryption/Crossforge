@@ -237,7 +237,9 @@ are tighten-only relative to user configuration and safe defaults:
 `gates.executableAllowlist` may only shrink, while `denyPaths` may only grow.
 An empty executable allowlist means the exact executables approved in
 `plan.json`, so a project may replace that implicit set with a narrower
-explicit restriction.
+explicit restriction. Gate construction intersects every explicit executable
+list with the plan-approved basenames, so repository policy cannot add
+execution authority.
 
 ```json
 {

@@ -131,9 +131,11 @@ to run in an independent gate.
 - Project gate environment allowlists may only remove trusted names.
 - A project may narrow a non-empty user executable allowlist, never widen or
   remove it. When the trusted list is empty, a project list adds a restriction
-  to the exact executables already approved in the plan.
+  to the exact executables already approved in the plan. Gate construction
+  enforces this by intersecting configured names with plan-approved basenames.
 - Credential-shaped environment names are filtered after allowlist merging,
-  including API/access keys, database URLs, and Kubernetes configuration.
+  including generic key suffixes, API/access keys, credential-store paths,
+  database connection URLs, and Kubernetes configuration.
 
 ### Git-history disclosure
 
