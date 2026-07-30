@@ -224,11 +224,16 @@ Capability evidence must be fresh (no older than 24 hours), executable- and
 policy-bound, stored beneath the run's owner-private `evidence/preflight`
 directory, and hash-bound in `run.json.providers`. An arbitrary path supplied
 only by the invocation request is rejected. `record-capability` is the sole
-transaction that validates and atomically copies trusted platform/provider
-negative-probe output into that location and updates the run binding; if no
-such platform probe is available, the provider remains unavailable. Every provider attempt writes to
-an immutable `provider/attempt-NN/` directory containing its own brief,
-context, runtime, policy, raw output, patch, and validated report.
+producer and binding transaction: it resolves the installed provider from
+`PATH`, rejects caller-writable executable locations, creates nonce-bound
+protected sentinels, requires repository-bound `probe` consent, and asks the
+provider sandbox to execute Crossforge's fixed helper. The trusted parent
+derives schema-v2 results from the helper's observed read, write, and
+loopback-network effects. Callers cannot supply booleans, an evidence path, or
+an executable override. Missing, partial, failed, or inconclusive output is
+rejected and never bound. Every provider attempt writes to an immutable
+`provider/attempt-NN/` directory containing its own brief, context, runtime,
+policy, raw output, patch, and validated report.
 
 ### 6. Restoration, scope, and capture
 

@@ -86,6 +86,10 @@ from crossforge_lib.preflight import (
     run_source_free_provider_probe,
     trusted_gate_read_only_paths,
 )
+from crossforge_lib.provider_capability import (
+    PRODUCER_ID as CAPABILITY_PRODUCER_ID,
+    produce_provider_capability,
+)
 from crossforge_lib.providers.base import CapabilityProbe
 from crossforge_lib.providers.codex_cli import CodexCLIAdapter
 from crossforge_lib.providers.grok_cli import GrokCLIAdapter
@@ -185,6 +189,7 @@ _CAPABILITY_BOOLEAN_FIELDS = {
 _CAPABILITY_KEYS = frozenset(
     {
         "schemaVersion",
+        "producer",
         "provider",
         "sourceFree",
         "recordedAt",
@@ -192,6 +197,8 @@ _CAPABILITY_KEYS = frozenset(
         "executableSha256",
         "sandboxPolicySha256",
         "managedPolicySha256",
+        "probeContractSha256",
+        "probeResultSha256",
         "message",
         *_CAPABILITY_BOOLEAN_FIELDS,
     }
@@ -272,6 +279,7 @@ def _trusted_credential_directories() -> tuple[Path, ...]:
     candidates = (
         Path.home() / ".codex",
         Path.home() / ".claude",
+        Path.home() / ".grok",
         Path.home() / ".config" / "grok",
         Path.home() / ".config" / "xai",
     )
@@ -305,6 +313,20 @@ def _capability_record(
     executable: str | None,
 ) -> tuple[CapabilityProbe, dict[str, Any]]:
     value = _read_json_object(path, label="provider capability evidence")
+    return _validate_capability_record(
+        value,
+        provider=provider,
+        executable=executable,
+    )
+
+
+def _validate_capability_record(
+    value: Mapping[str, Any],
+    *,
+    provider: str,
+    executable: str | None,
+) -> tuple[CapabilityProbe, dict[str, Any]]:
+    value = dict(value)
     unknown = set(value) - _CAPABILITY_KEYS
     missing = _CAPABILITY_KEYS - set(value)
     if unknown or missing:
@@ -312,21 +334,34 @@ def _capability_record(
             "Provider capability evidence has missing or unknown fields",
             details={"missing": sorted(missing), "unknown": sorted(unknown)},
         )
-    if value["schemaVersion"] != 1 or value["provider"] != provider:
+    if (
+        value["schemaVersion"] != 2
+        or value["producer"] != CAPABILITY_PRODUCER_ID
+        or value["provider"] != provider
+    ):
         raise InvalidInputError("Provider capability evidence identity does not match")
     if value["sourceFree"] is not True:
         raise InvalidInputError("Provider capability evidence is not source-free")
     for name in (
         "recordedAt",
+        "producer",
         "executablePath",
         "executableSha256",
         "sandboxPolicySha256",
         "managedPolicySha256",
+        "probeContractSha256",
+        "probeResultSha256",
         "message",
     ):
         if not isinstance(value[name], str):
             raise InvalidInputError(f"Provider capability field {name} is invalid")
-    for name in ("executableSha256", "sandboxPolicySha256", "managedPolicySha256"):
+    for name in (
+        "executableSha256",
+        "sandboxPolicySha256",
+        "managedPolicySha256",
+        "probeContractSha256",
+        "probeResultSha256",
+    ):
         if len(value[name]) != 64 or any(character not in "0123456789abcdef" for character in value[name]):
             raise InvalidInputError(f"Provider capability field {name} is not SHA-256")
     try:
@@ -1008,17 +1043,51 @@ def _cmd_record_consent(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_record_capability(args: argparse.Namespace) -> CommandOutput:
-    _capability, record = _capability_record(
-        args.evidence,
+    repository = _repository(args)
+    store = _store(args, repository)
+    run = store.load_run(args.run_id)
+    if run["status"] != RunStatus.ACTIVE.value:
+        raise PreconditionError("capability probe requires an active run")
+    config = load_config()
+    require_consent(
+        load_consent(store.root / "consent.json"),
+        repository_identity=repository_identity(repository),
         provider=args.provider,
-        executable=args.executable,
+        operation_class="probe",
+        deny_policy_sha256=deny_policy_hash(
+            config.deny_paths,
+            DETECTOR_NAMES,
+            (),
+            _CONTEXT_POLICY,
+        ),
+        managed_policy_sha256=args.managed_policy_sha256,
     )
-    source = Path(args.evidence)
-    binding = _store(args).bind_provider_capability(
+    record = produce_provider_capability(
+        provider=args.provider,
+        executable=None,
+        managed_policy_sha256=args.managed_policy_sha256,
+        git_common_dir=store.root,
+        orchestration_path=Path(__file__).resolve(),
+        credential_paths=_trusted_credential_directories(),
+        forbidden_executable_roots=(
+            repository.root,
+            store.root,
+            Path(tempfile.gettempdir()),
+        ),
+        timeout_seconds=args.timeout_seconds,
+    )
+    _validate_capability_record(
+        record,
+        provider=args.provider,
+        executable=None,
+    )
+    evidence_bytes = canonical_json_bytes(record) + b"\n"
+    evidence_sha256 = sha256_bytes(evidence_bytes)
+    binding = store.bind_provider_capability(
         args.run_id,
         args.provider,
-        evidence_bytes=source.read_bytes(),
-        evidence_sha256=sha256_file(source),
+        evidence_bytes=evidence_bytes,
+        evidence_sha256=evidence_sha256,
     )
     return CommandOutput(
         f"Bound trusted capability evidence for {args.provider}",
@@ -2616,13 +2685,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     item = command(
         "record-capability",
-        "validate and durably bind trusted provider capability evidence",
+        "produce and durably bind provider sandbox capability evidence",
     )
-    _add_state(item)
+    _add_state(item, repository=True)
     item.add_argument("--run-id", required=True)
     item.add_argument("--provider", choices=("codex", "grok"), required=True)
-    item.add_argument("--evidence", required=True)
-    item.add_argument("--executable")
+    item.add_argument("--managed-policy-sha256", required=True)
+    item.add_argument("--timeout-seconds", type=int, default=120)
 
     item = command("create-candidate", "create a recorded detached candidate worktree")
     _add_worktree_manager(item)

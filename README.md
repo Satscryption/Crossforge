@@ -190,6 +190,14 @@ class, expiry, deny policy, local exceptions, provider-visible context policy,
 or detected managed policy changes. Provider-readable files count as
 transmitted context even if the prompt does not mention them.
 
+Provider capability evidence is not an operator-authored checklist.
+After repository-bound `probe` consent is valid, `record-capability` resolves
+the installed provider executable itself, runs a fresh source-free
+negative-probe transaction, and derives each sandbox result from observed
+filesystem and loopback-network effects. It accepts neither an evidence file
+nor an executable override. Failed, skipped, partial, stale, or caller-writable
+probe inputs leave the provider unavailable.
+
 ## Configuration
 
 Configuration precedence, highest first:

@@ -291,6 +291,14 @@ expires, a lock owner crashes, or cleanup proof is unavailable. This is an
 intentional availability tradeoff. Recovery preserves evidence and requires
 explicit user decisions where automated proof is insufficient.
 
+Provider capability booleans are derived by the control layer, not accepted
+from a caller-authored file. The producer uses a fresh nonce and fixed helper,
+then validates actual filesystem and loopback-network effects. It refuses
+provider executables resolved beneath repository, state, or temporary roots.
+This makes the evidence a control-layer observation; it does not protect
+against a compromised authenticated provider CLI host, which remains out of
+scope.
+
 ## Out of scope
 
 - Protecting against a compromised operating system, kernel, Git binary,

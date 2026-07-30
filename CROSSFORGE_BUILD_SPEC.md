@@ -1516,6 +1516,14 @@ negative probe is failed or inconclusive, Codex is unavailable. The candidate
 is already a valid Git worktree, so `--skip-git-repo-check` is neither required
 nor permitted.
 
+The control layer must produce this evidence itself with a fixed,
+nonce-bound, source-free probe contract. Public commands must not accept
+caller-authored capability booleans, an evidence file, or a provider
+executable override. The parent derives results from observed probe effects
+and atomically binds only complete producer-marked evidence; a skipped helper,
+malformed result, unsafe executable location, or successful forbidden
+operation fails closed.
+
 `final_output_path` is an owner-only evidence path written by the trusted Codex
 CLI host process, not by model-generated tools. The probe must confirm that the
 path is not readable or writable through Codex tools. If the installed CLI
