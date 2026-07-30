@@ -202,7 +202,9 @@ The trusted parent process sends the task brief:
 
 All subprocesses use argument arrays and new process groups. Timeouts terminate
 descendants. Trusted stdout/stderr capture is written to owner-only evidence;
-only sanitized bounded messages reach the user.
+only sanitized bounded messages reach the user. Git failures expose a stable
+category and return code without argv, working directories, executable paths,
+or raw diagnostics.
 
 `crossforge.py invoke --request <json>` accepts one transaction document. The
 top level is bound to the active run and task:
@@ -271,8 +273,10 @@ report path on the candidate entry in the active run registry.
 After every provider descendant exits, Crossforge records isolated Git
 metadata changes, removes only the contained isolated `.git`, restores the
 original control file and quarantined files byte-for-byte, and calculates
-scope against the task base. A provider-created denied-path collision is
-restricted evidence and makes the candidate ineligible.
+scope against the task base. `invoke` persists the resulting report before
+returning exit 5 for a scope violation. A provider-created denied-path
+collision is restricted evidence and makes the candidate ineligible. Deny
+globs use platform-independent case-insensitive matching.
 
 For an eligible-scope worktree, Crossforge captures a binary Git patch, hashes
 it, proves it applies to a clean base, and confirms index cleanup does not
@@ -386,8 +390,9 @@ idempotently, and refuses to overwrite newer or terminal state.
 Cleanup operates only on a canonical path recorded under the configured
 worktree root. Dirty captured candidates require successful exact reverse-patch
 proof and a clean result before ordinary `git worktree remove`. Crossforge
-never force-removes or recursively deletes a candidate; uncertain cleanup
-retains it.
+derives evidence durability from the captured registry state and exact patch
+digest instead of accepting a caller flag. It never force-removes or
+recursively deletes a candidate; uncertain cleanup retains it.
 
 ## Shipping boundary
 

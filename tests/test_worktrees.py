@@ -265,7 +265,7 @@ class CaptureAndCleanupTests(WorktreeCase):
             1,
             command(entry.path, "git", "diff", "--cached", "--quiet", check=False).returncode,
         )
-        cleaned = self.manager.cleanup(captured, patch, evidence_durable=True)
+        cleaned = self.manager.cleanup(captured, patch)
         self.assertEqual("cleaned", cleaned.status)
         self.assertIsNotNone(cleaned.cleaned_at)
         self.assertFalse(entry.path.exists())
@@ -280,26 +280,28 @@ class CaptureAndCleanupTests(WorktreeCase):
         lock = self.manager.acquire_writer_lock(captured)
         try:
             with self.assertRaises(WorktreeError):
-                self.manager.cleanup(captured, patch, evidence_durable=True)
+                self.manager.cleanup(captured, patch)
         finally:
             lock.release()
 
         (entry.path / "tracked.txt").write_text("uncaptured\n", encoding="utf-8")
         with self.assertRaises(WorktreeStateError):
-            self.manager.cleanup(captured, patch, evidence_durable=True)
+            self.manager.cleanup(captured, patch)
         self.assertTrue(entry.path.exists())
 
-    def test_cleanup_requires_durable_evidence_and_honors_retention(self) -> None:
+    def test_cleanup_derives_durable_evidence_and_honors_retention(self) -> None:
         entry = self.create()
         (entry.path / "tracked.txt").write_text("candidate\n", encoding="utf-8")
         patch = self.evidence / "candidate.patch"
         captured = self.manager.capture_patch(entry, patch)
-        with self.assertRaises(WorktreeError):
-            self.manager.cleanup(captured, patch, evidence_durable=False)
+        original_patch = patch.read_bytes()
+        patch.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaises(WorktreeStateError):
+            self.manager.cleanup(captured, patch)
+        patch.write_bytes(original_patch)
         retained = self.manager.cleanup(
             captured,
             patch,
-            evidence_durable=True,
             retention_permits=False,
         )
         self.assertEqual("retained", retained.status)

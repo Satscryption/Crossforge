@@ -1798,7 +1798,8 @@ POSIX paths against configured deny globs using the following fixed semantics:
 
 - `*` and `?` do not cross `/`.
 - `**` crosses directory boundaries.
-- Matching is case-sensitive on every platform.
+- Matching is case-insensitive on every platform so a case-insensitive
+  checkout cannot bypass a deny pattern by changing only path casing.
 - A pattern without `/` matches only the repository root.
 - A pattern beginning `**/` also matches the same suffix at the root.
 
@@ -2089,8 +2090,9 @@ After deny-path and binary quarantine, but before provider invocation:
    context manifest.
 7. Write `runtime-manifest.json` with the isolated commit and tree IDs, fixed
    identity, effective sanitized Git configuration, provider executable
-   identity, sandbox-policy hash, and identities of required system/toolchain
-   mounts. Record paths and hashes only; never record authentication values.
+   identity, and sandbox-policy hash. Do not emit placeholder mount-identity
+   fields; record only evidence that the control layer actually derives and
+   consumes. Never record authentication values.
 
 After the provider process and all descendants exit:
 
@@ -2142,7 +2144,8 @@ bind.
 
 Use `git worktree remove <path>` only after:
 
-- Evidence is durable.
+- The captured patch exists as a regular file, its bytes match the digest in
+  the durable registry, and the registry entry is in `captured` state.
 - No writer lock is active.
 - Retention policy permits cleanup.
 
@@ -2233,6 +2236,10 @@ Reject:
 - `python`, `node`, `ruby`, or similar interpreters with inline-code flags.
 - Destructive Git, filesystem, privilege, package-publishing, remote-write, or
   credential-management commands.
+- Every Git global option before the subcommand. In particular, reject
+  `--exec-path`, `--git-dir`, `--work-tree`, `-C`, `-c`, and
+  `--config-env`; verification gates use the fixed Git executable and current
+  sandbox worktree.
 
 Checked-in scripts and test code remain untrusted and therefore still require
 the gate sandbox.
@@ -2498,15 +2505,19 @@ After three failed attempts:
 
 ### Micro-fix enforcement
 
-The Python layer provides a `check-micro-fix` command that validates:
+The Python layer provides a `check-micro-fix` command that checks the internal
+consistency of caller-attested inputs:
 
 - Changed-line count.
 - Allowlist.
 - Risk.
 - Disallowed task categories.
 
-Semantic conditions still require Claude judgment and must be recorded in
-`decisions.md`.
+The result is explicitly labeled `caller-attested` and is not verified
+control-layer evidence. Semantic conditions, changed-line/path claims, gate
+coverage, and promises about future evidence or commit text require independent
+inspection and must be recorded in `decisions.md`; the command result alone
+must never authorize a micro-fix.
 
 The micro-fix exception is not a general Claude implementation strategy. When
 permitted, Claude edits only a fresh recorded
@@ -2612,12 +2623,15 @@ record-shipment
 - Exit `2` for invalid arguments or configuration.
 - Exit `3` for precondition/blocker failures.
 - Exit `4` for provider unavailable.
-- Exit `5` for scope violation.
+- Exit `5` for scope violation, including `invoke` after it has durably
+  recorded a provider report whose scope check failed.
 - Exit `6` for gate failure.
 - Exit `7` for state inconsistency.
 - Exit `8` for consent or secret-policy failure.
 - Print human-readable errors to stderr.
 - Print JSON only to stdout when `--json` is selected.
+- Do not include Git argv, working directories, executable paths, or raw Git
+  diagnostics in user-facing errors; full local evidence remains separate.
 - Never emit a Python traceback for expected operational errors.
 
 ---

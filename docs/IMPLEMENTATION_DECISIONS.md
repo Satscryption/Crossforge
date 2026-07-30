@@ -239,6 +239,30 @@ fail-closed rule. Cross-repository regression tests assert that rejected
 commands leave both repositories, run records, task records, and pointers
 unchanged.
 
+### DEV-009: Minor security signals fail closed or declare their assurance
+
+Deny globs match case-insensitively on every platform, and the matching
+semantics are included in the context-policy digest. This prevents ordinary
+case-only path changes from escaping the default secret patterns on
+case-insensitive filesystems.
+
+Provider context-manifest bytes are compared with the canonical in-memory
+manifest rather than with a second read of the same file. The unused
+`requiredMountIdentities` placeholder is omitted. An invocation that records a
+scope failure now returns the stable scope-violation exit code while retaining
+its report as evidence.
+
+Cleanup no longer accepts an `--evidence-durable` assertion: captured registry
+state and the exact patch digest are the durability proof. Verification-gate
+Git commands reject all global options before the subcommand, closing
+executable/configuration/worktree redirection. User-facing Git failures omit
+argv, working directories, executable paths, and raw diagnostics.
+
+`check-micro-fix` remains a compatibility surface for mechanical policy
+checks, but its result is explicitly `caller-attested`. It is not verified
+evidence and cannot authorize a micro-fix without independent inspection, a
+durable recovery decision, and user approval.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

@@ -62,6 +62,8 @@ class GateTests(unittest.TestCase):
             ("rm", "-rf", "build"),
             ("git", "push", "origin"),
             ("git", "-c", "alias.test=!sh -c id", "test"),
+            ("git", "-C", "/tmp", "status"),
+            ("git", "--exec-path=/tmp/x", "status"),
             ("git", "--config-env", "alias.test=ALIAS", "test"),
             ("npm", "publish"),
             ("gh", "auth", "token"),
@@ -72,6 +74,12 @@ class GateTests(unittest.TestCase):
         for argv in rejected:
             with self.subTest(argv=argv), self.assertRaises(PolicyError):
                 validate_gate_command(GateCommand(argv, 30))
+        self.assertEqual(
+            ("git", "status", "--short"),
+            validate_gate_command(
+                GateCommand(("git", "status", "--short"), 30)
+            ).argv,
+        )
 
     def test_path_and_executable_identity_are_bound(self) -> None:
         python = Path(sys.executable).resolve()

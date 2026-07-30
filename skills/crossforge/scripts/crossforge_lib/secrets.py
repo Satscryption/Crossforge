@@ -118,7 +118,7 @@ def _translate_deny_glob(pattern: str) -> re.Pattern[str]:
             parts.append(re.escape(character))
             index += 1
     parts.append("$")
-    return re.compile("".join(parts))
+    return re.compile("".join(parts), re.IGNORECASE)
 
 
 def match_deny_path(

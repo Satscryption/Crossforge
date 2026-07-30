@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 
 from crossforge_lib.errors import InvalidInputError, PreconditionError
 from crossforge_lib.git import (
+    GitError,
     branch_exists,
     detect_default_branch,
     discover_repository,
@@ -85,6 +86,30 @@ class GitDiscoveryTests(GitRepositoryCase):
         self.assertEqual("git", result.argv[0])
         with self.assertRaises(InvalidInputError):
             run_git(self.root, ["status", "bad\x00argument"])
+
+    def test_git_errors_do_not_expose_absolute_paths(self) -> None:
+        missing = self.root / "private" / "missing-git"
+        with self.assertRaises(GitError) as caught:
+            run_git(
+                self.root,
+                ["status"],
+                git_executable=str(missing),
+            )
+        rendered = str(caught.exception)
+        payload = caught.exception.as_dict()
+        self.assertNotIn(str(self.root), rendered)
+        self.assertNotIn(str(self.root), str(payload))
+        self.assertNotIn(str(missing), str(payload))
+
+        sensitive_operand = self.root / "private" / "missing-object"
+        with self.assertRaises(GitError) as failed:
+            run_git(self.root, ["hash-object", str(sensitive_operand)])
+        failed_payload = failed.exception.as_dict()
+        self.assertEqual(
+            {"returnCode": 128},
+            failed_payload["details"],
+        )
+        self.assertNotIn(str(sensitive_operand), str(failed_payload))
 
     def test_dirty_state_includes_untracked_but_not_ignored(self) -> None:
         self.assertFalse(is_dirty(self.repository))

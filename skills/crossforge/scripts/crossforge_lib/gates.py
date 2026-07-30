@@ -392,6 +392,10 @@ def _reject_dangerous(executable: str, arguments: Sequence[str]) -> None:
         raise PolicyError(f"Destructive, remote, or privileged executable is not a valid gate: {basename}")
     operand = _first_operand(lowered)
     if basename == "git":
+        if arguments and arguments[0].startswith("-"):
+            raise PolicyError(
+                "Git global options before the subcommand are not valid gates"
+            )
         if any(
             item == "-c"
             or item.startswith("-c")

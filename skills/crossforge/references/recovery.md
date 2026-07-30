@@ -43,4 +43,8 @@ evidence. Cleanup follows the containment and captured-patch proof in
 [worktree protocol](worktree-protocol.md). Retain a worktree whenever cleanup
 proof is incomplete.
 
+Cleanup has no `--evidence-durable` assertion. The control layer derives
+durability from the canonical captured registry entry and the exact recorded
+patch digest before attempting reverse application or worktree removal.
+
 See [run state](run-state.md) for pointers and transitions.
