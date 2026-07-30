@@ -1222,13 +1222,31 @@ class StateStore:
             "createdAt",
             "cleanedAt",
         }
+        optional = {"invocationEvidenceSha256"}
         for entry in record["entries"]:
             item = _require_object(entry, "worktree entry")
-            _require_exact_fields(item, required, "worktree entry")
+            unknown = set(item) - required - optional
+            missing = required - set(item)
+            if unknown or missing:
+                raise StateInconsistencyError(
+                    "worktree entry fields are invalid",
+                    details={
+                        "unknown": sorted(unknown),
+                        "missing": sorted(missing),
+                    },
+                )
             if item["status"] not in valid_statuses:
                 raise StateInconsistencyError("worktree entry has an invalid status")
             for field in ("taskId", "provider", "path", "baseCommit", "writerLockPath", "createdAt"):
                 _require_string(item[field], f"worktree entry {field}")
+            invocation_hash = item.get("invocationEvidenceSha256")
+            if invocation_hash is not None and (
+                not isinstance(invocation_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", invocation_hash) is None
+            ):
+                raise StateInconsistencyError(
+                    "worktree entry invocationEvidenceSha256 is invalid"
+                )
 
 
 def initialize_state(git_common_dir: str | os.PathLike[str]) -> StateStore:

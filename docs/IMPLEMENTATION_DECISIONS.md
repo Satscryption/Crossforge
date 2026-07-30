@@ -159,6 +159,21 @@ with the executable basenames in its approved plan before constructing the
 runner. Gate environment construction separately filters credential-shaped
 names even when an upstream allowlist contains them.
 
+### DEV-005: Candidate provenance is active-run and invocation bound
+
+Candidate lifecycle commands derive state from the repository-common active
+run and accept only its canonical `worktrees.json`. They recheck repository
+identity, orchestration commit, active task, task base, and the derived
+repository-ID prefix rather than trusting caller paths.
+
+After a provider process exits and its report and referenced evidence validate,
+`invoke` stores the exact report-byte SHA-256 on the matching candidate entry.
+External-provider capture requires that marker. Selection loads the report
+against the recorded digest and additionally binds provider, base commit, and
+patch hash. Acceptance requires the selected provider and candidate marker to
+remain present. Legacy registry entries remain readable with a null marker but
+cannot pass the new external-provider capture and selection boundary.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

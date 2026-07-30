@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,14 +25,18 @@ if str(SCRIPTS) not in sys.path:
 import crossforge as crossforge_cli  # noqa: E402
 from crossforge_lib.config import load_config  # noqa: E402
 from crossforge_lib.consent import deny_policy_hash, record_consent  # noqa: E402
-from crossforge_lib.errors import InvalidInputError, PreconditionError  # noqa: E402
+from crossforge_lib.errors import (  # noqa: E402
+    InvalidInputError,
+    PreconditionError,
+    StateInconsistencyError,
+)
 from crossforge_lib.gates import ProbeCheck, SandboxProbeResult  # noqa: E402
 from crossforge_lib.git import (  # noqa: E402
     discover_repository,
     repository_identity,
     resolve_commit,
 )
-from crossforge_lib.models import ProviderStatus  # noqa: E402
+from crossforge_lib.models import ProviderStatus, TaskStatus  # noqa: E402
 from crossforge_lib.plan import load_plan, materialize_tasks, plan_sha256  # noqa: E402
 from crossforge_lib.providers.base import (  # noqa: E402
     CapabilityProbe,
@@ -798,6 +803,14 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         result = json.loads(stdout)["result"]["lanes"][0]
         report = load_provider_report(result["reportPath"])
         self.assertEqual("complete", report.status)
+        self.assertEqual(
+            sha256_file(result["reportPath"]),
+            result["invocationEvidenceSha256"],
+        )
+        self.assertEqual(
+            result["invocationEvidenceSha256"],
+            manager.registry.get(candidate.path).invocation_evidence_sha256,
+        )
         self.assertEqual(["app.txt"], [item["path"] for item in report.data["changedFiles"]])
         self.assertEqual(1, store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"])
         self.assertTrue((candidate.path / ".git").is_file())
@@ -1249,6 +1262,299 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
 
 
 class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
+    def test_candidate_lifecycle_requires_active_registry_and_invoke_evidence(
+        self,
+    ) -> None:
+        task = runtime_task(self.commit, status="in_progress")
+        store, run_id = self.seed_state(tasks=[task], active_task="T1")
+        identity = repository_identity(self.discovered)
+        run = store.load_run(run_id)
+        run["repositoryIdentity"] = identity
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+        worktree_root = self.root / "worktrees"
+        registry = store.run_dir(run_id) / "worktrees.json"
+        atomic_write_json(
+            registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        forged_registry = self.root / "forged-worktrees.json"
+        atomic_write_json(
+            forged_registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        record_request = self.root / "forged-selection.json"
+        accept_request = self.root / "forged-acceptance.json"
+        for path in (record_request, accept_request):
+            atomic_write_json(
+                path,
+                {
+                    "repository": str(self.repository),
+                    "gitCommonDir": str(self.common),
+                    "worktreeRoot": str(worktree_root),
+                    "registry": str(forged_registry),
+                    "runId": run_id,
+                    "taskId": "T1",
+                },
+            )
+        lifecycle_calls = (
+            (
+                "create-candidate",
+                "--repository",
+                str(self.repository),
+                "--worktree-root",
+                str(worktree_root),
+                "--registry",
+                str(forged_registry),
+                "--run-id",
+                run_id,
+                "--task-id",
+                "T1",
+                "--provider",
+                "codex",
+                "--base-commit",
+                self.commit,
+                "--evidence-dir",
+                str(self.root / "evidence"),
+            ),
+            (
+                "capture-candidate",
+                "--repository",
+                str(self.repository),
+                "--worktree-root",
+                str(worktree_root),
+                "--registry",
+                str(forged_registry),
+                "--worktree",
+                str(worktree_root / "candidate"),
+                "--patch",
+                str(self.root / "candidate.patch"),
+            ),
+            (
+                "record-selection",
+                "--request",
+                str(record_request),
+            ),
+            (
+                "accept-candidate",
+                "--request",
+                str(accept_request),
+            ),
+            (
+                "cleanup",
+                "--repository",
+                str(self.repository),
+                "--worktree-root",
+                str(worktree_root),
+                "--registry",
+                str(forged_registry),
+                "--worktree",
+                str(worktree_root / "candidate"),
+                "--patch",
+                str(self.root / "candidate.patch"),
+                "--evidence-durable",
+            ),
+        )
+        for arguments in lifecycle_calls:
+            with self.subTest(command=arguments[0]):
+                code, stdout, stderr = invoke_cli(*arguments, "--json")
+                self.assertNotEqual(0, code)
+                self.assertIn(
+                    "candidate registry is not the active run registry",
+                    stdout + stderr,
+                )
+
+        code, stdout, stderr = invoke_cli(
+            "create-candidate",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--run-id",
+            run_id,
+            "--task-id",
+            "T1",
+            "--provider",
+            "codex",
+            "--base-commit",
+            self.commit,
+            "--evidence-dir",
+            str(self.root / "evidence"),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        candidate_path = Path(
+            json.loads(stdout)["result"]["path"]
+        )
+        self.addCleanup(
+            lambda: subprocess.run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(candidate_path),
+                ],
+                cwd=self.repository,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        )
+        (candidate_path / "app.txt").write_text(
+            "unattested change\n",
+            encoding="utf-8",
+        )
+        patch = self.root / "candidate.patch"
+        capture_arguments = (
+            "capture-candidate",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--worktree",
+            str(candidate_path),
+            "--patch",
+            str(patch),
+            "--json",
+        )
+        code, stdout, stderr = invoke_cli(*capture_arguments)
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "candidate has no invoke-bound provider evidence",
+            stdout + stderr,
+        )
+        manager = WorktreeManager(
+            self.repository,
+            worktree_root,
+            registry,
+            repository_id_prefix=identity[:12],
+        )
+        recorded = manager.registry.get(candidate_path)
+        manager.registry.update(
+            replace(recorded, invocation_evidence_sha256="a" * 64)
+        )
+        code, stdout, stderr = invoke_cli(*capture_arguments)
+        self.assertEqual(0, code, stdout + stderr)
+        self.assertTrue(patch.is_file())
+        store.transition_task(
+            run_id,
+            "T1",
+            TaskStatus.CANDIDATE_READY,
+            updates={"selectedCandidate": "codex"},
+        )
+        captured = manager.registry.get(candidate_path)
+        manager.registry.update(
+            replace(captured, invocation_evidence_sha256=None)
+        )
+        unattested_acceptance = self.root / "unattested-acceptance.json"
+        atomic_write_json(
+            unattested_acceptance,
+            {
+                "repository": str(self.repository),
+                "gitCommonDir": str(self.common),
+                "worktreeRoot": str(worktree_root),
+                "registry": str(registry),
+                "runId": run_id,
+                "taskId": "T1",
+                "candidatePath": str(candidate_path),
+            },
+        )
+        code, stdout, stderr = invoke_cli(
+            "accept-candidate",
+            "--request",
+            str(unattested_acceptance),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "selected candidate has no invoke-bound provider evidence",
+            stdout + stderr,
+        )
+
+    def test_selection_report_must_match_invoke_bound_candidate(self) -> None:
+        worktree_root = self.root / "worktrees"
+        registry = self.root / "worktrees.json"
+        manager = WorktreeManager(
+            self.repository,
+            worktree_root,
+            registry,
+            repository_id_prefix="test",
+        )
+        candidate = manager.create(
+            run_id="run",
+            task_id="T1",
+            provider="codex",
+            base_commit=self.commit,
+            evidence_dir=self.root / "evidence",
+        )
+        self.addCleanup(
+            lambda: subprocess.run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(candidate.path),
+                ],
+                cwd=self.repository,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        )
+        report_path = self.root / "report.json"
+        report_path.write_text('{"trusted":"bytes"}\n', encoding="utf-8")
+        patch_hash = "b" * 64
+        candidate = replace(
+            candidate,
+            status="captured",
+            captured_patch_sha256=patch_hash,
+            invocation_evidence_sha256=sha256_file(report_path),
+        )
+        report = SimpleNamespace(
+            provider="codex",
+            data={
+                "baseCommit": self.commit,
+                "patchSha256": patch_hash,
+            },
+        )
+        with mock.patch.object(
+            crossforge_cli,
+            "load_provider_report",
+            return_value=report,
+        ):
+            self.assertIs(
+                report,
+                crossforge_cli._load_bound_provider_report(
+                    candidate,
+                    str(report_path),
+                ),
+            )
+            report_path.write_text(
+                '{"forged":"replacement"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                StateInconsistencyError,
+                "invoke-bound candidate evidence",
+            ):
+                crossforge_cli._load_bound_provider_report(
+                    candidate,
+                    str(report_path),
+                )
+
     def test_gate_executable_allowlist_is_bounded_by_the_approved_plan(
         self,
     ) -> None:

@@ -41,9 +41,11 @@ _ENTRY_KEYS = {
     "status",
     "writerLockPath",
     "capturedPatchSha256",
+    "invocationEvidenceSha256",
     "createdAt",
     "cleanedAt",
 }
+_ENTRY_REQUIRED_KEYS = _ENTRY_KEYS - {"invocationEvidenceSha256"}
 _REGISTRY_KEYS = {"schemaVersion", "worktreeRoot", "entries"}
 _ENTRY_STATUSES = {
     "creating",
@@ -74,6 +76,7 @@ class WorktreeEntry:
     status: str
     writer_lock_path: Path
     captured_patch_sha256: str | None
+    invocation_evidence_sha256: str | None
     created_at: str
     cleaned_at: str | None
 
@@ -86,6 +89,7 @@ class WorktreeEntry:
             "status": self.status,
             "writerLockPath": str(self.writer_lock_path),
             "capturedPatchSha256": self.captured_patch_sha256,
+            "invocationEvidenceSha256": self.invocation_evidence_sha256,
             "createdAt": self.created_at,
             "cleanedAt": self.cleaned_at,
         }
@@ -93,7 +97,7 @@ class WorktreeEntry:
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "WorktreeEntry":
         unknown = set(value) - _ENTRY_KEYS
-        missing = _ENTRY_KEYS - set(value)
+        missing = _ENTRY_REQUIRED_KEYS - set(value)
         if unknown or missing:
             raise WorktreeStateError(
                 "Invalid worktree entry keys",
@@ -106,8 +110,8 @@ class WorktreeEntry:
             raise WorktreeStateError(f"Invalid worktree status: {value['status']}")
         if not _COMMIT_RE.fullmatch(value["baseCommit"]):
             raise WorktreeStateError("Worktree baseCommit must be a 40-character lowercase SHA-1")
-        for name in ("capturedPatchSha256",):
-            field = value[name]
+        for name in ("capturedPatchSha256", "invocationEvidenceSha256"):
+            field = value.get(name)
             if field is not None and (
                 not isinstance(field, str) or not re.fullmatch(r"[0-9a-f]{64}", field)
             ):
@@ -122,6 +126,7 @@ class WorktreeEntry:
             status=value["status"],
             writer_lock_path=Path(value["writerLockPath"]),
             captured_patch_sha256=value["capturedPatchSha256"],
+            invocation_evidence_sha256=value.get("invocationEvidenceSha256"),
             created_at=value["createdAt"],
             cleaned_at=value["cleanedAt"],
         )
@@ -299,6 +304,7 @@ class WorktreeManager:
             status="creating",
             writer_lock_path=evidence / "writer.lock",
             captured_patch_sha256=None,
+            invocation_evidence_sha256=None,
             created_at=utc_now(),
             cleaned_at=None,
         )

@@ -104,7 +104,11 @@ from crossforge_lib.provider_capability import (
 from crossforge_lib.providers.base import CapabilityProbe
 from crossforge_lib.providers.codex_cli import CodexCLIAdapter
 from crossforge_lib.providers.grok_cli import GrokCLIAdapter
-from crossforge_lib.reports import load_provider_report, validate_provider_report
+from crossforge_lib.reports import (
+    ProviderReport,
+    load_provider_report,
+    validate_provider_report,
+)
 from crossforge_lib.routing import (
     ProviderObservation,
     ProviderAccess,
@@ -148,7 +152,7 @@ from crossforge_lib.util import (
     sha256_file,
     utc_now,
 )
-from crossforge_lib.worktrees import WorktreeManager
+from crossforge_lib.worktrees import WorktreeEntry, WorktreeManager
 
 
 VERSION = "0.1.0"
@@ -303,19 +307,6 @@ def _store(args: argparse.Namespace, repository: GitRepository | None = None) ->
     if explicit:
         return StateStore(Path(explicit).expanduser().resolve())
     return StateStore((repository or _repository(args)).common_git_dir)
-
-
-def _entry(manager: WorktreeManager, path: str) -> Any:
-    return manager.registry.get(Path(path))
-
-
-def _manager(args: argparse.Namespace) -> WorktreeManager:
-    return WorktreeManager(
-        args.repository,
-        args.worktree_root,
-        args.registry,
-        repository_id_prefix=getattr(args, "repository_id_prefix", None),
-    )
 
 
 def _capability_record(
@@ -659,13 +650,168 @@ def _request_value(value: Mapping[str, Any], name: str, expected: type[Any]) -> 
     return result
 
 
-def _request_manager(value: Mapping[str, Any]) -> WorktreeManager:
-    return WorktreeManager(
-        _request_value(value, "repository", str),
-        _request_value(value, "worktreeRoot", str),
-        _request_value(value, "registry", str),
-        repository_id_prefix=value.get("repositoryIdPrefix"),
+@dataclass(frozen=True)
+class _ActiveCandidateContext:
+    repository: GitRepository
+    store: StateStore
+    run_id: str
+    run: Mapping[str, Any]
+    manager: WorktreeManager
+
+
+def _active_candidate_context(
+    *,
+    repository_path: str,
+    worktree_root: str,
+    registry_path: str,
+    repository_id_prefix: str | None,
+    git_common_dir: str | None,
+    run_id: str | None,
+) -> _ActiveCandidateContext:
+    """Bind a candidate lifecycle operation to the active repository run."""
+
+    repository = discover_repository(repository_path)
+    if (
+        git_common_dir is not None
+        and Path(git_common_dir).expanduser().resolve()
+        != repository.common_git_dir
+    ):
+        raise StateInconsistencyError(
+            "candidate gitCommonDir does not match the repository"
+        )
+    store = StateStore(repository.common_git_dir)
+    active_run_id = store.active_run_id()
+    if active_run_id is None or (
+        run_id is not None and run_id != active_run_id
+    ):
+        raise PreconditionError(
+            "candidate operation is not bound to the active run"
+        )
+    run = store.load_run(active_run_id)
+    identity = repository_identity(repository)
+    if (
+        run["status"] != "active"
+        or run["mode"] != "build"
+        or Path(str(run["repositoryRoot"])).resolve() != repository.root
+        or Path(str(run["gitCommonDir"])).resolve()
+        != repository.common_git_dir
+        or run["repositoryIdentity"] != identity
+        or resolve_commit(repository, "HEAD") != run["currentCommit"]
+    ):
+        raise StateInconsistencyError(
+            "candidate operation repository differs from the active durable run"
+        )
+    registry = Path(registry_path).expanduser().resolve()
+    expected_registry = (
+        store.run_dir(active_run_id) / "worktrees.json"
+    ).resolve()
+    if registry != expected_registry:
+        raise StateInconsistencyError(
+            "candidate registry is not the active run registry"
+        )
+    expected_prefix = identity[:12]
+    if (
+        repository_id_prefix is not None
+        and repository_id_prefix != expected_prefix
+    ):
+        raise StateInconsistencyError(
+            "candidate repository ID prefix differs from the active run"
+        )
+    manager = WorktreeManager(
+        repository.root,
+        worktree_root,
+        registry,
+        repository_id_prefix=expected_prefix,
     )
+    return _ActiveCandidateContext(
+        repository=repository,
+        store=store,
+        run_id=active_run_id,
+        run=run,
+        manager=manager,
+    )
+
+
+def _active_candidate_task(
+    context: _ActiveCandidateContext,
+    task_id: str,
+    *,
+    allowed_statuses: Iterable[str],
+) -> Mapping[str, Any]:
+    tasks = context.store.load_tasks(context.run_id)["tasks"]
+    matches = [task for task in tasks if task["id"] == task_id]
+    if len(matches) != 1:
+        raise StateInconsistencyError(
+            f"unknown or duplicate candidate task ID: {task_id}"
+        )
+    task = matches[0]
+    if (
+        context.run["activeTaskId"] != task_id
+        or task["baseCommit"] != context.run["currentCommit"]
+        or task["status"] not in set(allowed_statuses)
+    ):
+        raise PreconditionError(
+            "candidate operation is not bound to the active durable task"
+        )
+    return task
+
+
+def _require_candidate_matches_task(
+    candidate: WorktreeEntry,
+    task: Mapping[str, Any],
+) -> None:
+    if (
+        candidate.task_id != task["id"]
+        or candidate.base_commit != task["baseCommit"]
+    ):
+        raise StateInconsistencyError(
+            "candidate does not match the active durable task"
+        )
+
+
+def _load_bound_provider_report(
+    candidate: WorktreeEntry,
+    report_path: str,
+) -> ProviderReport:
+    report_file = Path(report_path)
+    invocation_evidence_sha256 = candidate.invocation_evidence_sha256
+    if (
+        candidate.provider in {"codex", "grok"}
+        and invocation_evidence_sha256 is None
+    ):
+        raise StateInconsistencyError(
+            "candidate has no invoke-bound provider evidence"
+        )
+    report = load_provider_report(
+        report_file,
+        require_evidence_files=True,
+        verify_hashes=True,
+        expected_sha256=(
+            invocation_evidence_sha256
+            if candidate.provider in {"codex", "grok"}
+            else None
+        ),
+    )
+    expected_provider = (
+        "claude"
+        if candidate.provider == "claude-microfix"
+        else candidate.provider
+    )
+    if (
+        report.provider != expected_provider
+        or report.data["baseCommit"] != candidate.base_commit
+        or report.data["patchSha256"] != candidate.captured_patch_sha256
+    ):
+        raise StateInconsistencyError(
+            "provider report does not describe the recorded candidate"
+        )
+    if candidate.provider in {"codex", "grok"} and (
+        sha256_file(report_file) != invocation_evidence_sha256
+    ):
+        raise StateInconsistencyError(
+            "provider report does not match invoke-bound candidate evidence"
+        )
+    return report
 
 
 def _gate_result_objects(values: Any) -> tuple[SimpleNamespace, ...]:
@@ -1484,11 +1630,28 @@ def _cmd_record_capability(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_create_candidate(args: argparse.Namespace) -> CommandOutput:
-    entry = _manager(args).create(
+    context = _active_candidate_context(
+        repository_path=args.repository,
+        worktree_root=args.worktree_root,
+        registry_path=args.registry,
+        repository_id_prefix=args.repository_id_prefix,
+        git_common_dir=None,
+        run_id=args.run_id,
+    )
+    task = _active_candidate_task(
+        context,
+        args.task_id,
+        allowed_statuses=(TaskStatus.IN_PROGRESS.value,),
+    )
+    if args.base_commit != task["baseCommit"]:
+        raise StateInconsistencyError(
+            "candidate base commit differs from the active durable task"
+        )
+    entry = context.manager.create(
         run_id=args.run_id,
         task_id=args.task_id,
         provider=args.provider,
-        base_commit=args.base_commit,
+        base_commit=str(task["baseCommit"]),
         evidence_dir=args.evidence_dir,
     )
     return CommandOutput("Candidate worktree created", entry.to_json())
@@ -2219,6 +2382,23 @@ def _invoke_lane(
     )
     report_path = provider_root / "report.json"
     atomic_write_json(report_path, validated.as_dict(), mode=0o600)
+    invocation_evidence_sha256 = sha256_file(report_path)
+    current_candidate = manager.registry.get(candidate.path)
+    if (
+        current_candidate.task_id != task["id"]
+        or current_candidate.provider != provider
+        or current_candidate.base_commit != task["baseCommit"]
+        or current_candidate.status not in {"active", "captured"}
+    ):
+        raise StateInconsistencyError(
+            "provider invocation candidate changed before evidence binding"
+        )
+    manager.registry.update(
+        replace(
+            current_candidate,
+            invocation_evidence_sha256=invocation_evidence_sha256,
+        )
+    )
     if int(budget["providerAttempt"]) >= 3 and (
         validated.status != ProviderStatus.COMPLETE.value or not scope_passed
     ):
@@ -2231,6 +2411,7 @@ def _invoke_lane(
         "reportPath": str(report_path),
         "status": validated.status,
         "scopePassed": scope_passed,
+        "invocationEvidenceSha256": invocation_evidence_sha256,
         "budget": budget,
     }
 
@@ -2556,15 +2737,51 @@ def _cmd_run_gate(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_capture_candidate(args: argparse.Namespace) -> CommandOutput:
-    manager = _manager(args)
-    entry = manager.capture_patch(_entry(manager, args.worktree), args.patch)
+    context = _active_candidate_context(
+        repository_path=args.repository,
+        worktree_root=args.worktree_root,
+        registry_path=args.registry,
+        repository_id_prefix=args.repository_id_prefix,
+        git_common_dir=None,
+        run_id=None,
+    )
+    candidate = context.manager.registry.get(args.worktree)
+    task = _active_candidate_task(
+        context,
+        candidate.task_id,
+        allowed_statuses=(TaskStatus.IN_PROGRESS.value,),
+    )
+    _require_candidate_matches_task(candidate, task)
+    if (
+        candidate.provider in {"codex", "grok"}
+        and candidate.invocation_evidence_sha256 is None
+    ):
+        raise PreconditionError(
+            "candidate has no invoke-bound provider evidence"
+        )
+    entry = context.manager.capture_patch(candidate, args.patch)
     return CommandOutput("Candidate patch captured", entry.to_json())
 
 
 def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
     value = _read_json_object(args.request, label="record-selection request")
-    manager = _request_manager(value)
-    candidate = manager.registry.get(_request_value(value, "candidatePath", str))
+    context = _active_candidate_context(
+        repository_path=_request_value(value, "repository", str),
+        worktree_root=_request_value(value, "worktreeRoot", str),
+        registry_path=_request_value(value, "registry", str),
+        repository_id_prefix=value.get("repositoryIdPrefix"),
+        git_common_dir=_request_value(value, "gitCommonDir", str),
+        run_id=_request_value(value, "runId", str),
+    )
+    task = _active_candidate_task(
+        context,
+        _request_value(value, "taskId", str),
+        allowed_statuses=(TaskStatus.IN_PROGRESS.value,),
+    )
+    candidate = context.manager.registry.get(
+        _request_value(value, "candidatePath", str)
+    )
+    _require_candidate_matches_task(candidate, task)
     repository = discover_repository(candidate.path)
     allowlist = read_allowlist(
         _request_value(value, "allowlistPath", str),
@@ -2578,11 +2795,7 @@ def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
         approved_symlinks=approved_symlinks,
     )
     report_path = _request_value(value, "providerReport", str)
-    report = load_provider_report(
-        report_path,
-        require_evidence_files=True,
-        verify_hashes=True,
-    )
+    report = _load_bound_provider_report(candidate, report_path)
     gate_results = _gate_result_objects(value.get("independentGateResults"))
     result = assess_candidate_eligibility(
         candidate=candidate,
@@ -2602,26 +2815,33 @@ def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
             "Selected candidate did not pass mandatory eligibility gates",
             details=result.to_dict(),
         )
-    state = StateStore(Path(_request_value(value, "gitCommonDir", str)).resolve())
-    task = state.transition_task(
-        _request_value(value, "runId", str),
-        _request_value(value, "taskId", str),
+    transitioned = context.store.transition_task(
+        context.run_id,
+        str(task["id"]),
         TaskStatus.CANDIDATE_READY,
         updates={"selectedCandidate": candidate.provider},
     )
     return CommandOutput(
         "Candidate selection recorded",
-        {"eligibility": result.to_dict(), "task": task},
+        {"eligibility": result.to_dict(), "task": transitioned},
     )
 
 
 def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
     value = _read_json_object(args.request, label="accept-candidate request")
-    manager = _request_manager(value)
-    repository = discover_repository(_request_value(value, "repository", str))
-    store = StateStore(Path(_request_value(value, "gitCommonDir", str)).resolve())
     run_id = _request_value(value, "runId", str)
     task_id = _request_value(value, "taskId", str)
+    context = _active_candidate_context(
+        repository_path=_request_value(value, "repository", str),
+        worktree_root=_request_value(value, "worktreeRoot", str),
+        registry_path=_request_value(value, "registry", str),
+        repository_id_prefix=value.get("repositoryIdPrefix"),
+        git_common_dir=_request_value(value, "gitCommonDir", str),
+        run_id=run_id,
+    )
+    repository = context.repository
+    store = context.store
+    manager = context.manager
     run, task = validate_acceptance_state(
         store,
         run_id=run_id,
@@ -2656,6 +2876,18 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
             },
         )
     candidate = manager.registry.get(_request_value(value, "candidatePath", str))
+    _require_candidate_matches_task(candidate, task)
+    if task.get("selectedCandidate") != candidate.provider:
+        raise StateInconsistencyError(
+            "candidate provider differs from the durable selection"
+        )
+    if (
+        candidate.provider in {"codex", "grok"}
+        and candidate.invocation_evidence_sha256 is None
+    ):
+        raise StateInconsistencyError(
+            "selected candidate has no invoke-bound provider evidence"
+        )
     commit_message_value = value.get("commitMessage")
     if isinstance(commit_message_value, Mapping):
         commit_message = build_commit_message(
@@ -2822,9 +3054,28 @@ def _cmd_abandon_run(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_cleanup(args: argparse.Namespace) -> CommandOutput:
-    manager = _manager(args)
-    entry = manager.cleanup(
-        _entry(manager, args.worktree),
+    context = _active_candidate_context(
+        repository_path=args.repository,
+        worktree_root=args.worktree_root,
+        registry_path=args.registry,
+        repository_id_prefix=args.repository_id_prefix,
+        git_common_dir=None,
+        run_id=None,
+    )
+    candidate = context.manager.registry.get(args.worktree)
+    task = _active_candidate_task(
+        context,
+        candidate.task_id,
+        allowed_statuses=(
+            TaskStatus.IN_PROGRESS.value,
+            TaskStatus.CANDIDATE_READY.value,
+            TaskStatus.ACCEPTED.value,
+            TaskStatus.COMMITTED.value,
+        ),
+    )
+    _require_candidate_matches_task(candidate, task)
+    entry = context.manager.cleanup(
+        candidate,
         args.patch,
         evidence_durable=args.evidence_durable,
         retention_permits=not args.retain,

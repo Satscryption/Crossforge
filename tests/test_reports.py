@@ -119,6 +119,27 @@ class ProviderReportTests(unittest.TestCase):
             with self.assertRaises(PreconditionError):
                 load_provider_report(report_path)
 
+    def test_report_loader_parses_only_invoke_bound_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path, _ = self._fixture(Path(temporary))
+            expected = sha256_file(report_path)
+            self.assertEqual(
+                "codex",
+                load_provider_report(
+                    report_path,
+                    expected_sha256=expected,
+                ).provider,
+            )
+            report_path.write_text('{"forged":true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                PreconditionError,
+                "invoke-bound evidence",
+            ):
+                load_provider_report(
+                    report_path,
+                    expected_sha256=expected,
+                )
+
     def test_runtime_manifest_provider_identity_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             report_path, raw = self._fixture(Path(temporary))
