@@ -742,14 +742,11 @@ class WorktreeManager:
         entry: WorktreeEntry,
         patch_path: str | os.PathLike[str],
         *,
-        evidence_durable: bool,
         retention_permits: bool = True,
     ) -> WorktreeEntry:
-        """Remove a candidate only after exact reverse-patch and cleanliness proof."""
+        """Remove a candidate only after durable patch and cleanliness proof."""
 
         current = self.registry.get(entry.path)
-        if not evidence_durable:
-            raise WorktreeError("Cannot clean worktree before evidence is durable")
         if not retention_permits:
             retained = replace(current, status="retained")
             self.registry.update(retained)

@@ -29,8 +29,8 @@ Apply [provider privacy](provider-privacy.md), then:
    Git configuration, and an owner-only temporary home;
 4. prove that the isolated repository has no remote and exactly one commit;
 5. record tree/commit IDs, effective sanitized configuration, executable
-   identity, sandbox-policy hash, and toolchain mount identities in
-   `runtime-manifest.json`.
+   identity, and sandbox-policy hash in `runtime-manifest.json`; omit
+   placeholder evidence fields that are neither derived nor consumed.
 
 After every provider descendant exits, record isolated Git metadata changes,
 remove only the contained isolated `.git`, restore the original control file

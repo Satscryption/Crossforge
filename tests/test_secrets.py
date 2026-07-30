@@ -44,14 +44,25 @@ class SecretTests(unittest.TestCase):
         return path
 
     def test_fixed_deny_glob_semantics(self):
-        patterns = ["**/.env", "**/.env.*", "**/secrets/**", "*.pem", "a/**/blocked"]
+        patterns = [
+            "**/.env",
+            "**/.env.*",
+            "**/secrets/**",
+            "*.pem",
+            "**/*.pem",
+            "a/**/blocked",
+        ]
         self.assertTrue(match_deny_path(".env", patterns))
         self.assertTrue(match_deny_path("service/.env.local", patterns))
         self.assertTrue(match_deny_path("a/secrets/token.txt", patterns))
         self.assertTrue(match_deny_path("a/blocked", patterns))
         self.assertTrue(match_deny_path("a/deep/blocked", patterns))
         self.assertTrue(match_deny_path("root.pem", patterns))
-        self.assertFalse(match_deny_path("keys/root.pem", patterns))
+        self.assertTrue(match_deny_path("keys/root.pem", patterns))
+        self.assertFalse(match_deny_path("keys/root.pem", ["*.pem"]))
+        for path in (".ENV", "a/.Env", "Secrets/x.txt", "app/key.PEM"):
+            with self.subTest(path=path):
+                self.assertTrue(match_deny_path(path, patterns))
         self.assertFalse(match_deny_path("not.env", patterns))
         self.assertEqual(
             denied_paths(["safe.txt", ".env", "x/secrets/a"], patterns),

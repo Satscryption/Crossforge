@@ -234,6 +234,7 @@ _CONTEXT_POLICY = {
     "binaryContext": "exact-path-and-sha256",
     "symlinks": "internal-only-never-follow",
     "gitProjection": "isolated-one-commit",
+    "denyGlobCase": "insensitive",
 }
 
 
@@ -2721,8 +2722,8 @@ def _invoke_lane(
             )
         context_path = provider_root / "context-manifest.json"
         _shared_evidence_bytes(
-            provider_root / "context-manifest.json",
-            context_path.read_bytes(),
+            context_path,
+            canonical_json_bytes(context.context_manifest),
             label="context manifest",
         )
         runtime_path = provider_root / "runtime-manifest.json"
@@ -2734,7 +2735,6 @@ def _invoke_lane(
             "sha256": capability_record["executableSha256"],
         }
         runtime["sandboxPolicySha256"] = sandbox_policy_sha256
-        runtime["requiredMountIdentities"] = []
         atomic_write_json(runtime_path, runtime, mode=0o600)
         invoke_method = (
             adapter.implement
@@ -3093,6 +3093,21 @@ def _cmd_invoke(args: argparse.Namespace) -> CommandOutput:
                 details={"laneFailures": sorted(failures, key=lambda item: item["provider"])},
             )
         results.sort(key=lambda item: item["provider"])
+    return _invoke_command_output(run_id, task_id, results)
+
+
+def _invoke_command_output(
+    run_id: str,
+    task_id: str,
+    results: list[dict[str, Any]],
+) -> CommandOutput:
+    """Return successful invoke output or surface recorded scope failures."""
+
+    if any(item["scopePassed"] is not True for item in results):
+        raise ScopeViolationError(
+            "Provider invocation changed content outside the task allowlist",
+            details={"runId": run_id, "taskId": task_id, "lanes": results},
+        )
     return CommandOutput(
         f"Completed {len(results)} provider invocation lane(s)",
         {"runId": run_id, "taskId": task_id, "lanes": results},
@@ -4136,10 +4151,13 @@ def _cmd_check_micro_fix(args: argparse.Namespace) -> CommandOutput:
     result = assess_micro_fix(**value)
     if not result.allowed:
         raise PreconditionError(
-            "Micro-fix is not eligible",
+            "Caller-attested micro-fix is not eligible",
             details=result.to_dict(),
         )
-    return CommandOutput("Micro-fix is eligible", result.to_dict())
+    return CommandOutput(
+        "Caller-attested micro-fix inputs are mechanically eligible",
+        result.to_dict(),
+    )
 
 
 def _cmd_finish_task(args: argparse.Namespace) -> CommandOutput:
@@ -4244,7 +4262,6 @@ def _cmd_cleanup(args: argparse.Namespace) -> CommandOutput:
         entry = context.manager.cleanup(
             candidate,
             args.patch,
-            evidence_durable=args.evidence_durable,
             retention_permits=not args.retain,
         )
     return CommandOutput("Candidate cleanup complete", entry.to_json())
@@ -4601,7 +4618,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (
         ("record-selection", "record a candidate selection"),
         ("accept-candidate", "verify and accept a candidate"),
-        ("check-micro-fix", "validate guarded micro-fix eligibility"),
+        ("check-micro-fix", "check caller-attested micro-fix inputs"),
     ):
         item = command(name, help_text)
         item.add_argument(
@@ -4631,7 +4648,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_worktree_manager(item)
     item.add_argument("--worktree", required=True)
     item.add_argument("--patch", required=True)
-    item.add_argument("--evidence-durable", action="store_true")
     item.add_argument("--retain", action="store_true")
 
     handlers = {

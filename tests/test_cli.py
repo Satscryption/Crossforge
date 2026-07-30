@@ -28,6 +28,7 @@ from crossforge_lib.consent import deny_policy_hash, record_consent  # noqa: E40
 from crossforge_lib.errors import (  # noqa: E402
     InvalidInputError,
     PreconditionError,
+    ScopeViolationError,
     StateInconsistencyError,
 )
 from crossforge_lib.gates import ProbeCheck, SandboxProbeResult  # noqa: E402
@@ -890,6 +891,19 @@ class ConsentCLIRegressionTests(CLITestCase):
 
 
 class ProviderBoundaryCLIRegressionTests(CLITestCase):
+    def test_recorded_invoke_scope_violation_uses_exit_five_contract(self) -> None:
+        lanes = [
+            {
+                "provider": "codex",
+                "scopePassed": False,
+                "reportPath": "/evidence/report.json",
+            }
+        ]
+        with self.assertRaises(ScopeViolationError) as caught:
+            crossforge_cli._invoke_command_output("run-1", "T1", lanes)
+        self.assertEqual(5, int(caught.exception.exit_code))
+        self.assertEqual(lanes, caught.exception.details["lanes"])
+
     def test_valid_invoke_is_consent_bound_and_writes_verified_report(self) -> None:
         task = runtime_task(self.commit, status="in_progress")
         store, run_id = self.seed_state(tasks=[task], active_task="T1")
@@ -1110,6 +1124,12 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         self.assertEqual(0, code, stdout + stderr)
         result = json.loads(stdout)["result"]["lanes"][0]
         report = load_provider_report(result["reportPath"])
+        runtime = json.loads(
+            (
+                Path(result["reportPath"]).parent / "runtime-manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertNotIn("requiredMountIdentities", runtime)
         self.assertEqual("complete", report.status)
         self.assertEqual(
             sha256_file(result["reportPath"]),
@@ -1695,7 +1715,6 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
                 str(worktree_root / "candidate"),
                 "--patch",
                 str(self.root / "candidate.patch"),
-                "--evidence-durable",
             ),
         )
         for arguments in lifecycle_calls:
@@ -1877,7 +1896,6 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
             str(candidate.path),
             "--patch",
             str(patch),
-            "--evidence-durable",
             "--json",
         )
         self.assertEqual(0, code, stdout + stderr)

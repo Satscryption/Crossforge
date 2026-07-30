@@ -60,8 +60,11 @@ Combining candidates requires a newly approved integration task. A correction
 keeps the original allowlist and constraints, names the exact failed command,
 and supplies only sanitized output. After three failed attempts by one provider,
 block the task. A Claude micro-fix is allowed only after `check-micro-fix`
-passes and must use a fresh recorded candidate worktree and the normal capture,
-selection, and acceptance path.
+returns mechanically eligible, its explicitly caller-attested inputs are
+independently inspected and recorded in `decisions.md`, and the user approves
+the recovery. The command result is not verified evidence and cannot authorize
+the exception alone. A micro-fix must use a fresh recorded candidate worktree
+and the normal capture, selection, and acceptance path.
 
 See also [routing policy](routing-policy.md) and
 [worktree protocol](worktree-protocol.md).

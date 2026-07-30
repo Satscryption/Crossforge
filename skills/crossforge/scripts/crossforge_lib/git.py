@@ -154,17 +154,13 @@ def run_git(
             shell=False,
         )
     except FileNotFoundError as error:
-        raise GitError(f"Git executable was not found: {git_executable}") from error
+        raise GitError("Git executable was not found") from error
     except subprocess.TimeoutExpired as error:
         raise GitError(
             f"Git command timed out after {timeout_seconds} seconds",
-            details={"argv": list(argv), "cwd": str(working_directory)},
         ) from error
     except OSError as error:
-        raise GitError(
-            f"Git command could not be started: {error}",
-            details={"argv": list(argv), "cwd": str(working_directory)},
-        ) from error
+        raise GitError("Git command could not be started") from error
 
     result = GitResult(
         argv=argv,
@@ -174,14 +170,9 @@ def run_git(
         stderr_bytes=completed.stderr,
     )
     if check and result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
         raise GitError(
-            f"Git command failed ({result.returncode}): {message}",
-            details={
-                "argv": list(argv),
-                "cwd": str(working_directory),
-                "returnCode": result.returncode,
-            },
+            f"Git command failed with exit code {result.returncode}",
+            details={"returnCode": result.returncode},
         )
     return result
 
@@ -214,7 +205,7 @@ def discover_repository(
         git_executable=git_executable,
     )
     if probe.returncode != 0 or probe.stdout.strip() != "true":
-        raise GitError(f"Not inside a non-bare Git worktree: {candidate}")
+        raise GitError("Not inside a non-bare Git worktree")
 
     root = Path(
         git_stdout(
@@ -271,7 +262,7 @@ def current_branch(repository: GitRepository) -> str | None:
         return result.stdout.strip()
     if result.returncode == 1:
         return None
-    raise GitError(f"Unable to determine current branch: {result.stderr.strip()}")
+    raise GitError("Unable to determine current branch")
 
 
 def is_dirty(
@@ -298,7 +289,7 @@ def branch_exists(repository: GitRepository, branch: str) -> bool:
         git_executable=repository.git_executable,
     )
     if result.returncode not in (0, 1):
-        raise GitError(f"Unable to inspect branch {branch!r}: {result.stderr.strip()}")
+        raise GitError("Unable to inspect branch")
     return result.returncode == 0
 
 
@@ -373,9 +364,7 @@ def detect_default_branch(
             if value.startswith(prefix) and len(value) > len(prefix):
                 return validate_branch_name(repository, value[len(prefix) :])
         elif symbolic.returncode not in (1, 128):
-            raise GitError(
-                f"Unable to inspect symbolic default branch: {symbolic.stderr.strip()}"
-            )
+            raise GitError("Unable to inspect symbolic default branch")
 
     if policy_default:
         return validate_branch_name(repository, policy_default)
@@ -393,7 +382,7 @@ def detect_default_branch(
     if configured.returncode == 0 and configured.stdout.strip():
         return validate_branch_name(repository, configured.stdout.strip())
     if configured.returncode not in (0, 1):
-        raise GitError(f"Unable to read init.defaultBranch: {configured.stderr.strip()}")
+        raise GitError("Unable to read init.defaultBranch")
     raise PreconditionError(
         "Unable to determine the target branch; supply --target-branch"
     )
@@ -554,7 +543,7 @@ def origin_remote_url(repository: GitRepository) -> str | None:
     # Git has used both 2 and 128 for a missing remote across versions.
     if "No such remote" in result.stderr or "No such remote" in result.stdout:
         return None
-    raise GitError(f"Unable to read origin remote: {result.stderr.strip()}")
+    raise GitError("Unable to read origin remote")
 
 
 def repository_identity(

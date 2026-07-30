@@ -285,9 +285,11 @@ For each task:
    output, expected behavior, unchanged constraints, and current allowlist.
    Allow at most three attempts per provider.
 7. After three failures, block and report the impasse. Do not silently take
-   over. A Claude micro-fix is allowed only after `check-micro-fix` passes and
-   must use a fresh candidate worktree and the complete normal evidence and
-   acceptance path.
+   over. `check-micro-fix` returns only a caller-attested mechanical result,
+   not verified evidence. A Claude micro-fix additionally requires independent
+   inspection, a recorded recovery decision, and user approval, and must use a
+   fresh candidate worktree and the complete normal evidence and acceptance
+   path.
 
 ### Accept, commit, and advance
 

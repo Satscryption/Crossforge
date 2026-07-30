@@ -126,7 +126,26 @@ class MicroFixResult:
     reasons: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
-        return {"allowed": self.allowed, "reasons": list(self.reasons)}
+        return {
+            "allowed": self.allowed,
+            "reasons": list(self.reasons),
+            "assurance": "caller-attested",
+            "authoritative": False,
+            "attestedInputs": [
+                "changed_lines",
+                "changed_paths",
+                "allowlist",
+                "task_risk",
+                "task_class",
+                "public_interface_change",
+                "security_or_behavioral_decision",
+                "persistence_migration_or_concurrency",
+                "new_test_logic",
+                "deterministic_gates_cover",
+                "evidence_will_record",
+                "commit_body_will_record",
+            ],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,7 +344,12 @@ def check_micro_fix(
     evidence_will_record: bool,
     commit_body_will_record: bool,
 ) -> MicroFixResult:
-    """Mechanically enforce the guarded Claude micro-fix exception."""
+    """Check the internal consistency of caller-attested micro-fix inputs.
+
+    This helper does not independently observe a repository, patch, task, gate,
+    evidence record, or future commit body. Its output must therefore never be
+    represented as verified control-layer evidence.
+    """
 
     reasons: list[str] = []
     if not enabled:
@@ -793,7 +817,6 @@ def verify_candidate_gates(
             cleaned = worktree_manager.cleanup(
                 captured_verification,
                 patch,
-                evidence_durable=True,
             )
             cleanup_status = cleaned.status
         except BaseException:
@@ -1101,7 +1124,6 @@ def accept_candidate(
                 cleaned = worktree_manager.cleanup(
                     captured_verification,
                     patch,
-                    evidence_durable=True,
                 )
                 cleanup_status = cleaned.status
         except BaseException:

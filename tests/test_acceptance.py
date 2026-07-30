@@ -756,6 +756,12 @@ class EligibilityAndMicroFixTests(AcceptanceCase):
             commit_body_will_record=True,
         )
         self.assertTrue(allowed.allowed)
+        self.assertEqual("caller-attested", allowed.to_dict()["assurance"])
+        self.assertFalse(allowed.to_dict()["authoritative"])
+        self.assertIn(
+            "changed_lines",
+            allowed.to_dict()["attestedInputs"],
+        )
 
         rejected = check_micro_fix(
             changed_lines=6,
