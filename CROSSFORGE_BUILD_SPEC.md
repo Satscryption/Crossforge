@@ -32,8 +32,10 @@ must be limited to explicitly enabled live smoke tests.
 4. Do not read or manipulate provider OAuth tokens. Reuse authenticated CLI
    sessions by invoking their official CLIs.
 5. Do not use destructive Git commands such as `git reset --hard`.
-6. Do not push, create a pull request, or perform another external write during
-   normal Crossforge execution. Those actions belong to `crossforge-ship`.
+6. Do not record provider consent, push, create a pull request, or perform
+   another external write during normal Crossforge execution. Consent belongs
+   to user-invoked `crossforge-consent`; publication belongs to
+   `crossforge-ship`.
 7. Keep the main `SKILL.md` below 500 lines. Put detailed protocols in
    `references/` and deterministic behavior in Python.
 8. Preserve the relevant MIT notices and provenance described in the licensing
@@ -89,10 +91,16 @@ crossforge/
 │   │               ├── base.py
 │   │               ├── codex_cli.py
 │   │               └── grok_cli.py
+│   ├── crossforge-consent/
+│   │   ├── SKILL.md
+│   │   └── scripts/
+│   │       └── crossforge_consent.py
 │   └── crossforge-ship/
 │       ├── SKILL.md
 │       └── references/
 │           └── shipping-protocol.md
+├── hooks/
+│   └── crossforge_boundary.py
 ├── evals/
 │   ├── evals.json
 │   └── trigger-evals.json
@@ -441,6 +449,9 @@ the current branch name alone.
 - Store consent locally per repository and provider.
 - Default expiry: 90 days.
 - Bind consent to repository identity.
+- Let the normal skill prepare only a 15-minute, exact-byte-hash request.
+- Require the directly user-invoked consent skill and an exact
+  `PreToolUse` permission prompt to record that request.
 - Reconfirm for a new provider, changed repository identity, expanded operation
   class, relaxed deny policy, managed-policy change, or expiry.
 
@@ -834,7 +845,7 @@ remaining unshipped completed build run or remove it when none exists.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "runId": "20260724T120000Z-a1b2c3d4",
   "status": "active",
   "mode": "build",
@@ -1873,7 +1884,7 @@ and explicit-port examples.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 3,
   "repositoryIdentity": "hex",
   "providers": {
     "codex": {
@@ -1888,6 +1899,9 @@ and explicit-port examples.
       "managedPolicySha256": "hex-or-no-managed-policy",
       "providerExecutablePath": "/canonical/absolute/path",
       "providerExecutableSha256": "hex",
+      "contextManifestSha256": "hex",
+      "contextFileCount": 123,
+      "contextTotalBytes": 456789,
       "approvedAt": "RFC3339 UTC",
       "expiresAt": "RFC3339 UTC"
     },
@@ -1902,6 +1916,9 @@ and explicit-port examples.
       "managedPolicySha256": "hex-or-no-managed-policy",
       "providerExecutablePath": "/canonical/absolute/path",
       "providerExecutableSha256": "hex",
+      "contextManifestSha256": "hex",
+      "contextFileCount": 123,
+      "contextTotalBytes": 456789,
       "approvedAt": "RFC3339 UTC",
       "expiresAt": "RFC3339 UTC"
     }
@@ -1909,17 +1926,33 @@ and explicit-port examples.
 }
 ```
 
-The Python control layer reports missing consent. Claude Code obtains user
-approval through normal interaction and then invokes an explicit
-`record-consent` command. The Python script must never infer consent from
-provider availability.
+The normal Python control layer reports missing consent and exposes
+`prepare-consent`, not `record-consent`. Preparation derives the live
+repository identity, deny-policy hash, provider executable identity, exact
+expiry, and context-manifest counts into a private request valid for at most
+15 minutes. The returned SHA-256 binds its exact bytes.
+
+Only the separate `crossforge-consent` skill exposes `record-consent`. It must
+be marked `disable-model-invocation: true`, use a disjoint launcher, and have a
+`PreToolUse` hook that revalidates the request and returns
+`permissionDecision: ask` with `consent_summary()` as the user-only reason.
+After approval, the CLI revalidates the same request hash and every live
+derivable binding before writing consent. Its hook allows no other tool call.
+The normal skill's fail-closed hook permits only explicitly listed tools,
+blocks file tools from the Git-common Crossforge state and any
+`consent.json`, and permits only the bundled read-only advisor/reviewer agent
+types. The normal skill and provider availability must never infer or mint
+approval.
 
 Before approval, show provider, operation classes, repository identity prefix,
 deny-policy hash prefix, managed-policy hash prefix, provider executable path
 and content-hash prefix, consent expiry, and—for source-bearing operations—the
 context-manifest file count and total bytes. Persist the canonical executable
-identity in consent; any later path or byte change invalidates approval. Do not
-display secret findings or file contents in the consent prompt.
+identity and, for source-bearing operations, the canonical context-manifest
+hash and counts in consent. Recheck the live source manifest while holding the
+candidate writer lock; any later path or byte change invalidates approval. Do
+not display secret findings or file contents in the consent prompt. Probe-only
+entries store null context fields.
 
 Local executable discovery, version output, help inspection, and local login
 status may run before consent because they transmit no repository content and
@@ -2476,7 +2509,8 @@ render-plan
 materialize-tasks
 start-task
 route-task
-record-consent
+prepare-consent
+record-capability
 create-candidate
 invoke
 check-scope
@@ -2490,6 +2524,17 @@ finish-task
 complete-run
 abandon-run
 cleanup
+```
+
+The user-only consent CLI exposes:
+
+```text
+record-consent
+```
+
+The user-only shipping CLI exposes:
+
+```text
 ship-preflight
 authorize-shipment
 cancel-shipment
@@ -2907,6 +2952,12 @@ All tests must run without real provider credentials or network access.
 - Operation-class expansion.
 - Deny-policy hash change.
 - Managed-policy hash change.
+- Main control surface cannot record consent.
+- User-only consent skill cannot be model-invoked.
+- Request byte, path, repository, policy, executable, manifest, and freshness
+  mismatches fail before consent is written.
+- Consent approval hook returns `permissionDecision: ask` with the exact
+  non-sensitive disclosure.
 
 #### Secrets
 
@@ -3473,6 +3524,9 @@ crossforge/tests/test_state.py
 ```text
 crossforge/skills/crossforge/scripts/crossforge_lib/consent.py
 crossforge/skills/crossforge/scripts/crossforge_lib/secrets.py
+crossforge/skills/crossforge-consent/SKILL.md
+crossforge/skills/crossforge-consent/scripts/crossforge_consent.py
+crossforge/hooks/crossforge_boundary.py
 crossforge/tests/test_consent.py
 crossforge/tests/test_secrets.py
 ```
@@ -3480,6 +3534,7 @@ crossforge/tests/test_secrets.py
 **Do:**
 
 - Implement repository/provider/operation consent.
+- Implement sealed preparation and a disjoint user-only approval surface.
 - Implement expiry and invalidation.
 - Implement deny-path matching.
 - Implement credential detectors without value disclosure.

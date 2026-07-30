@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,7 +24,7 @@ MAIN_COMMANDS = frozenset(
         "materialize-tasks",
         "start-task",
         "route-task",
-        "record-consent",
+        "prepare-consent",
         "record-capability",
         "create-candidate",
         "invoke",
@@ -39,9 +41,13 @@ MAIN_COMMANDS = frozenset(
         "cleanup",
     }
 )
+CONSENT_COMMANDS = frozenset({"record-consent"})
 SHIP_COMMANDS = frozenset(
     {"ship-preflight", "authorize-shipment", "cancel-shipment", "record-shipment"}
 )
+MAIN_READ_TOOLS = frozenset({"Read", "Grep", "Glob", "AskUserQuestion"})
+MAIN_FILE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
+MAIN_AGENT_TYPES = frozenset({"commitment-advisor", "independent-reviewer"})
 FORBIDDEN_SHELL_SYNTAX = (
     "&&",
     "||",
@@ -66,9 +72,151 @@ def deny(reason: str) -> int:
 def _script_suffix(mode: str) -> str:
     if mode == "main":
         return "/skills/crossforge/scripts/crossforge.py"
+    if mode == "consent":
+        return "/skills/crossforge-consent/scripts/crossforge_consent.py"
     if mode == "ship":
         return "/skills/crossforge-ship/scripts/crossforge_ship.py"
     raise ValueError("unknown boundary mode")
+
+
+def _option_value(tokens: list[str], option: str) -> str:
+    positions = [index for index, token in enumerate(tokens) if token == option]
+    if len(positions) != 1 or positions[0] + 1 >= len(tokens):
+        raise ValueError(f"{option} must appear exactly once")
+    return tokens[positions[0] + 1]
+
+
+def _consent_approval(tokens: list[str]) -> int:
+    try:
+        request_path = _option_value(tokens, "--request")
+        request_sha256 = _option_value(tokens, "--request-sha256")
+        scripts = PLUGIN_ROOT / "skills" / "crossforge" / "scripts"
+        sys.path.insert(0, str(scripts))
+        from crossforge import _load_runtime_consent_request
+        from crossforge_lib.consent import consent_request_summary
+        from types import SimpleNamespace
+
+        request, _path, _store = _load_runtime_consent_request(
+            SimpleNamespace(
+                request=request_path,
+                request_sha256=request_sha256,
+            )
+        )
+        summary = consent_request_summary(request)
+    except Exception as error:
+        return deny(f"invalid consent request: {error}")
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": (
+                        "Approve this exact Crossforge provider consent? "
+                        + json.dumps(
+                            summary,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    ),
+                }
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def _tool_input(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("malformed hook input")
+    value = payload.get("tool_input")
+    if not isinstance(value, dict):
+        raise ValueError("malformed hook input")
+    return value
+
+
+def _git_common_dir(cwd: Path) -> Path:
+    executable = shutil.which("git")
+    if executable is None:
+        raise ValueError("Git is unavailable")
+    completed = subprocess.run(
+        (
+            str(Path(executable).resolve(strict=True)),
+            "-C",
+            str(cwd),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise ValueError("repository Git common directory is unavailable")
+    return Path(completed.stdout.strip()).resolve(strict=True)
+
+
+def _same_or_within_casefold(path: Path, root: Path) -> bool:
+    path_parts = tuple(part.casefold() for part in path.parts)
+    root_parts = tuple(part.casefold() for part in root.parts)
+    return (
+        len(path_parts) >= len(root_parts)
+        and path_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _main_file_tool(payload: dict[str, object], tool_name: str) -> int:
+    try:
+        tool_input = _tool_input(payload)
+        field = "notebook_path" if tool_name == "NotebookEdit" else "file_path"
+        raw_path = tool_input.get(field)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"{tool_name} is missing {field}")
+        raw_cwd = payload.get("cwd", os.getcwd())
+        if not isinstance(raw_cwd, str) or not raw_cwd:
+            raise ValueError("hook input is missing cwd")
+        cwd = Path(raw_cwd).expanduser().resolve(strict=True)
+        path = Path(raw_path).expanduser()
+        resolved = (
+            path.resolve(strict=False)
+            if path.is_absolute()
+            else (cwd / path).resolve(strict=False)
+        )
+        if resolved.name.casefold() == "consent.json":
+            return deny("the normal skill cannot write a consent record")
+        state_root = _git_common_dir(cwd) / "crossforge"
+        if _same_or_within_casefold(resolved, state_root):
+            return deny("the normal skill cannot edit Crossforge durable state")
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return deny(str(error))
+    return 0
+
+
+def _main_non_bash(payload: dict[str, object], tool_name: str) -> int:
+    if tool_name in MAIN_READ_TOOLS:
+        return 0
+    if tool_name in MAIN_FILE_TOOLS:
+        return _main_file_tool(payload, tool_name)
+    if tool_name == "Agent":
+        try:
+            tool_input = _tool_input(payload)
+            agent_type = tool_input.get("subagent_type")
+            if not isinstance(agent_type, str) or not agent_type:
+                raise ValueError("Agent is missing subagent_type")
+            if agent_type.rsplit(":", 1)[-1] not in MAIN_AGENT_TYPES:
+                raise ValueError("Agent type is outside the read-only allowlist")
+        except ValueError as error:
+            return deny(str(error))
+        return 0
+    return deny(f"{tool_name} is outside the deterministic control surface")
 
 
 def main(argv: list[str]) -> int:
@@ -77,8 +225,21 @@ def main(argv: list[str]) -> int:
     mode = argv[1]
     try:
         payload = json.load(sys.stdin)
-        command = payload["tool_input"]["command"]
+        tool_name = payload["tool_name"]
+        permission_mode = payload["permission_mode"]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return deny("malformed hook input")
+    if not isinstance(tool_name, str) or not tool_name:
+        return deny("missing tool name")
+    if not isinstance(permission_mode, str) or not permission_mode:
+        return deny("missing permission mode")
+    if mode == "main" and tool_name != "Bash":
+        return _main_non_bash(payload, tool_name)
+    if mode == "consent" and tool_name != "Bash":
+        return deny("only the canonical consent launcher is allowed")
+    try:
+        command = _tool_input(payload)["command"]
+    except (KeyError, TypeError, ValueError):
         return deny("malformed hook input")
     if not isinstance(command, str) or not command.strip():
         return deny("missing command")
@@ -105,9 +266,20 @@ def main(argv: list[str]) -> int:
     if script != expected or not script.is_file():
         return deny("wrong Crossforge control surface")
     command_name = next((item for item in tokens[2:] if not item.startswith("-")), None)
-    allowed = MAIN_COMMANDS if mode == "main" else SHIP_COMMANDS
+    if mode == "main":
+        allowed = MAIN_COMMANDS
+    elif mode == "consent":
+        allowed = CONSENT_COMMANDS
+    else:
+        allowed = SHIP_COMMANDS
     if command_name not in allowed:
         return deny("command is outside the active skill authority")
+    if mode == "consent":
+        if permission_mode == "bypassPermissions":
+            return deny(
+                "provider consent cannot be recorded in bypassPermissions mode"
+            )
+        return _consent_approval(tokens)
     return 0
 
 

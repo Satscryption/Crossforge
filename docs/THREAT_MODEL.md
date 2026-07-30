@@ -92,9 +92,20 @@ files, binary artifacts, or unrelated source to a provider.
 
 - Provider availability is never consent.
 - Consent binds repository identity, provider, operation class, expiry,
-  deny-policy hash, and managed-policy hash.
+  deny-policy hash, managed-policy hash, canonical provider executable, and
+  source-manifest hash and counts.
+- The normal model-invoked skill can only prepare a 15-minute, exact-byte-hash
+  consent request. Its fail-closed hook permits only known tools, blocks writes
+  to durable Crossforge state or any `consent.json`, and allows only the two
+  bundled read-only agent types.
+- Only a directly user-invoked, non-model-invocable consent skill can record
+  the request. It permits only the canonical consent transaction; its host
+  hook recomputes live bindings and forces a user permission prompt containing
+  `consent_summary()` output.
 - Every provider-readable regular file and symlink is manifested with path,
   type, size, and SHA-256.
+- Source-bearing consent is rechecked against the candidate manifest while
+  holding its writer lock, before any provider source access.
 - Denied tracked files are quarantined; denied untracked files are omitted.
 - Binary files require exact path/hash approval.
 - Readable text is secret-scanned; findings expose metadata, never values.
@@ -103,7 +114,9 @@ files, binary artifacts, or unrelated source to a provider.
 
 **Residual risk:** Pattern and entropy detectors cannot recognize every secret
 or sensitivity category. Consent presents file count and byte volume, and the
-user remains responsible for repository classification.
+user remains responsible for repository classification. An agent run outside
+the installed Crossforge skill hooks shares the user's operating-system
+identity and is outside this plugin-enforced approval boundary.
 
 ### Git-history disclosure
 
@@ -256,8 +269,9 @@ duplicate PRs, hooks execute unsandboxed, or a changed target receives code.
 - The normal skill has no publication path.
 - Shipping requires a completed run and a current explicit user request.
 - Dry-run records no authorization and performs no writes.
-- The normal and shipping skills expose disjoint CLIs; scoped host hooks block
-  cross-surface and direct publication commands during supported execution.
+- The normal, consent, and shipping skills expose disjoint CLIs; scoped host
+  hooks block cross-surface and direct publication commands during supported
+  execution.
 - Authorization expires after 24 hours and binds repository identity, run,
   remote name and effective URL, head, target, final commit, preflight evidence,
   and an idempotency key.

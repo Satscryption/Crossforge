@@ -488,23 +488,30 @@ def load_config(
     user_path: str | os.PathLike[str] | None = None,
     project_path: str | os.PathLike[str] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
+    discover_defaults: bool = True,
 ) -> CrossforgeConfig:
     """Load defaults, user config, project config, then CLI overrides."""
 
     merged: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+    if user_path is not None:
+        user_source: Path | None = Path(user_path)
+    elif discover_defaults:
+        user_source = Path.home() / ".claude/crossforge.json"
+    else:
+        user_source = None
+    if project_path is not None:
+        project_source: Path | None = Path(project_path)
+    elif discover_defaults:
+        project_source = Path.cwd() / ".claude/crossforge.json"
+    else:
+        project_source = None
     sources = (
-        (
-            Path(user_path) if user_path is not None else Path.home() / ".claude/crossforge.json",
-            user_path is not None,
-        ),
-        (
-            Path(project_path)
-            if project_path is not None
-            else Path.cwd() / ".claude/crossforge.json",
-            project_path is not None,
-        ),
+        (user_source, user_path is not None),
+        (project_source, project_path is not None),
     )
     for path, explicit in sources:
+        if path is None:
+            continue
         if path.exists():
             merged = merge_config(merged, load_config_file(path))
         elif explicit:

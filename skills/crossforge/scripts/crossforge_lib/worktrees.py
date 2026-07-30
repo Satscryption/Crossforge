@@ -148,6 +148,7 @@ class ProviderContext:
     """Prepared provider-visible context yielded by :meth:`expose_to_provider`."""
 
     entry: WorktreeEntry
+    source_manifest: Mapping[str, Any]
     context_manifest: Mapping[str, Any]
     quarantine_manifest: Mapping[str, Any]
     projection: ProjectionState
@@ -471,7 +472,13 @@ class WorktreeManager:
                 manifest_paths=manifest_paths,
                 runtime_metadata=runtime_metadata,
             )
-            yield ProviderContext(entry, context_manifest, quarantine_manifest, projection)
+            yield ProviderContext(
+                entry,
+                initial_manifest,
+                context_manifest,
+                quarantine_manifest,
+                projection,
+            )
         finally:
             restoration_error: BaseException | None = None
             if projection is not None:

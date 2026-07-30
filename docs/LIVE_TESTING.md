@@ -11,7 +11,8 @@ CROSSFORGE_LIVE_TESTS=1
 ```
 
 Setting the variable is necessary but not sufficient authorization. Provider
-consent and any publication request remain separate explicit user actions.
+consent through `/crossforge:crossforge-consent` and any publication request
+through `/crossforge:crossforge-ship` remain separate explicit user actions.
 Never set this variable in ordinary CI.
 
 ## Before testing
@@ -129,6 +130,8 @@ has a distinct writer lock and evidence directory.
 Using disposable data only, confirm:
 
 - missing consent blocks a remote probe;
+- the normal skill can prepare but cannot record consent;
+- a declined, expired, moved, or byte-mutated consent request writes nothing;
 - expired or policy-mismatched consent blocks source transmission;
 - an out-of-scope edit makes the candidate ineligible;
 - a failed test blocks acceptance;

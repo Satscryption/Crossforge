@@ -12,6 +12,11 @@ establish correctness.
 User
   -> Claude architect
       -> deterministic Crossforge control layer
+          -> sealed provider-consent request
+  -> crossforge-consent
+      -> explicit user approval
+  -> Claude architect
+      -> deterministic Crossforge control layer
           -> Codex candidate worktree
           -> Grok candidate worktree
           -> scope/gates/evidence
@@ -21,12 +26,16 @@ User
       -> push/PR
 ```
 
-The normal skill and user-invoked shipping skill use disjoint CLI surfaces.
-Skill-scoped host hooks allow each skill to call only its own deterministic
-entry point. The normal skill may create local branches and commits but cannot
-reach the supported publication surface. The shipping skill requires current
-publication intent, an unexpired authorization, a completed build, a fresh
-final gate, a URL-bound remote, and remote readback.
+The normal, user-invoked consent, and user-invoked shipping skills use
+disjoint CLI surfaces. Skill-scoped host hooks allow each skill to call only
+its own deterministic entry point. The normal skill may prepare consent
+requests and create local branches and commits, but cannot record consent or
+reach the supported publication surface. The consent skill is not
+model-invocable, allows only its canonical Bash transaction, and forces an
+exact disclosure prompt. Normal-skill file-mutation and subagent tools are
+blocked so durable consent cannot be hand-written around the CLI. The shipping
+skill requires current publication intent, an unexpired authorization, a
+completed build, a fresh final gate, a URL-bound remote, and remote readback.
 
 ## Judgment and enforcement
 
@@ -57,7 +66,7 @@ library.
 | `config.py`, `models.py`, `plan.py` | Strict configuration and canonical plan models, validation, rendering, approval hashes, and task materialization |
 | `git.py`, `scope.py` | Repository discovery and identity, dedicated branches, exact changed-path calculation, mode/symlink checks, and filter-free staging |
 | `state.py`, `locking.py` | Owner-private repository-common state, valid transitions, atomic pointers, and repository/run/writer locks |
-| `consent.py`, `secrets.py` | Expiring policy-bound provider consent, deny-path quarantine, complete readable-context manifests, binary controls, and secret screening |
+| `consent.py`, `secrets.py` | Byte-bound short-lived consent requests, expiring policy-bound provider consent, deny-path quarantine, complete readable-context manifests, binary controls, and secret screening |
 | `preflight.py`, `providers/` | Runtime discovery, version and authentication checks, capability evidence, safe Codex/Grok argv, bounded process execution, and sanitized errors |
 | `worktrees.py` | Recorded detached worktrees, sanitized one-commit Git projections, patch capture, restoration, and proof-driven cleanup |
 | `gates.py`, `evidence.py`, `reports.py` | Gate-command policy, executable identity, sandbox construction/probes, owner-only evidence, provider report validation, and independent eligibility |
@@ -126,7 +135,15 @@ source-free readiness prompt requires `probe` consent. Source-bearing
 operations require consent for their exact provider and operation class.
 
 Consent is also bound to expiry, the deny-policy hash, the discovered
-managed-policy hash, and the exact provider executable path and content hash.
+managed-policy hash, the exact provider executable path and content hash, and
+for source-bearing operations the canonical context-manifest hash and counts.
+The normal skill derives those facts and a context-manifest summary into an
+owner-private request whose exact bytes are valid for at most 15 minutes. It
+cannot approve the request. The separate `crossforge-consent` skill requires
+direct user invocation, revalidates every live binding and the request hash,
+and returns `permissionDecision: ask` from its `PreToolUse` hook with the exact
+non-sensitive disclosure. Only the consent CLI can then write `consent.json`.
+Invocation rechecks the manifest after acquiring the candidate writer lock.
 Provider capability evidence must prove denial of network, outside-worktree
 access, common Git state, orchestration checkout, and credential directories.
 Failed or inconclusive proof marks the provider unavailable.
@@ -226,9 +243,10 @@ directory, and hash-bound in `run.json.providers`. An arbitrary path supplied
 only by the invocation request is rejected. `record-capability` is the sole
 producer and binding transaction: it resolves the installed provider from
 `PATH`, requires it to match the identity explicitly pinned by
-`record-consent`, rejects executable locations beneath repository, state, or
-temporary roots, creates nonce-bound protected sentinels, and requires
-repository-bound `probe` consent. Codex launches Crossforge's fixed helper
+the user-only `record-consent` surface, rejects executable locations beneath
+repository, state, or temporary roots, creates nonce-bound protected
+sentinels, and requires repository-bound `probe` consent. Codex launches
+Crossforge's fixed helper
 directly through the CLI's stable sandbox command. Grok exposes only its
 command tool and must produce a parent-private control-host hook receipt for
 the exact sealed helper command. The trusted parent re-hashes the helper,
