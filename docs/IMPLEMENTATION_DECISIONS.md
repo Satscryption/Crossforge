@@ -292,7 +292,10 @@ and state contracts, not only the original product intent. Crossforge 0.1.0
 has three user-facing skills; the normal, consent, and shipping CLIs are
 disjoint. Provider capability production is active-build-run-bound. Plan mode
 and standalone review are local Claude workflows, while Codex/Grok
-transactions are limited to active build tasks.
+transactions are limited to active build tasks. The consent schema's `plan`
+operation and routing decision's `planCritiqueLanes` field are retained for
+forward compatibility, but no 0.1.0 workflow prepares or invokes `plan`, and
+the routing field is always empty.
 
 The build specification keeps future-facing design context only where it is
 explicitly marked as deferred. Its repository tree, config schema, skill

@@ -46,6 +46,10 @@ Crossforge now uses four assurance labels consistently:
 
 - Crossforge 0.1.0 invokes Codex and Grok only for active build tasks.
   Plan-mode critique and standalone review are local Claude workflows.
+- The consent schema retains `plan` and routing retains
+  `planCritiqueLanes` for forward compatibility. No 0.1.0 workflow prepares
+  or invokes a `plan` transaction, and every routing decision leaves the lane
+  list empty. External `review` consent applies only to active build tasks.
 - Provider consent is user-confirmed. Plan semantics and `planApproval`,
   publication/destination flags, recovery decisions, and micro-fix semantic
   inputs remain caller/model-attested.

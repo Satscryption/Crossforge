@@ -27,6 +27,11 @@ expiry, file count, and total bytes—never findings, contents, tokens, or
 credential values. The normal model-invocable skill cannot call the approval
 surface.
 
+The consent schema recognizes `plan` for forward compatibility, but release
+0.1.0 never prepares or invokes that operation. External `review` consent is
+used only for a review lane attached to an active build task; standalone
+review remains a local Claude workflow.
+
 ## Context preparation
 
 - Match deny globs with Crossforge's fixed case-insensitive semantics. Move

@@ -151,6 +151,9 @@ The repository identity is the SHA-256 of the canonical repository root and a
 normalized, credential-free origin URL (or `<no-origin>`). A fixed,
 source-free readiness prompt requires `probe` consent. Source-bearing
 operations require consent for their exact provider and operation class.
+The schema-reserved `plan` operation is not prepared or invoked in 0.1.0.
+External `review` operations belong only to active build tasks; standalone
+review is local.
 
 Consent is also bound to expiry, the deny-policy hash, the discovered
 managed-policy hash, the exact provider executable path and content hash, and

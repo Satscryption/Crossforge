@@ -157,7 +157,9 @@ Read only the references required for the selected mode:
   [worktree protocol](references/worktree-protocol.md), and
   [candidate selection](references/candidate-selection.md);
 - review:
-  provider privacy, routing policy, and worktree protocol;
+  provider privacy for context classification and quarantine rules, routing
+  policy for authorship labels, and worktree protocol for local isolation;
+  loading these references does not authorize or imply provider contact;
 - resume:
   [recovery](references/recovery.md), run state, and worktree protocol;
 - status:
@@ -270,9 +272,10 @@ For each task:
    recorded permission. `invoke` rejects any lane or operation differing from
    this decision. Stay within the selected budget's total provider-call limit.
 4. For high-risk tasks, use the read-only commitment advisor before execution.
-   Use external critiques/reviewers according to routing policy. Claude
-   subagents never supervise Codex or Grok lanes and never receive Bash for
-   lane execution.
+   Perform plan critique locally. The compatibility `planCritiqueLanes` field
+   remains empty in 0.1.0; use only external build-task review lanes recorded
+   by `route-task`. Claude subagents never supervise Codex or Grok lanes and
+   never receive Bash for lane execution.
 5. Call `create-candidate` for each selected lane. Race lanes may run
    concurrently only for the same task and in separate recorded worktrees.
 6. Prepare full provider-readable context with `scan-context`, obtain valid

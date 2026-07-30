@@ -486,6 +486,6 @@ no network request:
 python3 -m unittest discover -s tests -v
 ```
 
-Release confidence additionally requires opt-in live sandbox/provider
-capability tests described in [LIVE_TESTING.md](LIVE_TESTING.md). Do not treat
-provider self-reporting as proof that a boundary holds.
+Release confidence additionally requires the manual live sandbox/provider
+capability procedure described in [LIVE_TESTING.md](LIVE_TESTING.md). Do not
+treat provider self-reporting as proof that a boundary holds.

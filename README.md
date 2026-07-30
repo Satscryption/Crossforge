@@ -201,13 +201,16 @@ Budgets are call/quality profiles, not spending guarantees:
 | --- | --- | ---: |
 | `lean` | One lane; review high-risk work only | 4 |
 | `balanced` | Review medium/high risk; race only eligible high-risk work | 6 |
-| `quality` | Independent critiques; race eligible medium/high-risk work | 8 |
+| `quality` | Local high-risk plan critique; independent build-task review; race eligible medium/high-risk work | 8 |
 
 ## Provider consent and source transmission
 
 Provider installation or authentication is not consent. Crossforge requests
 repository-bound, provider-specific, expiring approval for operation classes:
-`probe`, `plan`, `review`, and `implement`.
+`probe`, `plan`, `review`, and `implement`. The `plan` value is reserved for a
+future transaction type: no 0.1.0 workflow requests or executes it.
+`review` applies only to an external review lane for an active build task;
+standalone review mode remains local.
 
 A remote readiness call needs `probe` consent and uses a fixed source-free
 prompt. A source-bearing call additionally shows the provider, operation

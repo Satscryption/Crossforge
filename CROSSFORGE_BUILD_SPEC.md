@@ -1402,6 +1402,7 @@ Otherwise return a clear blocker. Do not silently change the strategy.
 - Consult the commitment advisor.
 - Obtain a local read-only Claude plan critique. Release 0.1.0 does not call
   Codex or Grok for plan-mode critique.
+- Keep the serialized `planCritiqueLanes` compatibility field empty.
 - Use a race only when both candidates can be objectively compared.
 - Otherwise use one implementation lane and two independent reviews.
 
@@ -1973,7 +1974,6 @@ and explicit-port examples.
       "approved": true,
       "operationClasses": [
         "probe",
-        "plan",
         "review",
         "implement"
       ],
@@ -1991,7 +1991,6 @@ and explicit-port examples.
       "approved": true,
       "operationClasses": [
         "probe",
-        "plan",
         "review"
       ],
       "denyPolicySha256": "hex",
@@ -2007,6 +2006,11 @@ and explicit-port examples.
   }
 }
 ```
+
+The schema recognizes `plan` as a reserved operation class for forward
+compatibility, but the 0.1.0 skill never prepares or invokes it. `review` in
+this schema means an external review lane attached to an active build task;
+standalone review mode is local.
 
 The normal Python control layer reports missing consent and exposes
 `prepare-consent`, not `record-consent`. Preparation derives the live

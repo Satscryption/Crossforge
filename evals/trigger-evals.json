@@ -21,9 +21,9 @@
     },
     {
       "id": "TR4",
-      "prompt": "Use Crossforge review mode for an independent Codex and Grok review of the current branch, with no edits.",
+      "prompt": "Use Crossforge review mode for an evidence-backed local review of the current branch, with no edits.",
       "shouldTrigger": true,
-      "reason": "The request explicitly asks for Crossforge cross-vendor repository review."
+      "reason": "The request explicitly asks for Crossforge's local read-only review mode."
     },
     {
       "id": "TR5",
@@ -45,9 +45,9 @@
     },
     {
       "id": "TR8",
-      "prompt": "Plan a high-risk database migration with Claude, obtain independent critiques from Codex and Grok, then implement the approved tasks.",
+      "prompt": "Plan a high-risk database migration with Crossforge, use the local Claude commitment advisor and plan critique, then race Codex and Grok on objectively testable build tasks.",
       "shouldTrigger": true,
-      "reason": "The request combines high-risk planning, independent model critiques, and implementation."
+      "reason": "The request combines Crossforge's local high-risk planning controls with external implementation lanes."
     },
     {
       "id": "TR9",
@@ -107,7 +107,7 @@
       "id": "TR18",
       "prompt": "Review my pull request for correctness and leave the code unchanged.",
       "shouldTrigger": false,
-      "reason": "This asks for a normal single-model code review and does not request independent cross-vendor review."
+      "reason": "This asks for an ordinary code review without naming Crossforge or requesting multi-provider build orchestration."
     },
     {
       "id": "TR19",

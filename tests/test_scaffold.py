@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import tomllib
 import unittest
 from pathlib import Path
@@ -170,7 +172,7 @@ class ScaffoldTests(unittest.TestCase):
         ):
             self.assertNotIn(overclaim, combined)
 
-    def test_security_review_closeout_matches_implemented_surfaces(self) -> None:
+    def test_security_review_closeout_links_and_release_contracts(self) -> None:
         closeout = (PROJECT_ROOT / "docs/SECURITY_REVIEW_CLOSEOUT.md").read_text(
             encoding="utf-8"
         )
@@ -242,6 +244,51 @@ class ScaffoldTests(unittest.TestCase):
             "cross-vendor planning, isolated coding",
         ):
             self.assertNotIn(stale_claim, release_contract)
+
+    def test_documented_command_boundaries_match_runtime(self) -> None:
+        main_script = (
+            PROJECT_ROOT / "skills/crossforge/scripts/crossforge.py"
+        )
+        shipping_script = (
+            PROJECT_ROOT
+            / "skills/crossforge-ship/scripts/crossforge_ship.py"
+        )
+        main_help = subprocess.run(
+            [sys.executable, str(main_script), "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        shipping_help = subprocess.run(
+            [sys.executable, str(shipping_script), "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        for shipping_command in (
+            "ship-preflight",
+            "authorize-shipment",
+            "cancel-shipment",
+            "record-shipment",
+        ):
+            with self.subTest(command=shipping_command):
+                self.assertNotIn(shipping_command, main_help)
+                self.assertIn(shipping_command, shipping_help)
+
+        control_source = main_script.read_text(encoding="utf-8")
+        self.assertIn(
+            'raise PreconditionError("capability probe requires an active run")',
+            control_source,
+        )
+        runtime_source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for root in (
+                PROJECT_ROOT / "skills",
+                PROJECT_ROOT / "hooks",
+            )
+            for path in root.rglob("*.py")
+        )
+        self.assertNotIn("CROSSFORGE_LIVE_TESTS", runtime_source)
 
     def test_local_markdown_links_resolve(self) -> None:
         link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
