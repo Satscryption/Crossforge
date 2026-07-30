@@ -41,7 +41,12 @@ from crossforge_lib.reports import load_provider_report  # noqa: E402
 from crossforge_lib.secrets import DETECTOR_NAMES  # noqa: E402
 from crossforge_lib.shipping import RemoteReadback  # noqa: E402
 from crossforge_lib.state import StateStore, generate_run_id  # noqa: E402
-from crossforge_lib.util import atomic_write_bytes, atomic_write_json, sha256_file  # noqa: E402
+from crossforge_lib.util import (  # noqa: E402
+    atomic_write_bytes,
+    atomic_write_json,
+    sha256_file,
+    utc_now,
+)
 from crossforge_lib.worktrees import WorktreeManager  # noqa: E402
 
 
@@ -393,7 +398,10 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             "schemaVersion": 1,
             "provider": "codex",
             "sourceFree": True,
-            "recordedAt": "2026-07-24T12:00:00Z",
+            # Capability evidence must fall inside the control layer's freshness
+            # window (crossforge.py: [-5min, +24h]); a fixed stamp made this test
+            # a time bomb that failed 24h after it was written. Stamp it at now.
+            "recordedAt": utc_now(),
             "executablePath": str(executable),
             "executableSha256": sha256_file(executable),
             "sandboxPolicySha256": "a" * 64,
