@@ -416,6 +416,263 @@ class ShippingTests(unittest.TestCase):
         self.assertEqual(completed["status"], "recorded")
         self.assertEqual(self.store.mark_calls, 1)
 
+    def test_push_only_retry_rejects_remote_confirmed_pr_bindings(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        prepared = reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="Crossforge run",
+            body="Evidence",
+            draft=True,
+            forge_identity=self.forge_identity,
+            runner=self.remote.runner,
+        )
+        expected_bindings = (
+            prepared["forgeExecutable"],
+            prepared["bodySha256"],
+            prepared["publicationPayloadSha256"],
+        )
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "PR publication bindings"
+        ):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=True,
+                runner=self.remote.runner,
+            )
+        persisted = json.loads(
+            (self.store.run_dir(RUN_ID) / "shipment.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            expected_bindings,
+            (
+                persisted["forgeExecutable"],
+                persisted["bodySha256"],
+                persisted["publicationPayloadSha256"],
+            ),
+        )
+
+    def test_push_only_retry_rejects_pr_bindings_after_failed_push(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+
+        def fail_push(
+            argv: Sequence[str], *, cwd: Path, input_text: str | None = None
+        ) -> CommandResult:
+            values = tuple(argv)
+            if "push" in values:
+                return CommandResult(values, 1, "", "rejected")
+            return self.remote.runner(values, cwd=cwd, input_text=input_text)
+
+        with self.assertRaisesRegex(PreconditionError, "authorized push failed"):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=False,
+                title="Crossforge run",
+                body="Evidence",
+                draft=False,
+                forge_identity=self.forge_identity,
+                runner=fail_push,
+            )
+        persisted = json.loads(
+            (self.store.run_dir(RUN_ID) / "shipment.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIsNotNone(persisted["forgeExecutable"])
+        self.assertIsNotNone(persisted["bodySha256"])
+        self.assertIsNotNone(persisted["publicationPayloadSha256"])
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "PR publication bindings"
+        ):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=True,
+                runner=self.remote.runner,
+            )
+
+    def test_record_push_only_rejects_prepared_pr_bindings(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=False,
+            title="Crossforge run",
+            body="Evidence",
+            draft=False,
+            forge_identity=self.forge_identity,
+            runner=self.remote.runner,
+        )
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "PR publication bindings"
+        ):
+            record_shipment(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                push_only=True,
+                publication_requested=True,
+                runner=self.remote.runner,
+            )
+        self.assertEqual(self.store.mark_calls, 0)
+
+    def test_first_shot_push_only_shipment_still_completes(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        pushed = reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=True,
+            runner=self.remote.runner,
+        )
+        completed = record_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            push_only=True,
+            publication_requested=True,
+            runner=self.remote.runner,
+        )
+        self.assertIsNone(pushed["forgeExecutable"])
+        self.assertIsNone(pushed["bodySha256"])
+        self.assertIsNone(pushed["publicationPayloadSha256"])
+        self.assertEqual(completed["status"], "push_only_recorded")
+        self.assertEqual(self.store.mark_calls, 1)
+
+    def test_terminal_push_only_shipment_cannot_acquire_pr_bindings(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=True,
+            runner=self.remote.runner,
+        )
+        record_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            push_only=True,
+            publication_requested=True,
+            runner=self.remote.runner,
+        )
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "terminal push-only shipment"
+        ):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=False,
+                title="Crossforge run",
+                body="Evidence",
+                draft=False,
+                forge_identity=self.forge_identity,
+                runner=self.remote.runner,
+            )
+        persisted = json.loads(
+            (self.store.run_dir(RUN_ID) / "shipment.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIsNone(persisted["forgeExecutable"])
+        self.assertIsNone(persisted["bodySha256"])
+        self.assertIsNone(persisted["publicationPayloadSha256"])
+
+    def test_incomplete_pr_publication_bindings_fail_closed(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        shipment_path = self.store.run_dir(RUN_ID) / "shipment.json"
+        shipment = json.loads(shipment_path.read_text(encoding="utf-8"))
+        shipment["bodySha256"] = "a" * 64
+        shipment_path.write_text(json.dumps(shipment), encoding="utf-8")
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "PR publication bindings are incomplete"
+        ):
+            reconcile_push(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                publication_requested=True,
+                final_gate=self._gate_evidence,
+                push_only=True,
+                runner=self.remote.runner,
+            )
+        self.assertEqual(self.remote.push_calls, 0)
+
     def test_existing_remote_and_pr_are_discovered(self) -> None:
         self.remote.head = self.commit
         authorize_shipment(

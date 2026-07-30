@@ -41,6 +41,11 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _KEY = re.compile(r"^[0-9a-f]{32}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
 _AUTHORIZATION_TTL = timedelta(hours=24)
+_PR_PUBLICATION_BINDING_FIELDS = (
+    "forgeExecutable",
+    "bodySha256",
+    "publicationPayloadSha256",
+)
 _SHIPMENT_FIELDS = {
     "schemaVersion",
     "repositoryIdentity",
@@ -514,6 +519,17 @@ def _shipment_path(store: StateStore, run_id: str) -> Path:
     return store.run_dir(run_id) / "shipment.json"
 
 
+def _has_pr_publication_bindings(shipment: Mapping[str, Any]) -> bool:
+    present = tuple(
+        shipment[field] is not None for field in _PR_PUBLICATION_BINDING_FIELDS
+    )
+    if any(present) and not all(present):
+        raise StateInconsistencyError(
+            "shipment PR publication bindings are incomplete"
+        )
+    return all(present)
+
+
 def _load_shipment(store: StateStore, run_id: str) -> dict[str, Any] | None:
     path = _shipment_path(store, run_id)
     if not path.exists():
@@ -570,6 +586,7 @@ def validate_shipment(value: object) -> dict[str, Any]:
         r"[0-9a-f]{64}", str(value["publicationPayloadSha256"])
     ):
         raise StateInconsistencyError("shipment publicationPayloadSha256 is invalid")
+    has_pr_bindings = _has_pr_publication_bindings(value)
     if value["status"] not in {
         "authorized",
         "remote_confirmed",
@@ -584,6 +601,16 @@ def validate_shipment(value: object) -> dict[str, Any]:
         value["pullRequest"], dict
     ):
         raise StateInconsistencyError("shipment checkpoint is missing PR readback")
+    if value["status"] in {"pr_confirmed", "recorded"} and not has_pr_bindings:
+        raise StateInconsistencyError(
+            "shipment checkpoint is missing PR publication bindings"
+        )
+    if value["status"] == "push_only_recorded" and (
+        has_pr_bindings or value["pullRequest"] is not None
+    ):
+        raise StateInconsistencyError(
+            "push-only shipment contains PR publication state"
+        )
     if value["status"] in {"recorded", "push_only_recorded"}:
         if not isinstance(value["completedAt"], str) or not value["completedAt"]:
             raise StateInconsistencyError("recorded shipment is missing completedAt")
@@ -827,6 +854,10 @@ def reconcile_push(
     pinned_forge: dict[str, Any] | None = None
     body_sha256: str | None = None
     if push_only:
+        if _has_pr_publication_bindings(shipment):
+            raise StateInconsistencyError(
+                "cannot convert shipment with PR publication bindings to push-only"
+            )
         if (
             title is not None
             or body is not None
@@ -835,6 +866,10 @@ def reconcile_push(
         ):
             raise InvalidInputError("push-only shipment cannot bind pull-request inputs")
     else:
+        if shipment["status"] == "push_only_recorded":
+            raise StateInconsistencyError(
+                "cannot convert terminal push-only shipment to PR publication"
+            )
         if title is None or body is None or draft is None or forge_identity is None:
             raise PreconditionError(
                 "pull-request inputs must be validated before the shipment push"
@@ -921,8 +956,9 @@ def reconcile_push(
         "observedCommit": shipment["finalCommit"],
         "recordedAt": utc_now(),
     }
-    checkpoint["forgeExecutable"] = pinned_forge
-    checkpoint["bodySha256"] = body_sha256
+    if not push_only:
+        checkpoint["forgeExecutable"] = pinned_forge
+        checkpoint["bodySha256"] = body_sha256
     return _write_shipment(store, checkpoint)
 
 
@@ -1216,8 +1252,10 @@ def record_shipment(
             for item in matches
         ):
             raise StateInconsistencyError("pull-request readback no longer matches")
-    elif shipment["pullRequest"] is not None:
-        raise StateInconsistencyError("cannot convert a PR shipment to push-only")
+    elif shipment["pullRequest"] is not None or _has_pr_publication_bindings(shipment):
+        raise StateInconsistencyError(
+            "cannot convert shipment with PR publication bindings to push-only"
+        )
     completed = dict(shipment)
     completed["status"] = "push_only_recorded" if push_only else "recorded"
     completed["completedAt"] = completed["completedAt"] or utc_now()
