@@ -301,6 +301,18 @@ def _repository(args: argparse.Namespace) -> GitRepository:
     return discover_repository(getattr(args, "repository", "."))
 
 
+def _state_store_for_repository(
+    git_common_dir: str | os.PathLike[str],
+    repository: GitRepository,
+) -> StateStore:
+    store = StateStore(Path(git_common_dir).expanduser().resolve())
+    if store.git_common_dir != repository.common_git_dir:
+        raise StateInconsistencyError(
+            "gitCommonDir does not match the discovered repository"
+        )
+    return store
+
+
 def _trusted_credential_directories() -> tuple[Path, ...]:
     candidates = (
         Path.home() / ".codex",
@@ -314,9 +326,11 @@ def _trusted_credential_directories() -> tuple[Path, ...]:
 
 def _store(args: argparse.Namespace, repository: GitRepository | None = None) -> StateStore:
     explicit = getattr(args, "git_common_dir", None)
-    if explicit:
-        return StateStore(Path(explicit).expanduser().resolve())
-    return StateStore((repository or _repository(args)).common_git_dir)
+    resolved_repository = repository or _repository(args)
+    return _state_store_for_repository(
+        explicit or resolved_repository.common_git_dir,
+        resolved_repository,
+    )
 
 
 def _capability_record(
@@ -1454,6 +1468,7 @@ def _cmd_init_run(args: argparse.Namespace) -> CommandOutput:
             "Run approval is not bound to the supplied canonical plan"
         )
     repository = discover_repository(args.repository)
+    store = _store(args, repository)
     if Path(str(run.get("repositoryRoot", ""))).resolve() != repository.root:
         raise StateInconsistencyError("Run repositoryRoot does not match discovered repository")
     if Path(str(run.get("gitCommonDir", ""))).resolve() != repository.common_git_dir:
@@ -1493,7 +1508,6 @@ def _cmd_init_run(args: argparse.Namespace) -> CommandOutput:
             timestamp=str(run.get("createdAt") or utc_now()),
         )
     )
-    store = _store(args)
     directory = store.initialize_run(
         run,
         plan=raw_plan,
@@ -1579,7 +1593,8 @@ def _cmd_materialize_tasks(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_start_task(args: argparse.Namespace) -> CommandOutput:
-    store = _store(args)
+    repository = _repository(args)
+    store = _store(args, repository)
     task, run = store.start_task(
         args.run_id,
         args.task_id,
@@ -1661,7 +1676,8 @@ def _cmd_route_task(args: argparse.Namespace) -> CommandOutput:
             raise InvalidInputError(
                 "durable routing requires gitCommonDir, runId, and taskId"
             )
-        task = StateStore(Path(args.git_common_dir).resolve()).record_task_routing(
+        repository = _repository(args)
+        task = _store(args, repository).record_task_routing(
             args.run_id,
             args.task_id,
             data,
@@ -4128,7 +4144,11 @@ def _cmd_check_micro_fix(args: argparse.Namespace) -> CommandOutput:
 
 def _cmd_finish_task(args: argparse.Namespace) -> CommandOutput:
     value = _read_json_object(args.request, label="finish-task request")
-    store = StateStore(Path(_request_value(value, "gitCommonDir", str)).resolve())
+    repository = _repository(args)
+    store = _state_store_for_repository(
+        _request_value(value, "gitCommonDir", str),
+        repository,
+    )
     run_id = _request_value(value, "runId", str)
     task_id = _request_value(value, "taskId", str)
     unknown = set(value) - {
@@ -4173,7 +4193,8 @@ def _cmd_finish_task(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_complete_run(args: argparse.Namespace) -> CommandOutput:
-    store = _store(args)
+    repository = _repository(args)
+    store = _store(args, repository)
     tasks = store.load_tasks(args.run_id)["tasks"]
     incomplete = [task["id"] for task in tasks if task["status"] != "complete"]
     if incomplete:
@@ -4186,7 +4207,8 @@ def _cmd_complete_run(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_abandon_run(args: argparse.Namespace) -> CommandOutput:
-    run = _store(args).abandon_run(args.run_id, reason=args.reason)
+    repository = _repository(args)
+    run = _store(args, repository).abandon_run(args.run_id, reason=args.reason)
     return CommandOutput(f"Abandoned run {args.run_id}", run)
 
 
@@ -4461,7 +4483,7 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--output")
 
     item = command("start-task", "transition one durable task to in-progress")
-    _add_state(item)
+    _add_state(item, repository=True)
     item.add_argument("--run-id", required=True)
     item.add_argument("--task-id", required=True)
     item.add_argument("--base-commit")
@@ -4483,7 +4505,7 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--statistics")
     item.add_argument("--gate-fingerprint")
     item.add_argument("--repository-identity")
-    item.add_argument("--git-common-dir")
+    _add_state(item, repository=True)
     item.add_argument("--run-id")
     item.add_argument("--task-id")
 
@@ -4580,7 +4602,6 @@ def build_parser() -> argparse.ArgumentParser:
         ("record-selection", "record a candidate selection"),
         ("accept-candidate", "verify and accept a candidate"),
         ("check-micro-fix", "validate guarded micro-fix eligibility"),
-        ("finish-task", "finish and durably record one task"),
     ):
         item = command(name, help_text)
         item.add_argument(
@@ -4589,12 +4610,20 @@ def build_parser() -> argparse.ArgumentParser:
             help="JSON object matching the installed acceptance API",
         )
 
+    item = command("finish-task", "finish and durably record one task")
+    _add_repository(item)
+    item.add_argument(
+        "--request",
+        required=True,
+        help="JSON object matching the installed acceptance API",
+    )
+
     item = command("complete-run", "transition a build run to complete")
-    _add_state(item)
+    _add_state(item, repository=True)
     item.add_argument("--run-id", required=True)
 
     item = command("abandon-run", "abandon an unfinished build without deleting user work")
-    _add_state(item)
+    _add_state(item, repository=True)
     item.add_argument("--run-id", required=True)
     item.add_argument("--reason")
 

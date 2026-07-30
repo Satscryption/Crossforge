@@ -53,6 +53,11 @@ Use `init-run`, `start-task`, `record-selection`, `accept-candidate`,
 canonical JSON or pointers by hand. Transition commands are idempotent only
 when the complete existing target record matches.
 
+Every state command is repository-bound. Supply the orchestration repository
+alongside an explicit Git common directory, and stop if the control layer says
+they do not resolve to the same repository. Never retry with a different
+repository merely to make a state path pass validation.
+
 ## Locks and consistency
 
 Acquire locks only in this order:

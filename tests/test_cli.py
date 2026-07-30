@@ -357,6 +357,17 @@ class CLITestCase(unittest.TestCase):
         self.common = self.discovered.common_git_dir
         self.commit = resolve_commit(self.discovered, "HEAD")
 
+    def create_repository(self, name: str) -> tuple[Path, Path]:
+        repository = self.root / name
+        repository.mkdir()
+        git(repository, "init", "-b", "main")
+        git(repository, "config", "user.name", "Crossforge Test")
+        git(repository, "config", "user.email", "test@invalid")
+        (repository / "app.txt").write_text("other\n", encoding="utf-8")
+        git(repository, "add", "app.txt")
+        git(repository, "commit", "-m", "other base")
+        return repository, discover_repository(repository).common_git_dir
+
     def seed_state(
         self,
         *,
@@ -410,6 +421,178 @@ class CLITestCase(unittest.TestCase):
 
 
 class ApprovalAndStateCLIRegressionTests(CLITestCase):
+    def test_state_commands_reject_an_unrelated_git_common_dir(self) -> None:
+        other_repository, other_common = self.create_repository("other")
+        store, run_id = self.seed_state(
+            tasks=[runtime_task(self.commit)],
+            active_task=None,
+        )
+        tasks_path = store.run_dir(run_id) / "tasks.json"
+        run_path = store.run_dir(run_id) / "run.json"
+        before_tasks = tasks_path.read_bytes()
+        before_run = run_path.read_bytes()
+        access_path = self.root / "access.json"
+        access_path.write_text(
+            json.dumps(
+                {
+                    provider: {
+                        "enabled": provider == "codex",
+                        "available": provider == "codex",
+                        "consented": provider == "codex",
+                        "managedAllowed": True,
+                    }
+                    for provider in ("codex", "grok")
+                }
+            ),
+            encoding="utf-8",
+        )
+        finish_request = self.root / "finish-other-repository.json"
+        finish_request.write_text(
+            json.dumps(
+                {
+                    "gitCommonDir": str(self.common),
+                    "runId": run_id,
+                    "taskId": "T1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        commands = (
+            (
+                "status",
+                "--repository",
+                str(other_repository),
+                "--git-common-dir",
+                str(self.common),
+            ),
+            (
+                "start-task",
+                "--repository",
+                str(other_repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+                "--task-id",
+                "T1",
+            ),
+            (
+                "route-task",
+                "--repository",
+                str(other_repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+                "--task-id",
+                "T1",
+                "--risk",
+                "low",
+                "--task-class",
+                "mechanical",
+                "--access-json",
+                str(access_path),
+            ),
+            (
+                "record-capability",
+                "--repository",
+                str(other_repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+                "--provider",
+                "codex",
+                "--managed-policy-sha256",
+                "a" * 64,
+            ),
+            (
+                "finish-task",
+                "--repository",
+                str(other_repository),
+                "--request",
+                str(finish_request),
+            ),
+            (
+                "complete-run",
+                "--repository",
+                str(other_repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+            ),
+            (
+                "abandon-run",
+                "--repository",
+                str(other_repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+            ),
+        )
+
+        for command in commands:
+            with self.subTest(command=command[0]):
+                code, stdout, stderr = invoke_cli(*command, "--json")
+                self.assertNotEqual(0, code, stdout + stderr)
+                payload = json.loads(stdout)
+                self.assertIn(
+                    "gitCommonDir does not match",
+                    payload["message"],
+                )
+
+        self.assertEqual(before_tasks, tasks_path.read_bytes())
+        self.assertEqual(before_run, run_path.read_bytes())
+        self.assertFalse((other_common / "crossforge").exists())
+
+    def test_init_run_rejects_an_unrelated_explicit_git_common_dir(self) -> None:
+        _other_repository, other_common = self.create_repository("other-init")
+        approved = canonical_plan()
+        run_id = generate_run_id()
+        run = run_record(
+            self.repository,
+            self.common,
+            run_id,
+            approved,
+            self.commit,
+        )
+        run["repositoryIdentity"] = repository_identity(self.discovered)
+        run_path = self.root / "valid-run.json"
+        plan_path = self.root / "valid-plan.json"
+        atomic_write_json(run_path, run)
+        atomic_write_json(plan_path, approved)
+        branch_before = git(
+            self.repository,
+            "branch",
+            "--show-current",
+        ).stdout
+
+        code, stdout, stderr = invoke_cli(
+            "init-run",
+            "--repository",
+            str(self.repository),
+            "--git-common-dir",
+            str(other_common),
+            "--run-json",
+            str(run_path),
+            "--plan",
+            str(plan_path),
+            "--json",
+        )
+
+        self.assertNotEqual(0, code, stdout + stderr)
+        self.assertIn(
+            "gitCommonDir does not match",
+            json.loads(stdout)["message"],
+        )
+        self.assertEqual(
+            branch_before,
+            git(self.repository, "branch", "--show-current").stdout,
+        )
+        self.assertFalse((other_common / "crossforge").exists())
+
     def test_init_run_rejects_plan_hash_mismatch_before_state_mutation(self) -> None:
         approved = canonical_plan(title="Approved bytes")
         supplied = canonical_plan(title="Different bytes")
@@ -463,7 +646,12 @@ class ApprovalAndStateCLIRegressionTests(CLITestCase):
         )
 
         code, _stdout, _stderr = invoke_cli(
-            "finish-task", "--request", str(request), "--json"
+            "finish-task",
+            "--repository",
+            str(self.repository),
+            "--request",
+            str(request),
+            "--json",
         )
 
         self.assertNotEqual(0, code)
@@ -475,7 +663,12 @@ class ApprovalAndStateCLIRegressionTests(CLITestCase):
         request.write_text('{"runId":', encoding="utf-8")
 
         code, stdout, stderr = invoke_cli(
-            "finish-task", "--request", str(request), "--json"
+            "finish-task",
+            "--repository",
+            str(self.repository),
+            "--request",
+            str(request),
+            "--json",
         )
 
         self.assertEqual(2, code)

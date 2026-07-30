@@ -350,6 +350,11 @@ State lives at:
 <absolute-git-common-dir>/crossforge/
 ```
 
+State-facing command boundaries discover the target repository and bind its
+resolved common Git directory before reading or mutating this tree. An
+explicit state path cannot redirect status, run/task transitions, capability
+evidence, or completion into another repository's control directory.
+
 Directories are created owner-only and canonical files use same-directory
 temporary files, flush, file `fsync`, `os.replace`, and directory `fsync` where
 supported. `active` names at most one unfinished build; `latest-complete`
