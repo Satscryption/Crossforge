@@ -2,7 +2,9 @@
 
 Shipping is a separate explicit-publication transaction. Ordinary Crossforge
 planning, building, review, resume, and cleanup never call these operations.
-The skill never invokes remote-writing Git or forge commands directly.
+The normal CLI does not expose them, and a skill-scoped host hook blocks access
+to the shipping launcher. The shipping skill is user-invocable only and never
+invokes remote-writing Git or forge commands directly.
 `record-shipment` is the sole write reconciler.
 
 ## Preconditions
@@ -20,6 +22,9 @@ The skill never invokes remote-writing Git or forge commands directly.
 - the remote target is a proven ancestor of the final commit.
 
 An inconclusive ancestry check blocks. MVP does not update or rewrite history.
+Shipping also fails closed on multiple URLs, distinct fetch/push destinations,
+or active Git `url.*.insteadOf`/`pushInsteadOf` rules. Configure the selected
+remote with one direct URL before preflight.
 
 ## Authorization
 
@@ -29,19 +34,25 @@ Authorization binds this immutable tuple:
 repository identity
 run ID
 remote
+exact effective remote URL
 head branch
 target branch
 final commit
 ```
 
-It also records a random 32-lowercase-hex idempotency key. Repeating the same
+It also records the bound preflight gate, a fixed 24-hour expiry, and a
+random 32-lowercase-hex idempotency key. Repeating the same
 authorization is idempotent only when the tuple and key both match. A mismatch
-must not overwrite the record. Cancel an unwritten authorization, obtain
+must not overwrite an unexpired record. After expiry, a fresh preflight,
+current publication intent, and a new key may renew the exact tuple while
+preserving any durable checkpoints. Cancel an unwritten authorization, obtain
 explicit approval for any destination change, repeat preflight, and create a
 new authorization.
 
 `--dry-run` ends before this boundary. It writes neither authorization nor
-remote state.
+remote state. `record-shipment` requires a fresh `--publication-requested`
+assertion and rejects an expired authorization before any new external write.
+Exact readback, checkpoint recovery, and terminal finalization remain available.
 
 ## Durable checkpoints
 
@@ -55,15 +66,20 @@ none -> authorized -> remote_confirmed -> pr_confirmed -> recorded
 On every `record-shipment` call and after every process restart, the control
 layer—not the skill directly—queries remote state before deciding to write:
 
-1. If the remote head already equals the final commit, checkpoint
+1. Validate the body, title, pinned forge executable, live repository identity,
+   exact fetch/push URL, authorization expiry, current publication intent, and
+   a fresh final gate before the first write.
+   The body must be an owner-private regular file beneath the run's
+   `evidence/shipping/` directory; arbitrary external paths and links fail.
+2. If the remote head already equals the final commit, checkpoint
    `result: discovered`.
-2. Otherwise require proven fast-forward ancestry, push once with hooks
+3. Otherwise require proven fast-forward ancestry, push once with hooks
    disabled and `--no-verify`, then require exact readback and checkpoint
    `result: performed`.
-3. Query open and closed PRs for the exact head and target. Reuse one with
+4. Query open and closed PRs for the exact head and target. Reuse one with
    `result: discovered`; if none exists, create one, read it back, and record
    `result: created`.
-4. Mark the run shipped only after recorded state is independently read back.
+5. Mark the run shipped only after recorded state is independently read back.
 
 A retained `performed` or `created` result is not downgraded to `discovered`
 when a retry observes its prior write.

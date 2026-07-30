@@ -2,6 +2,15 @@
 name: crossforge
 description: Orchestrate Claude architecture with isolated Codex/xAI Grok build lanes, testing, evidence, and local task commits. Use for multi-model implementation, comparing build candidates, executing an approved multi-task plan, or resuming a Crossforge build. Version 0.1.0 plan and standalone review modes are local Claude workflows and do not claim cross-vendor independence. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
 compatibility: Requires Claude Code 2.1.216+, Python 3.11+, Git 2.39+, a supported local gate-sandbox backend, and at least one authenticated external provider CLI for cross-vendor execution.
+hooks:
+  PreToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: python3
+          args:
+            - "${CLAUDE_PLUGIN_ROOT}/hooks/crossforge_boundary.py"
+            - main
 ---
 
 # Crossforge
@@ -81,15 +90,11 @@ finish-task
 complete-run
 abandon-run
 cleanup
-ship-preflight
-authorize-shipment
-cancel-shipment
-record-shipment
 ```
 
-This main skill must not call the four shipping commands: `ship-preflight`,
-`authorize-shipment`, `cancel-shipment`, or `record-shipment`. They belong only
-to `crossforge-ship`.
+The main CLI does not expose shipping commands. Its skill-scoped Bash hook
+allows only this local control entry point and blocks the separate shipping
+launcher. Publication belongs only to the user-invoked `crossforge-ship` skill.
 
 ## Arguments and mode classification
 

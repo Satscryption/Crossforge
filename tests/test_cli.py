@@ -687,6 +687,20 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
 
 
 class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
+    def test_main_and_shipping_command_surfaces_are_disjoint(self) -> None:
+        main_parser = crossforge_cli.build_parser()
+        ship_parser = crossforge_cli.build_shipping_parser()
+        main_choices = set(main_parser._subparsers._group_actions[0].choices)
+        ship_choices = set(ship_parser._subparsers._group_actions[0].choices)
+
+        self.assertEqual(set(crossforge_cli.SHIPPING_COMMANDS), ship_choices)
+        self.assertTrue(main_choices.isdisjoint(ship_choices))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main_parser.parse_args(["record-shipment", "--run-id", "invalid"])
+            with self.assertRaises(SystemExit):
+                ship_parser.parse_args(["status"])
+
     def test_accept_candidate_rejects_scope_and_gate_overrides(self) -> None:
         task = runtime_task(
             self.commit,
@@ -785,6 +799,41 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
 
         self.assertNotEqual(0, code)
         self.assertFalse((store.run_dir(run_id) / "shipment.json").exists())
+
+    def test_repeated_final_gate_uses_distinct_worktree_identity(self) -> None:
+        task = runtime_task(self.commit, status="complete")
+        store, run_id = self.seed_state(
+            tasks=[task], completed_tasks=["T1"]
+        )
+        store.complete_run(run_id)
+        run = store.load_run(run_id)
+        executor = crossforge_cli._final_gate_executor(self.discovered, store)
+
+        class StopAfterCreate(RuntimeError):
+            pass
+
+        manager = mock.Mock()
+        manager.create.side_effect = StopAfterCreate
+        with mock.patch.object(
+            crossforge_cli, "WorktreeManager", return_value=manager
+        ), mock.patch.object(
+            crossforge_cli.random_secrets,
+            "token_hex",
+            side_effect=("1111111111111111", "2222222222222222"),
+        ):
+            with self.assertRaises(StopAfterCreate):
+                executor(run)
+            with self.assertRaises(StopAfterCreate):
+                executor(run)
+
+        task_ids = [call.kwargs["task_id"] for call in manager.create.call_args_list]
+        self.assertEqual(
+            [
+                "final-gate-1111111111111111",
+                "final-gate-2222222222222222",
+            ],
+            task_ids,
+        )
 
 
 class SandboxPolicyCLIRegressionTests(CLITestCase):

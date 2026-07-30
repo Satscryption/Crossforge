@@ -2,6 +2,16 @@
 name: crossforge-ship
 description: Ship a completed Crossforge run by revalidating its recorded evidence, running the final repository gate, pushing its branch, and opening or reusing exactly one pull request when a supported forge CLI is available. Use only when the user explicitly asks to push, publish, ship, or open a PR for completed Crossforge work.
 compatibility: Requires a completed Crossforge run, Git, and a configured forge CLI such as gh.
+disable-model-invocation: true
+hooks:
+  PreToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: python3
+          args:
+            - "${CLAUDE_PLUGIN_ROOT}/hooks/crossforge_boundary.py"
+            - ship
 ---
 
 # Crossforge Ship
@@ -17,6 +27,12 @@ Canonical invocation:
 
 ```text
 /crossforge:crossforge-ship [--run-id ID] [--remote NAME] [--target-branch NAME] [--draft] [--dry-run]
+```
+
+Only a user may invoke this skill. Run its dedicated control surface:
+
+```text
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge-ship/scripts/crossforge_ship.py" <subcommand> [options]
 ```
 
 Reject unknown arguments. Read
@@ -43,13 +59,15 @@ Reject unknown arguments. Read
    the same run, remote, and target used by preflight. Authorization re-runs
    the trusted shipping preflight; caller-supplied gate results are never
    accepted. This skill—not the main Crossforge skill—owns that authorization.
-7. Prepare an owner-private PR body file containing the required summary, then
-   call `record-shipment --run-id <id> --body-file <path> [--draft]`.
+7. Prepare an owner-private PR body file beneath the selected run's
+   `evidence/shipping/` directory containing the required summary, then
+   call `record-shipment --publication-requested --run-id <id> --body-file <path> [--draft]`.
    `record-shipment` must re-read the remote, push only when needed with hooks
    disabled, durably checkpoint readback, query open and closed matching PRs,
    create at most one, read it back, and record completion.
 8. If no supported forge CLI exists, call
-   `record-shipment --run-id <id> --push-only`; report compare-URL instructions
+   `record-shipment --publication-requested --run-id <id> --push-only`; report
+   compare-URL instructions
    without claiming a PR exists.
 9. Report the durable branch, commit, PR URL when present, and whether each
    result was performed, created, or discovered.

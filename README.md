@@ -145,8 +145,11 @@ To publish a completed run, make a separate explicit request:
 ```
 
 Remove `--dry-run` only after checking the proposed immutable publication
-tuple. Shipping re-runs the final gate, never force-pushes, and discovers an
-existing matching remote commit or pull request before writing.
+tuple. The user-invoked shipping skill has a dedicated CLI; the normal CLI has
+no shipping commands. Shipping binds the effective remote URL, expires
+authorization after 24 hours, re-runs the final gate at write time, screens
+the PR title/body, pins the forge executable, never force-pushes, and discovers
+an existing matching remote commit or pull request before writing.
 
 ## Modes
 

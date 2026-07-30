@@ -2651,15 +2651,32 @@ compare URL or instructions rather than claiming a PR was created.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "repositoryIdentity": "64-char-sha256",
   "runId": "run-id",
   "status": "authorized",
   "idempotencyKey": "32-lowercase-hex",
   "remote": "origin",
+  "remoteUrl": "https://github.com/owner/repository",
   "headBranch": "crossforge/run-id",
   "targetBranch": "main",
   "finalCommit": "40-char-sha",
   "authorizedAt": "RFC3339 UTC",
+  "expiresAt": "RFC3339 UTC, 24 hours after authorization",
+  "preflightGate": {
+    "runId": "run-id",
+    "finalCommit": "40-char-sha",
+    "planSha256": "64-char-sha256",
+    "globalCommandsSha256": "64-char-sha256",
+    "gatePolicySha256": "64-char-sha256",
+    "sandboxPolicySha256": "64-char-sha256",
+    "resultSha256": "64-char-sha256",
+    "provenance": "independent",
+    "passed": true
+  },
+  "forgeExecutable": null,
+  "bodySha256": null,
+  "publicationPayloadSha256": null,
   "push": null,
   "pullRequest": null,
   "completedAt": null

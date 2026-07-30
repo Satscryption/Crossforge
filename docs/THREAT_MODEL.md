@@ -256,8 +256,14 @@ duplicate PRs, hooks execute unsandboxed, or a changed target receives code.
 - The normal skill has no publication path.
 - Shipping requires a completed run and a current explicit user request.
 - Dry-run records no authorization and performs no writes.
-- Authorization binds repository identity, run, remote, head, target, and
-  final commit with an idempotency key.
+- The normal and shipping skills expose disjoint CLIs; scoped host hooks block
+  cross-surface and direct publication commands during supported execution.
+- Authorization expires after 24 hours and binds repository identity, run,
+  remote name and effective URL, head, target, final commit, preflight evidence,
+  and an idempotency key.
+- Write-time publication intent and a fresh final gate are required.
+- PR title/body bytes are bounded and secret-screened before push; the forge
+  executable path and hash are pinned and rechecked before every invocation.
 - Remote head and matching open/closed PRs are read before writes.
 - Pushes are non-force and disable hooks; required hook equivalents must be
   approved sandboxed gates.

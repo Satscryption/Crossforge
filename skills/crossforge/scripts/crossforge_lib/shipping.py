@@ -6,23 +6,46 @@ import json
 import hashlib
 import os
 import re
+import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
-from .errors import InvalidInputError, PreconditionError, StateInconsistencyError
-from .git import GitRepository, current_branch, is_dirty, resolve_commit
+from .errors import (
+    InvalidInputError,
+    PreconditionError,
+    SecretPolicyError,
+    StateInconsistencyError,
+)
+from .gates import ExecutableIdentity, executable_identity, validate_path_environment
+from .git import (
+    GitRepository,
+    current_branch,
+    is_dirty,
+    normalize_remote_url,
+    repository_identity,
+    resolve_commit,
+)
 from .locking import repository_lock, run_lock
 from .models import RunMode, RunStatus, TaskStatus
+from .secrets import MAX_TEXT_BYTES, match_deny_path, scan_text
 from .state import StateStore
-from .util import atomic_write_json, canonical_json_bytes, utc_now
+from .util import atomic_write_json, canonical_json_bytes, sha256_bytes, utc_now
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _KEY = re.compile(r"^[0-9a-f]{32}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
+_AUTHORIZATION_TTL = timedelta(hours=24)
+_PR_PUBLICATION_BINDING_FIELDS = (
+    "forgeExecutable",
+    "bodySha256",
+    "publicationPayloadSha256",
+)
 _SHIPMENT_FIELDS = {
     "schemaVersion",
     "repositoryIdentity",
@@ -30,10 +53,16 @@ _SHIPMENT_FIELDS = {
     "status",
     "idempotencyKey",
     "remote",
+    "remoteUrl",
     "headBranch",
     "targetBranch",
     "finalCommit",
     "authorizedAt",
+    "expiresAt",
+    "preflightGate",
+    "forgeExecutable",
+    "bodySha256",
+    "publicationPayloadSha256",
     "push",
     "pullRequest",
     "completedAt",
@@ -78,17 +107,20 @@ class ShippingPlan:
     repository_identity: str
     run_id: str
     remote: str
+    remote_url: str
     head_branch: str
     target_branch: str
     final_commit: str
     remote_readback: RemoteReadback
+    final_gate_evidence: FinalGateEvidence
     dry_run: bool
 
-    def authorization_tuple(self) -> tuple[str, str, str, str, str, str]:
+    def authorization_tuple(self) -> tuple[str, str, str, str, str, str, str]:
         return (
             self.repository_identity,
             self.run_id,
             self.remote,
+            self.remote_url,
             self.head_branch,
             self.target_branch,
             self.final_commit,
@@ -99,6 +131,7 @@ class ShippingPlan:
             "repositoryIdentity": self.repository_identity,
             "runId": self.run_id,
             "remote": self.remote,
+            "remoteUrl": self.remote_url,
             "headBranch": self.head_branch,
             "targetBranch": self.target_branch,
             "finalCommit": self.final_commit,
@@ -120,9 +153,271 @@ class FinalGateEvidence:
     provenance: str
     passed: bool
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "runId": self.run_id,
+            "finalCommit": self.final_commit,
+            "planSha256": self.plan_sha256,
+            "globalCommandsSha256": self.global_commands_sha256,
+            "gatePolicySha256": self.gate_policy_sha256,
+            "sandboxPolicySha256": self.sandbox_policy_sha256,
+            "resultSha256": self.result_sha256,
+            "provenance": self.provenance,
+            "passed": self.passed,
+        }
+
 
 def _sha256_json(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _parse_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise StateInconsistencyError(f"shipment {label} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise StateInconsistencyError(f"shipment {label} is not RFC3339") from exc
+    if parsed.tzinfo is None:
+        raise StateInconsistencyError(f"shipment {label} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_datetime() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _remote_urls(
+    repository: GitRepository,
+    remote: str,
+    *,
+    runner: CommandRunner | None = None,
+) -> tuple[str, str]:
+    """Resolve one unambiguous fetch/push destination for a remote alias."""
+
+    command_runner = runner or default_command_runner
+    remote = _validate_name(remote, "remote")
+    if remote.startswith("-"):
+        raise InvalidInputError("invalid remote")
+    rewrite_check = command_runner(
+        (
+            repository.git_executable,
+            "config",
+            "--get-regexp",
+            r"^url\.",
+        ),
+        cwd=repository.root,
+    )
+    if rewrite_check.returncode not in {0, 1}:
+        raise PreconditionError("Git URL rewrite policy could not be inspected")
+    if rewrite_check.returncode == 0 and any(
+        line.split(None, 1)[0].lower().endswith((".insteadof", ".pushinsteadof"))
+        for line in rewrite_check.stdout.splitlines()
+        if line.split(None, 1)
+    ):
+        raise PreconditionError(
+            "Git URL rewrite rules are not supported for shipping"
+        )
+
+    def resolve(*extra: str) -> list[str]:
+        result = command_runner(
+            (
+                repository.git_executable,
+                "remote",
+                "get-url",
+                *extra,
+                "--all",
+                remote,
+            ),
+            cwd=repository.root,
+        )
+        if result.returncode != 0:
+            raise PreconditionError("authorized remote URL could not be resolved")
+        values = [line for line in result.stdout.splitlines() if line]
+        if len(values) != 1 or any(
+            value != value.strip() or "\x00" in value for value in values
+        ):
+            raise PreconditionError(
+                "shipping requires exactly one unambiguous remote URL"
+            )
+        return values
+
+    fetch_url = resolve()[0]
+    push_url = resolve("--push")[0]
+    for value in (fetch_url, push_url):
+        if "://" in value:
+            parsed = urlsplit(value)
+            if parsed.password is not None or (
+                parsed.username is not None
+                and parsed.scheme.lower() not in {"ssh", "git+ssh"}
+            ):
+                raise PreconditionError(
+                    "shipping remote URLs must not contain credentials"
+                )
+        else:
+            scp_match = re.fullmatch(r"(?:(?P<user>[^@/:]+)@)?[^/:]+:.+", value)
+            if scp_match and scp_match.group("user") not in {None, "git"}:
+                raise PreconditionError(
+                    "shipping remote URLs must not contain credentials"
+                )
+    if normalize_remote_url(fetch_url) != normalize_remote_url(push_url):
+        raise PreconditionError("remote fetch and push destinations differ")
+    return fetch_url, push_url
+
+
+def _assert_remote_binding(
+    repository: GitRepository,
+    shipment: Mapping[str, Any],
+    *,
+    runner: CommandRunner | None = None,
+) -> str:
+    fetch_url, push_url = _remote_urls(
+        repository, str(shipment["remote"]), runner=runner
+    )
+    if (
+        normalize_remote_url(fetch_url) != shipment["remoteUrl"]
+        or normalize_remote_url(push_url) != shipment["remoteUrl"]
+    ):
+        raise StateInconsistencyError(
+            "authorized remote URL changed after shipment authorization"
+        )
+    return push_url
+
+
+def resolve_forge_executable(
+    executable: str = "gh",
+    *,
+    path_value: str | None = None,
+) -> ExecutableIdentity:
+    """Resolve and pin the trusted forge CLI before any publication write."""
+
+    effective_path = path_value if path_value is not None else os.environ.get("PATH", "")
+    validate_path_environment(effective_path)
+    if Path(executable).is_absolute():
+        resolved = Path(executable).resolve(strict=True)
+    else:
+        if "/" in executable or "\\" in executable:
+            raise InvalidInputError("forge executable must be a basename or absolute path")
+        found = shutil.which(executable, path=effective_path)
+        if found is None:
+            raise PreconditionError("GitHub CLI is unavailable")
+        resolved = Path(found).resolve(strict=True)
+    return executable_identity(resolved)
+
+
+def _require_forge_identity(identity: Mapping[str, Any] | ExecutableIdentity) -> str:
+    expected = (
+        identity.as_dict()
+        if isinstance(identity, ExecutableIdentity)
+        else dict(identity)
+    )
+    if set(expected) != {"basename", "path", "mode", "sha256"}:
+        raise StateInconsistencyError("forge executable identity is invalid")
+    observed = executable_identity(str(expected["path"])).as_dict()
+    if observed != expected:
+        raise StateInconsistencyError("forge executable changed after validation")
+    return str(observed["path"])
+
+
+def _assert_publication_authority(
+    shipment: Mapping[str, Any],
+    *,
+    publication_requested: bool,
+) -> None:
+    if not publication_requested:
+        raise PreconditionError("current user request does not authorize publication")
+
+
+def _assert_authorization_fresh(shipment: Mapping[str, Any]) -> None:
+    current = _utc_datetime()
+    authorized = _parse_timestamp(shipment["authorizedAt"], "authorizedAt")
+    if current < authorized:
+        raise PreconditionError("shipment authorization is future-dated")
+    if current >= _parse_timestamp(shipment["expiresAt"], "expiresAt"):
+        raise PreconditionError(
+            "shipment authorization expired; rerun authorization with current intent"
+        )
+
+
+def load_pull_request_body(
+    path: str | os.PathLike[str],
+    *,
+    repository: GitRepository,
+    deny_paths: Sequence[str],
+    allowed_root: str | os.PathLike[str],
+    max_bytes: int = MAX_TEXT_BYTES,
+) -> str:
+    """Read one owner-private, non-link PR body and screen its exact bytes."""
+
+    source = Path(path)
+    allowed = Path(allowed_root).resolve()
+    try:
+        source.resolve().relative_to(allowed)
+    except ValueError as exc:
+        raise SecretPolicyError(
+            "pull-request body must be inside the run shipping-evidence directory"
+        ) from exc
+    try:
+        initial = source.lstat()
+    except OSError as exc:
+        raise SecretPolicyError(
+            "pull-request body is not a readable regular file"
+        ) from exc
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
+        raise SecretPolicyError("pull-request body must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise SecretPolicyError("pull-request body is not a readable regular file") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise SecretPolicyError("pull-request body must be a regular file")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise SecretPolicyError("pull-request body must be owner-private")
+        if info.st_size > max_bytes:
+            raise SecretPolicyError("pull-request body exceeds the size limit")
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > max_bytes:
+            raise SecretPolicyError("pull-request body exceeds the size limit")
+    finally:
+        os.close(descriptor)
+    try:
+        body = bytes(data).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SecretPolicyError("pull-request body must be valid UTF-8") from exc
+    resolved = source.resolve()
+    candidates = [source.name, resolved.name]
+    try:
+        candidates.append(resolved.relative_to(repository.root).as_posix())
+    except ValueError:
+        pass
+    if any(match_deny_path(candidate, deny_paths) for candidate in candidates):
+        raise SecretPolicyError("pull-request body path is denied by policy")
+    if scan_text(body, "pull-request-body.md"):
+        raise SecretPolicyError("pull-request body contains secret-like content")
+    return body
+
+
+def validate_publication_text(value: str, *, label: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise InvalidInputError(f"{label} must be non-empty text")
+    if len(value.encode("utf-8")) > MAX_TEXT_BYTES:
+        raise SecretPolicyError(f"{label} exceeds the size limit")
+    if scan_text(value, label):
+        raise SecretPolicyError(f"{label} contains secret-like content")
 
 
 def validate_final_gate_evidence(
@@ -155,6 +450,36 @@ def validate_final_gate_evidence(
             raise StateInconsistencyError("final verification evidence hash is invalid")
     if evidence.provenance != "independent" or evidence.passed is not True:
         raise PreconditionError("canonical global verification gate did not pass")
+
+
+def _validate_stored_preflight_gate(
+    run: Mapping[str, Any], value: Mapping[str, Any]
+) -> None:
+    keys = {
+        "runId",
+        "finalCommit",
+        "planSha256",
+        "globalCommandsSha256",
+        "gatePolicySha256",
+        "sandboxPolicySha256",
+        "resultSha256",
+        "provenance",
+        "passed",
+    }
+    if set(value) != keys:
+        raise StateInconsistencyError("stored preflight gate is malformed")
+    evidence = FinalGateEvidence(
+        run_id=value["runId"],
+        final_commit=value["finalCommit"],
+        plan_sha256=value["planSha256"],
+        global_commands_sha256=value["globalCommandsSha256"],
+        gate_policy_sha256=value["gatePolicySha256"],
+        sandbox_policy_sha256=value["sandboxPolicySha256"],
+        result_sha256=value["resultSha256"],
+        provenance=value["provenance"],
+        passed=value["passed"],
+    )
+    validate_final_gate_evidence(run, evidence)
 
 
 def default_command_runner(
@@ -194,6 +519,17 @@ def _shipment_path(store: StateStore, run_id: str) -> Path:
     return store.run_dir(run_id) / "shipment.json"
 
 
+def _has_pr_publication_bindings(shipment: Mapping[str, Any]) -> bool:
+    present = tuple(
+        shipment[field] is not None for field in _PR_PUBLICATION_BINDING_FIELDS
+    )
+    if any(present) and not all(present):
+        raise StateInconsistencyError(
+            "shipment PR publication bindings are incomplete"
+        )
+    return all(present)
+
+
 def _load_shipment(store: StateStore, run_id: str) -> dict[str, Any] | None:
     path = _shipment_path(store, run_id)
     if not path.exists():
@@ -208,15 +544,17 @@ def _load_shipment(store: StateStore, run_id: str) -> dict[str, Any] | None:
 def validate_shipment(value: object) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _SHIPMENT_FIELDS:
         raise StateInconsistencyError("shipment.json has missing or unknown fields")
-    if value["schemaVersion"] != 1:
+    if value["schemaVersion"] != 2:
         raise StateInconsistencyError("unsupported shipment schema")
     for field in (
         "repositoryIdentity",
         "runId",
         "remote",
+        "remoteUrl",
         "headBranch",
         "targetBranch",
         "authorizedAt",
+        "expiresAt",
     ):
         if not isinstance(value[field], str) or not value[field]:
             raise StateInconsistencyError(f"shipment {field} is invalid")
@@ -224,6 +562,31 @@ def validate_shipment(value: object) -> dict[str, Any]:
         raise StateInconsistencyError("shipment finalCommit is invalid")
     if not _KEY.fullmatch(value["idempotencyKey"] or ""):
         raise StateInconsistencyError("shipment idempotencyKey is invalid")
+    try:
+        normalized_remote = normalize_remote_url(value["remoteUrl"])
+    except InvalidInputError as exc:
+        raise StateInconsistencyError("shipment remoteUrl is invalid") from exc
+    if normalized_remote != value["remoteUrl"]:
+        raise StateInconsistencyError("shipment remoteUrl is not canonical")
+    authorized_at = _parse_timestamp(value["authorizedAt"], "authorizedAt")
+    expires_at = _parse_timestamp(value["expiresAt"], "expiresAt")
+    if expires_at <= authorized_at or expires_at - authorized_at > _AUTHORIZATION_TTL:
+        raise StateInconsistencyError("shipment authorization expiry is invalid")
+    if not isinstance(value["preflightGate"], dict):
+        raise StateInconsistencyError("shipment preflightGate is invalid")
+    if value["forgeExecutable"] is not None and not isinstance(
+        value["forgeExecutable"], dict
+    ):
+        raise StateInconsistencyError("shipment forgeExecutable is invalid")
+    if value["bodySha256"] is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", str(value["bodySha256"])
+    ):
+        raise StateInconsistencyError("shipment bodySha256 is invalid")
+    if value["publicationPayloadSha256"] is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", str(value["publicationPayloadSha256"])
+    ):
+        raise StateInconsistencyError("shipment publicationPayloadSha256 is invalid")
+    has_pr_bindings = _has_pr_publication_bindings(value)
     if value["status"] not in {
         "authorized",
         "remote_confirmed",
@@ -238,6 +601,16 @@ def validate_shipment(value: object) -> dict[str, Any]:
         value["pullRequest"], dict
     ):
         raise StateInconsistencyError("shipment checkpoint is missing PR readback")
+    if value["status"] in {"pr_confirmed", "recorded"} and not has_pr_bindings:
+        raise StateInconsistencyError(
+            "shipment checkpoint is missing PR publication bindings"
+        )
+    if value["status"] == "push_only_recorded" and (
+        has_pr_bindings or value["pullRequest"] is not None
+    ):
+        raise StateInconsistencyError(
+            "push-only shipment contains PR publication state"
+        )
     if value["status"] in {"recorded", "push_only_recorded"}:
         if not isinstance(value["completedAt"], str) or not value["completedAt"]:
             raise StateInconsistencyError("recorded shipment is missing completedAt")
@@ -269,6 +642,10 @@ def _assert_complete_build(
         )
     if is_dirty(repository):
         raise PreconditionError("shipping requires a clean orchestration worktree")
+    if repository_identity(repository) != run["repositoryIdentity"]:
+        raise StateInconsistencyError(
+            "current repository identity differs from the completed run"
+        )
     branch = current_branch(repository)
     head = resolve_commit(repository)
     if branch != run["branch"] or head != run["currentCommit"]:
@@ -299,7 +676,8 @@ def ship_preflight(
     if selected_run is None:
         raise PreconditionError("there is no completed Crossforge build to ship")
     run = _assert_complete_build(store, repository, selected_run)
-    validate_final_gate_evidence(run, final_gate(run))
+    gate_evidence = final_gate(run)
+    validate_final_gate_evidence(run, gate_evidence)
     selected_remote = _validate_name(remote or run["targetRemote"], "remote")
     selected_target = _validate_name(
         target_branch or run["targetBranch"], "target branch"
@@ -313,8 +691,10 @@ def ship_preflight(
         )
     head_branch = _validate_name(run["branch"], "head branch")
     final_commit = run["currentCommit"]
+    fetch_url, push_url = _remote_urls(repository, selected_remote)
+    remote_url = normalize_remote_url(push_url)
     remote_state = inspect_remote(
-        selected_remote, head_branch, selected_target, final_commit
+        push_url, head_branch, selected_target, final_commit
     )
     if (
         remote_state.head_commit not in {None, final_commit}
@@ -332,16 +712,19 @@ def ship_preflight(
         repository_identity=run["repositoryIdentity"],
         run_id=selected_run,
         remote=selected_remote,
+        remote_url=remote_url,
         head_branch=head_branch,
         target_branch=selected_target,
         final_commit=final_commit,
         remote_readback=remote_state,
+        final_gate_evidence=gate_evidence,
         dry_run=dry_run,
     )
 
 
 def authorize_shipment(
     store: StateStore,
+    repository: GitRepository,
     plan: ShippingPlan,
     *,
     idempotency_key: str,
@@ -354,10 +737,16 @@ def authorize_shipment(
     if not _KEY.fullmatch(idempotency_key):
         raise InvalidInputError("idempotency key must be 32 lowercase hexadecimal characters")
     run = store.load_run(plan.run_id)
+    _assert_complete_build(store, repository, plan.run_id)
+    validate_final_gate_evidence(run, plan.final_gate_evidence)
+    _assert_remote_binding(
+        repository, {"remote": plan.remote, "remoteUrl": plan.remote_url}
+    )
     expected = (
         run["repositoryIdentity"],
         run["runId"],
         plan.remote,
+        plan.remote_url,
         plan.head_branch,
         plan.target_branch,
         run["currentCommit"],
@@ -370,24 +759,56 @@ def authorize_shipment(
             existing["repositoryIdentity"],
             existing["runId"],
             existing["remote"],
+            existing["remoteUrl"],
             existing["headBranch"],
             existing["targetBranch"],
             existing["finalCommit"],
         )
-        if existing_tuple == expected and existing["idempotencyKey"] == idempotency_key:
-            return existing
+        if existing_tuple == expected:
+            expired = _utc_datetime() >= _parse_timestamp(
+                existing["expiresAt"], "expiresAt"
+            )
+            if existing["idempotencyKey"] == idempotency_key:
+                if expired and existing["status"] not in {
+                    "recorded",
+                    "push_only_recorded",
+                }:
+                    raise PreconditionError(
+                        "expired authorization renewal requires a new idempotency key"
+                    )
+                return existing
+            if expired and existing["status"] not in {
+                "recorded",
+                "push_only_recorded",
+            }:
+                renewed = dict(existing)
+                renewed_at = _utc_datetime()
+                renewed["idempotencyKey"] = idempotency_key
+                renewed["authorizedAt"] = _format_timestamp(renewed_at)
+                renewed["expiresAt"] = _format_timestamp(
+                    renewed_at + _AUTHORIZATION_TTL
+                )
+                renewed["preflightGate"] = plan.final_gate_evidence.to_dict()
+                return _write_shipment(store, renewed)
         raise StateInconsistencyError("an immutable shipment authorization already exists")
+    authorized_at = _utc_datetime()
     value = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "repositoryIdentity": plan.repository_identity,
         "runId": plan.run_id,
         "status": "authorized",
         "idempotencyKey": idempotency_key,
         "remote": plan.remote,
+        "remoteUrl": plan.remote_url,
         "headBranch": plan.head_branch,
         "targetBranch": plan.target_branch,
         "finalCommit": plan.final_commit,
-        "authorizedAt": utc_now(),
+        "authorizedAt": _format_timestamp(authorized_at),
+        "expiresAt": _format_timestamp(authorized_at + _AUTHORIZATION_TTL),
+        "preflightGate": plan.final_gate_evidence.to_dict(),
+        "forgeExecutable": None,
+        "bodySha256": None,
+        "publicationPayloadSha256": None,
         "push": None,
         "pullRequest": None,
         "completedAt": None,
@@ -408,16 +829,85 @@ def reconcile_push(
     *,
     run_id: str,
     inspect_remote: Callable[[str, str, str, str], RemoteReadback],
+    publication_requested: bool,
+    final_gate: Callable[[Mapping[str, Any]], FinalGateEvidence],
+    push_only: bool,
+    title: str | None = None,
+    body: str | None = None,
+    draft: bool | None = None,
+    forge_identity: Mapping[str, Any] | ExecutableIdentity | None = None,
     runner: CommandRunner = default_command_runner,
 ) -> dict[str, Any]:
     shipment = _load_shipment(store, run_id)
     if shipment is None:
         raise PreconditionError("shipment is not authorized")
+    _assert_publication_authority(
+        shipment, publication_requested=publication_requested
+    )
     run = _assert_complete_build(store, repository, run_id)
     if run["repositoryIdentity"] != shipment["repositoryIdentity"]:
         raise StateInconsistencyError("repository identity changed after authorization")
+    _validate_stored_preflight_gate(run, shipment["preflightGate"])
+    fresh_gate = final_gate(run)
+    validate_final_gate_evidence(run, fresh_gate)
+    remote_url = _assert_remote_binding(repository, shipment, runner=runner)
+    pinned_forge: dict[str, Any] | None = None
+    body_sha256: str | None = None
+    if push_only:
+        if _has_pr_publication_bindings(shipment):
+            raise StateInconsistencyError(
+                "cannot convert shipment with PR publication bindings to push-only"
+            )
+        if (
+            title is not None
+            or body is not None
+            or draft is not None
+            or forge_identity is not None
+        ):
+            raise InvalidInputError("push-only shipment cannot bind pull-request inputs")
+    else:
+        if shipment["status"] == "push_only_recorded":
+            raise StateInconsistencyError(
+                "cannot convert terminal push-only shipment to PR publication"
+            )
+        if title is None or body is None or draft is None or forge_identity is None:
+            raise PreconditionError(
+                "pull-request inputs must be validated before the shipment push"
+            )
+        validate_publication_text(title, label="pull-request title")
+        validate_publication_text(body, label="pull-request body")
+        _require_forge_identity(forge_identity)
+        pinned_forge = dict(
+            forge_identity.as_dict()
+            if isinstance(forge_identity, ExecutableIdentity)
+            else forge_identity
+        )
+        body_sha256 = sha256_bytes(body.encode("utf-8"))
+        payload_sha256 = sha256_bytes(
+            canonical_json_bytes(
+                {"title": title, "bodySha256": body_sha256, "draft": draft}
+            )
+        )
+        resolve_authorized_forge_repository(str(shipment["remoteUrl"]))
+        expected_bindings = (pinned_forge, body_sha256, payload_sha256)
+        existing_bindings = (
+            shipment["forgeExecutable"],
+            shipment["bodySha256"],
+            shipment["publicationPayloadSha256"],
+        )
+        if any(value is not None for value in existing_bindings):
+            if existing_bindings != expected_bindings:
+                raise StateInconsistencyError(
+                    "publication inputs differ from the prepared shipment"
+                )
+        else:
+            prepared = dict(shipment)
+            prepared["forgeExecutable"] = pinned_forge
+            prepared["bodySha256"] = body_sha256
+            prepared["publicationPayloadSha256"] = payload_sha256
+            shipment = _write_shipment(store, prepared)
     observed = inspect_remote(
-        shipment["remote"],
+        remote_url,
         shipment["headBranch"],
         shipment["targetBranch"],
         shipment["finalCommit"],
@@ -432,15 +922,16 @@ def reconcile_push(
             "core.hooksPath=/dev/null",
             "push",
             "--no-verify",
-            shipment["remote"],
+            remote_url,
             f"{shipment['finalCommit']}:refs/heads/{shipment['headBranch']}",
         )
+        _assert_authorization_fresh(shipment)
         result = runner(argv, cwd=repository.root)
         if result.returncode != 0:
             raise PreconditionError("authorized push failed")
         performed = True
         observed = inspect_remote(
-            shipment["remote"],
+            remote_url,
             shipment["headBranch"],
             shipment["targetBranch"],
             shipment["finalCommit"],
@@ -465,6 +956,9 @@ def reconcile_push(
         "observedCommit": shipment["finalCommit"],
         "recordedAt": utc_now(),
     }
+    if not push_only:
+        checkpoint["forgeExecutable"] = pinned_forge
+        checkpoint["bodySha256"] = body_sha256
     return _write_shipment(store, checkpoint)
 
 
@@ -472,12 +966,15 @@ def _query_pull_requests(
     shipment: Mapping[str, Any],
     *,
     repository: GitRepository,
-    gh_executable: str,
+    forge_identity: Mapping[str, Any] | ExecutableIdentity,
     runner: CommandRunner,
 ) -> list[PullRequestReadback]:
+    _assert_remote_binding(repository, shipment, runner=runner)
     forge_repository = resolve_authorized_forge_repository(
-        repository, str(shipment["remote"]), runner=runner
+        str(shipment["remoteUrl"])
     )
+    forge_owner = forge_repository.split("/", 1)[0]
+    gh_executable = _require_forge_identity(forge_identity)
     argv = (
         gh_executable,
         "pr",
@@ -487,11 +984,11 @@ def _query_pull_requests(
         "--state",
         "all",
         "--head",
-        shipment["headBranch"],
+        f"{forge_owner}:{shipment['headBranch']}",
         "--base",
         shipment["targetBranch"],
         "--json",
-        "number,url,state,headRefName,baseRefName,headRefOid",
+        "number,url,state,headRefName,baseRefName,headRefOid,isCrossRepository,headRepositoryOwner",
     )
     result = runner(argv, cwd=repository.root)
     if result.returncode != 0:
@@ -506,22 +1003,55 @@ def _query_pull_requests(
     for item in raw:
         if not isinstance(item, dict):
             continue
-        if (
-            item.get("headRefName") == shipment["headBranch"]
-            and item.get("baseRefName") == shipment["targetBranch"]
-            and item.get("headRefOid") in {None, shipment["finalCommit"]}
-        ):
-            matches.append(
-                PullRequestReadback(
-                    forge="github",
-                    number=int(item["number"]),
-                    url=str(item["url"]),
-                    state=str(item["state"]).lower(),
-                    head_branch=str(item["headRefName"]),
-                    target_branch=str(item["baseRefName"]),
-                    head_commit=item.get("headRefOid"),
-                )
+        if item.get("headRefName") != shipment["headBranch"] or item.get(
+            "baseRefName"
+        ) != shipment["targetBranch"]:
+            continue
+        number = item.get("number")
+        state = item.get("state")
+        url = item.get("url")
+        expected_path = f"/{forge_repository}/pull/{number}"
+        try:
+            parsed_pr_url = urlsplit(url) if isinstance(url, str) else None
+            valid_pr_url = bool(
+                parsed_pr_url
+                and parsed_pr_url.scheme == "https"
+                and (parsed_pr_url.hostname or "").lower() == "github.com"
+                and parsed_pr_url.path.lower() == expected_path.lower()
+                and not parsed_pr_url.query
+                and not parsed_pr_url.fragment
+                and parsed_pr_url.username is None
             )
+        except ValueError:
+            valid_pr_url = False
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+            or not isinstance(state, str)
+            or state.lower() not in {"open", "closed", "merged"}
+            or item.get("headRefOid") != shipment["finalCommit"]
+            or item.get("isCrossRepository") is not False
+            or not isinstance(item.get("headRepositoryOwner"), dict)
+            or str(item["headRepositoryOwner"].get("login", "")).lower()
+            != forge_owner.lower()
+            or not isinstance(url, str)
+            or not valid_pr_url
+        ):
+            raise StateInconsistencyError(
+                "matching pull-request readback is not bound to the authorized shipment"
+            )
+        matches.append(
+            PullRequestReadback(
+                forge="github",
+                number=number,
+                url=url,
+                state=state.lower(),
+                head_branch=str(item["headRefName"]),
+                target_branch=str(item["baseRefName"]),
+                head_commit=str(item["headRefOid"]),
+            )
+        )
     return matches
 
 
@@ -529,7 +1059,7 @@ def inspect_pull_requests(
     shipment: Mapping[str, Any],
     *,
     repository: GitRepository,
-    gh_executable: str = "gh",
+    forge_identity: Mapping[str, Any] | ExecutableIdentity,
     runner: CommandRunner = default_command_runner,
 ) -> tuple[PullRequestReadback, ...]:
     """Read matching open and closed PRs without changing forge state."""
@@ -538,7 +1068,7 @@ def inspect_pull_requests(
         _query_pull_requests(
             shipment,
             repository=repository,
-            gh_executable=gh_executable,
+            forge_identity=forge_identity,
             runner=runner,
         )
     )
@@ -552,22 +1082,54 @@ def reconcile_pull_request(
     title: str,
     body: str,
     draft: bool,
-    gh_executable: str = "gh",
+    publication_requested: bool,
+    final_gate: Callable[[Mapping[str, Any]], FinalGateEvidence],
+    forge_identity: Mapping[str, Any] | ExecutableIdentity,
     runner: CommandRunner = default_command_runner,
 ) -> dict[str, Any]:
     shipment = _load_shipment(store, run_id)
     if shipment is None or shipment["push"] is None:
         raise PreconditionError("remote commit must be confirmed before PR creation")
+    _assert_publication_authority(
+        shipment, publication_requested=publication_requested
+    )
     run = _assert_complete_build(store, repository, run_id)
     if (
         run["repositoryIdentity"] != shipment["repositoryIdentity"]
         or run["currentCommit"] != shipment["finalCommit"]
     ):
         raise StateInconsistencyError("durable run changed after shipment authorization")
+    _validate_stored_preflight_gate(run, shipment["preflightGate"])
+    fresh_gate = final_gate(run)
+    validate_final_gate_evidence(run, fresh_gate)
+    _assert_remote_binding(repository, shipment, runner=runner)
+    validate_publication_text(title, label="pull-request title")
+    validate_publication_text(body, label="pull-request body")
+    gh_executable = _require_forge_identity(forge_identity)
+    pinned = dict(forge_identity.as_dict() if isinstance(forge_identity, ExecutableIdentity) else forge_identity)
+    if shipment["forgeExecutable"] != pinned:
+        raise StateInconsistencyError("forge executable differs from shipment binding")
+    if shipment["bodySha256"] != sha256_bytes(body.encode("utf-8")):
+        raise StateInconsistencyError(
+            "pull-request body differs from the pre-push shipment binding"
+        )
+    payload_sha256 = sha256_bytes(
+        canonical_json_bytes(
+            {
+                "title": title,
+                "bodySha256": shipment["bodySha256"],
+                "draft": draft,
+            }
+        )
+    )
+    if shipment["publicationPayloadSha256"] != payload_sha256:
+        raise StateInconsistencyError(
+            "pull-request title, body, or draft mode differs from the prepared shipment"
+        )
     matches = _query_pull_requests(
         shipment,
         repository=repository,
-        gh_executable=gh_executable,
+        forge_identity=forge_identity,
         runner=runner,
     )
     if len(matches) > 1:
@@ -586,11 +1148,9 @@ def reconcile_pull_request(
                 "pr",
                 "create",
                 "--repo",
-                resolve_authorized_forge_repository(
-                    repository, str(shipment["remote"]), runner=runner
-                ),
+                resolve_authorized_forge_repository(str(shipment["remoteUrl"])),
                 "--head",
-                shipment["headBranch"],
+                f"{resolve_authorized_forge_repository(str(shipment['remoteUrl'])).split('/', 1)[0]}:{shipment['headBranch']}",
                 "--base",
                 shipment["targetBranch"],
                 "--title",
@@ -600,6 +1160,11 @@ def reconcile_pull_request(
             ]
             if draft:
                 argv.append("--draft")
+            if _require_forge_identity(forge_identity) != gh_executable:
+                raise StateInconsistencyError(
+                    "forge executable changed before pull-request creation"
+                )
+            _assert_authorization_fresh(shipment)
             result = runner(tuple(argv), cwd=repository.root)
             if result.returncode != 0:
                 raise PreconditionError("pull-request creation failed")
@@ -607,7 +1172,7 @@ def reconcile_pull_request(
         matches = _query_pull_requests(
             shipment,
             repository=repository,
-            gh_executable=gh_executable,
+            forge_identity=forge_identity,
             runner=runner,
         )
     if len(matches) != 1:
@@ -629,6 +1194,8 @@ def reconcile_pull_request(
         "state": match.state,
         "recordedAt": utc_now(),
     }
+    checkpoint["forgeExecutable"] = pinned
+    checkpoint["bodySha256"] = sha256_bytes(body.encode("utf-8"))
     return _write_shipment(store, checkpoint)
 
 
@@ -639,15 +1206,20 @@ def record_shipment(
     run_id: str,
     inspect_remote: Callable[[str, str, str, str], RemoteReadback],
     push_only: bool,
-    gh_executable: str = "gh",
+    publication_requested: bool,
+    forge_identity: Mapping[str, Any] | ExecutableIdentity | None = None,
     runner: CommandRunner = default_command_runner,
 ) -> dict[str, Any]:
     shipment = _load_shipment(store, run_id)
     if shipment is None or shipment["push"] is None:
         raise PreconditionError("shipment lacks a confirmed remote commit")
+    _assert_publication_authority(
+        shipment, publication_requested=publication_requested
+    )
     _assert_complete_build(store, repository, run_id)
+    remote_url = _assert_remote_binding(repository, shipment, runner=runner)
     remote = inspect_remote(
-        shipment["remote"],
+        remote_url,
         shipment["headBranch"],
         shipment["targetBranch"],
         shipment["finalCommit"],
@@ -655,12 +1227,23 @@ def record_shipment(
     if remote.head_commit != shipment["finalCommit"]:
         raise StateInconsistencyError("remote commit readback no longer matches")
     if not push_only:
+        if forge_identity is None:
+            raise PreconditionError("forge executable identity is required")
+        pinned = (
+            forge_identity.as_dict()
+            if isinstance(forge_identity, ExecutableIdentity)
+            else dict(forge_identity)
+        )
+        if shipment["forgeExecutable"] != pinned:
+            raise StateInconsistencyError(
+                "forge executable differs from the prepared shipment"
+            )
         if shipment["pullRequest"] is None:
             raise PreconditionError("shipment lacks a confirmed pull request")
         matches = _query_pull_requests(
             shipment,
             repository=repository,
-            gh_executable=gh_executable,
+            forge_identity=forge_identity,
             runner=runner,
         )
         expected = shipment["pullRequest"]
@@ -669,8 +1252,10 @@ def record_shipment(
             for item in matches
         ):
             raise StateInconsistencyError("pull-request readback no longer matches")
-    elif shipment["pullRequest"] is not None:
-        raise StateInconsistencyError("cannot convert a PR shipment to push-only")
+    elif shipment["pullRequest"] is not None or _has_pr_publication_bindings(shipment):
+        raise StateInconsistencyError(
+            "cannot convert shipment with PR publication bindings to push-only"
+        )
     completed = dict(shipment)
     completed["status"] = "push_only_recorded" if push_only else "recorded"
     completed["completedAt"] = completed["completedAt"] or utc_now()
@@ -685,10 +1270,12 @@ def record_shipment(
 
 def cancel_shipment(
     store: StateStore,
+    repository: GitRepository,
     *,
     run_id: str,
     inspect_remote: Callable[[str, str, str, str], RemoteReadback],
     inspect_pull_requests: Callable[[Mapping[str, Any]], Sequence[PullRequestReadback]],
+    runner: CommandRunner = default_command_runner,
 ) -> bool:
     shipment = _load_shipment(store, run_id)
     if shipment is None:
@@ -699,8 +1286,9 @@ def cancel_shipment(
         or shipment["pullRequest"] is not None
     ):
         raise PreconditionError("shipment cannot be cancelled after an external write")
+    remote_url = _assert_remote_binding(repository, shipment, runner=runner)
     remote = inspect_remote(
-        shipment["remote"],
+        remote_url,
         shipment["headBranch"],
         shipment["targetBranch"],
         shipment["finalCommit"],
@@ -722,7 +1310,14 @@ def inspect_remote_git(
 ) -> RemoteReadback:
     """Inspect remote refs and locally prove ancestry without fetching."""
 
-    remote = _validate_name(remote, "remote")
+    if (
+        not isinstance(remote, str)
+        or not remote
+        or remote != remote.strip()
+        or "\x00" in remote
+        or remote.startswith("-")
+    ):
+        raise InvalidInputError("invalid remote URL")
     head_branch = _validate_name(head_branch, "head branch")
     target_branch = _validate_name(target_branch, "target branch")
     if not _COMMIT.fullmatch(final_commit):
@@ -778,22 +1373,10 @@ def inspect_remote_git(
     )
 
 
-def resolve_authorized_forge_repository(
-    repository: GitRepository,
-    remote: str,
-    *,
-    runner: CommandRunner = default_command_runner,
-) -> str:
-    """Resolve the authorized Git remote to an exact GitHub ``owner/name``."""
+def resolve_authorized_forge_repository(remote_url: str) -> str:
+    """Map the already-authorized Git remote URL to exact GitHub ``owner/name``."""
 
-    remote = _validate_name(remote, "remote")
-    result = runner(
-        (repository.git_executable, "remote", "get-url", remote),
-        cwd=repository.root,
-    )
-    if result.returncode != 0:
-        raise PreconditionError("authorized remote URL could not be resolved")
-    url = result.stdout.strip()
+    url = remote_url.strip()
     if not url or "\n" in url or "\r" in url:
         raise StateInconsistencyError("authorized remote returned an invalid URL")
     host: str
@@ -804,8 +1387,19 @@ def resolve_authorized_forge_repository(
         except ValueError as exc:
             raise PreconditionError("authorized remote URL is not forge-compatible") from exc
         host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme.lower() not in {"https", "ssh", "git+ssh"}
+            or "%" in parsed.path
+            or parsed.port not in {None, 443, 22}
+            or parsed.query
+            or parsed.fragment
+            or parsed.password is not None
+        ):
+            raise PreconditionError("authorized remote URL is forge-ambiguous")
         path = parsed.path
     else:
+        if any(character in url for character in ("?", "#", "%", "\\")):
+            raise PreconditionError("authorized remote URL is forge-ambiguous")
         match = re.fullmatch(r"(?:(?:[^@/:]+)@)?([^/:]+):(.+)", url)
         if match is None:
             raise PreconditionError("authorized remote is not a supported GitHub URL")
@@ -822,7 +1416,10 @@ def resolve_authorized_forge_repository(
     if (
         len(parts) != 2
         or any(not item or item in {".", ".."} for item in parts)
-        or any(re.search(r"[\x00-\x1f\x7f]", item) for item in parts)
+        or any(
+            not re.fullmatch(r"[A-Za-z0-9_.-]+", item)
+            for item in parts
+        )
     ):
         raise PreconditionError("authorized GitHub remote path is invalid")
     return f"{parts[0]}/{parts[1]}"
@@ -839,6 +1436,7 @@ _cancel_shipment_unlocked = cancel_shipment
 
 def authorize_shipment(
     store: StateStore,
+    repository: GitRepository,
     plan: ShippingPlan,
     *,
     idempotency_key: str,
@@ -850,6 +1448,7 @@ def authorize_shipment(
         ):
             return _authorize_shipment_unlocked(
                 store,
+                repository,
                 plan,
                 idempotency_key=idempotency_key,
                 publication_requested=publication_requested,
@@ -862,6 +1461,13 @@ def reconcile_push(
     *,
     run_id: str,
     inspect_remote: Callable[[str, str, str, str], RemoteReadback],
+    publication_requested: bool,
+    final_gate: Callable[[Mapping[str, Any]], FinalGateEvidence],
+    push_only: bool,
+    title: str | None = None,
+    body: str | None = None,
+    draft: bool | None = None,
+    forge_identity: Mapping[str, Any] | ExecutableIdentity | None = None,
     runner: CommandRunner = default_command_runner,
 ) -> dict[str, Any]:
     with repository_lock(store.root, timeout=getattr(store, "lock_timeout", 0)):
@@ -871,6 +1477,13 @@ def reconcile_push(
                 repository,
                 run_id=run_id,
                 inspect_remote=inspect_remote,
+                publication_requested=publication_requested,
+                final_gate=final_gate,
+                push_only=push_only,
+                title=title,
+                body=body,
+                draft=draft,
+                forge_identity=forge_identity,
                 runner=runner,
             )
 
@@ -883,7 +1496,9 @@ def reconcile_pull_request(
     title: str,
     body: str,
     draft: bool,
-    gh_executable: str = "gh",
+    publication_requested: bool,
+    final_gate: Callable[[Mapping[str, Any]], FinalGateEvidence],
+    forge_identity: Mapping[str, Any] | ExecutableIdentity,
     runner: CommandRunner = default_command_runner,
 ) -> dict[str, Any]:
     with repository_lock(store.root, timeout=getattr(store, "lock_timeout", 0)):
@@ -895,23 +1510,29 @@ def reconcile_pull_request(
                 title=title,
                 body=body,
                 draft=draft,
-                gh_executable=gh_executable,
+                publication_requested=publication_requested,
+                final_gate=final_gate,
+                forge_identity=forge_identity,
                 runner=runner,
             )
 
 
 def cancel_shipment(
     store: StateStore,
+    repository: GitRepository,
     *,
     run_id: str,
     inspect_remote: Callable[[str, str, str, str], RemoteReadback],
     inspect_pull_requests: Callable[[Mapping[str, Any]], Sequence[PullRequestReadback]],
+    runner: CommandRunner = default_command_runner,
 ) -> bool:
     with repository_lock(store.root, timeout=getattr(store, "lock_timeout", 0)):
         with run_lock(store.run_dir(run_id), timeout=getattr(store, "lock_timeout", 0)):
             return _cancel_shipment_unlocked(
                 store,
+                repository,
                 run_id=run_id,
                 inspect_remote=inspect_remote,
                 inspect_pull_requests=inspect_pull_requests,
+                runner=runner,
             )
