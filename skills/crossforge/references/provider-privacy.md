@@ -29,7 +29,7 @@ surface.
 
 ## Context preparation
 
-- Match deny globs with Crossforge's fixed case-sensitive semantics. Move
+- Match deny globs with Crossforge's fixed case-insensitive semantics. Move
   tracked matches to owner-only evidence and omit untracked matches.
 - Manifest every remaining readable regular file and symlink with path, type,
   size, and SHA-256.
