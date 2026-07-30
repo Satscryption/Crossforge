@@ -111,12 +111,33 @@ the resulting producer-marked schema-v2 evidence. Codex uses its direct
 sealed helper command. The parent rechecks all contract bytes and observes a
 positive workspace control plus denied network, outside-write, credential,
 orchestration, Git-common, outside-sentinel, and final-output operations.
-`record-consent` pins the resolved executable path and hash. The capability
-command accepts no caller-authored evidence or executable override. A missing
+The user-only `record-consent` surface pins the resolved executable path and
+hash. The capability command accepts no caller-authored evidence or executable
+override. A missing
 receipt or helper execution, contract mutation, malformed or partial result,
 unsafe or changed executable identity, or failed check leaves the provider
 unavailable. Repository-bound `probe` consent is checked before any external
 provider request.
+
+### DEV-003: User-controlled provider consent
+
+Provider consent uses a split prepare/approve protocol. The normal Crossforge
+surface exposes only `prepare-consent`, which derives repository identity,
+effective deny policy, provider executable identity, expiry, and
+context-manifest counts into an owner-private request with a 15-minute
+validity window and an exact byte hash. It cannot write `consent.json`.
+
+Approval is isolated in the `crossforge-consent` skill, which is marked
+`disable-model-invocation: true` and has a disjoint launcher. Its
+`PreToolUse` hook revalidates the request and all live derivable bindings, then
+returns `permissionDecision: ask` with the exact `consent_summary()`
+disclosure. The CLI revalidates the same byte hash after approval before
+recording consent. This makes the user permission decision—not model text or a
+caller boolean—the provenance of approval.
+
+The managed-policy digest remains an input from managed-policy discovery and
+is displayed and bound exactly; improving that discovery trust anchor belongs
+to the managed-policy finding rather than this consent-boundary change.
 
 ## Verification limitations
 

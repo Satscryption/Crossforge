@@ -11,6 +11,13 @@ hooks:
           args:
             - "${CLAUDE_PLUGIN_ROOT}/hooks/crossforge_boundary.py"
             - main
+    - matcher: "Write|Edit|NotebookEdit|Agent"
+      hooks:
+        - type: command
+          command: python3
+          args:
+            - "${CLAUDE_PLUGIN_ROOT}/hooks/crossforge_boundary.py"
+            - deny-mutation
 ---
 
 # Crossforge
@@ -75,7 +82,7 @@ render-plan
 materialize-tasks
 start-task
 route-task
-record-consent
+prepare-consent
 record-capability
 create-candidate
 invoke
@@ -158,12 +165,14 @@ Read only the references required for the selected mode:
    login status are allowed here; no remote model or readiness call is.
 4. Resolve the canonical repository identity and the discovered managed-policy
    hash from control-layer output.
-5. Before a remote readiness call, show the provider, `probe` operation,
-   identity and policy-hash prefixes, canonical provider executable path and
-   content-hash prefix, expiry, and quota warning. Obtain an explicit
-   affirmative response, then use `record-consent`; that transaction pins the
-   executable identity.
-6. Only after valid `probe` consent, let `preflight` or `invoke` perform the
+5. Before a remote readiness call, use `prepare-consent` to derive and seal the
+   provider, `probe` operation, identity and policy-hash prefixes, canonical
+   provider executable identity, expiry, and quota warning. Show the returned
+   summary, then stop and ask the user to invoke `/crossforge:crossforge-consent`
+   with the exact returned request path and SHA-256. This skill has no
+   authority to record approval.
+6. Only after the user-only consent skill records valid `probe` consent, let
+   `preflight` or `invoke` perform the
    fixed source-free readiness call. A probe contains no path, remote, file
    name, or source.
 7. Resolve and record provider capabilities, requested model, resolved model
@@ -171,8 +180,10 @@ Read only the references required for the selected mode:
    is `unknown`, never an inferred claim.
 
 Before every source-bearing build-provider operation, use `scan-context` and
-the control-layer candidate projection. Show the operation class, context file
-count and total bytes, policy hashes, and expiry—never findings or contents.
+the control-layer candidate projection, then `prepare-consent` with that exact
+manifest. Show the returned operation class, context file count and total
+bytes, policy hashes, and expiry—never findings or contents—and stop for the
+user-only consent skill.
 Version 0.1.0 records `implement` or build-task `review` consent for external
 lanes; `plan` and standalone `review` are local-only. A provider change,
 expanded operation, repository change, expiry, policy-hash change, or provider

@@ -14,14 +14,20 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from crossforge_lib.consent import (  # noqa: E402
+    CONSENT_REQUEST_PRODUCER,
+    CONSENT_REQUEST_SCHEMA_VERSION,
     ConsentError,
     check_consent,
+    consent_request_summary,
     consent_summary,
     deny_policy_hash,
+    load_consent_request,
     load_consent,
     managed_policy_hash,
     record_consent,
+    validate_consent_request,
 )
+from crossforge_lib.util import atomic_write_json, sha256_file  # noqa: E402
 
 
 class ConsentTests(unittest.TestCase):
@@ -64,6 +70,41 @@ class ConsentTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return check_consent(record, **arguments)
+
+    def consent_request(self, **overrides):
+        request = {
+            "schemaVersion": CONSENT_REQUEST_SCHEMA_VERSION,
+            "producer": CONSENT_REQUEST_PRODUCER,
+            "requestId": "1" * 64,
+            "repositoryRoot": str(Path(self.temporary.name) / "repository"),
+            "gitCommonDir": str(Path(self.temporary.name) / "repository" / ".git"),
+            "repositoryIdentity": self.repository,
+            "provider": "codex",
+            "operationClasses": ["probe"],
+            "denyPolicySha256": self.deny,
+            "managedPolicySha256": self.managed,
+            "providerExecutablePath": self.executable,
+            "providerExecutableSha256": self.executable_sha256,
+            "preparedAt": "2026-07-24T12:00:00Z",
+            "requestedExpiresAt": "2026-08-23T12:00:00Z",
+            "requestValidUntil": "2026-07-24T12:15:00Z",
+            "ttlDays": 30,
+            "userConfigPath": str(
+                Path(self.temporary.name) / "user-config.json"
+            ),
+            "userConfigSha256": None,
+            "projectConfigPath": str(
+                Path(self.temporary.name) / "project-config.json"
+            ),
+            "projectConfigSha256": None,
+            "allowFile": None,
+            "contextManifestPath": None,
+            "contextManifestSha256": None,
+            "contextFileCount": None,
+            "contextTotalBytes": None,
+        }
+        request.update(overrides)
+        return request
 
     def test_missing_consent(self):
         result = self.check(None)
@@ -179,6 +220,71 @@ class ConsentTests(unittest.TestCase):
         )
         self.assertNotIn("findings", encoded)
         self.assertNotIn("must not leak", encoded)
+
+    def test_consent_request_is_byte_bound_and_has_exact_disclosure(self):
+        manifest = Path(self.temporary.name) / "manifest.json"
+        atomic_write_json(manifest, {"files": [], "fileCount": 2, "totalBytes": 99})
+        request = self.consent_request(
+            operationClasses=["implement", "probe"],
+            contextManifestPath=str(manifest),
+            contextManifestSha256=sha256_file(manifest),
+            contextFileCount=2,
+            contextTotalBytes=99,
+        )
+        request_path = Path(self.temporary.name) / "request.json"
+        atomic_write_json(request_path, request)
+        request_hash = sha256_file(request_path)
+
+        loaded = load_consent_request(
+            request_path,
+            expected_sha256=request_hash,
+        )
+        summary = consent_request_summary(loaded)
+
+        self.assertEqual(summary["operationClasses"], ["implement", "probe"])
+        self.assertEqual(summary["contextFileCount"], 2)
+        self.assertEqual(summary["contextTotalBytes"], 99)
+        self.assertEqual(summary["requestIdPrefix"], "1" * 12)
+        request_path.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            ConsentError, "changed after disclosure"
+        ):
+            load_consent_request(
+                request_path,
+                expected_sha256=request_hash,
+            )
+
+    def test_request_rejects_context_omission_and_overlong_window(self):
+        with self.assertRaisesRegex(ConsentError, "context metadata"):
+            validate_consent_request(
+                self.consent_request(contextFileCount=0)
+            )
+        with self.assertRaisesRegex(ConsentError, "contextManifestPath"):
+            validate_consent_request(
+                self.consent_request(operationClasses=["implement"])
+            )
+        with self.assertRaisesRegex(ConsentError, "validity window"):
+            validate_consent_request(
+                self.consent_request(
+                    requestValidUntil="2026-07-24T12:15:01Z"
+                )
+            )
+
+    def test_record_consent_can_preserve_the_disclosed_expiry(self):
+        disclosed_expiry = self.now + timedelta(days=30)
+        record = self.record(
+            now=self.now + timedelta(minutes=1),
+            expires_at=disclosed_expiry,
+        )
+        self.assertEqual(
+            record["providers"]["codex"]["expiresAt"],
+            "2026-08-23T12:00:00Z",
+        )
+        with self.assertRaisesRegex(ConsentError, "outside the approved TTL"):
+            self.record(
+                now=self.now + timedelta(minutes=1),
+                expires_at=self.now + timedelta(days=31),
+            )
 
     def test_invalid_ttl_and_unknown_operation_rejected(self):
         with self.assertRaises(ConsentError):

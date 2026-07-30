@@ -11,6 +11,7 @@ import json
 import os
 import secrets as random_secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,12 +32,19 @@ from crossforge_lib.acceptance import (
     validate_acceptance_state,
 )
 from crossforge_lib.consent import (
+    CONSENT_REQUEST_LIFETIME,
+    CONSENT_REQUEST_PRODUCER,
+    CONSENT_REQUEST_SCHEMA_VERSION,
+    consent_request_summary,
     deny_policy_hash,
     load_consent,
+    load_consent_request,
     record_consent,
     require_consent,
+    validate_consent_request,
 )
 from crossforge_lib.errors import (
+    ConsentError,
     CrossforgeError,
     GateFailureError,
     InvalidInputError,
@@ -155,7 +163,7 @@ COMMANDS = (
     "materialize-tasks",
     "start-task",
     "route-task",
-    "record-consent",
+    "prepare-consent",
     "record-capability",
     "create-candidate",
     "invoke",
@@ -171,6 +179,7 @@ COMMANDS = (
     "abandon-run",
     "cleanup",
 )
+CONSENT_COMMANDS = ("record-consent",)
 SHIPPING_COMMANDS = (
     "ship-preflight",
     "authorize-shipment",
@@ -1040,22 +1049,349 @@ def _cmd_route_task(args: argparse.Namespace) -> CommandOutput:
     return CommandOutput("Routing decision complete", data)
 
 
-def _cmd_record_consent(args: argparse.Namespace) -> CommandOutput:
+def _require_managed_policy_sha256(value: str) -> str:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise InvalidInputError(
+            "managedPolicySha256 must be a lowercase SHA-256 digest"
+        )
+    return value
+
+
+def _consent_context_metadata(
+    operations: Sequence[str],
+    manifest_path: str | None,
+) -> tuple[str | None, str | None, int | None, int | None]:
+    source_bearing = any(operation != "probe" for operation in operations)
+    if not source_bearing:
+        if manifest_path is not None:
+            raise InvalidInputError(
+                "probe-only consent must not include a context manifest"
+            )
+        return None, None, None, None
+    if manifest_path is None:
+        raise InvalidInputError(
+            "source-bearing consent requires --context-manifest"
+        )
+    resolved = Path(manifest_path).expanduser().resolve()
+    manifest = _read_json_object(resolved, label="context manifest")
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise InvalidInputError("context manifest files must be an array")
+    total_bytes = 0
+    for item in files:
+        if (
+            not isinstance(item, Mapping)
+            or isinstance(item.get("size"), bool)
+            or not isinstance(item.get("size"), int)
+            or item["size"] < 0
+        ):
+            raise InvalidInputError(
+                "context manifest contains an invalid file size"
+            )
+        total_bytes += int(item["size"])
+    if manifest.get("fileCount") != len(files):
+        raise InvalidInputError("context manifest fileCount is inconsistent")
+    if manifest.get("totalBytes") != total_bytes:
+        raise InvalidInputError("context manifest totalBytes is inconsistent")
+    return str(resolved), sha256_file(resolved), len(files), total_bytes
+
+
+def _consent_store(
+    args: argparse.Namespace,
+) -> tuple[GitRepository, StateStore]:
+    repository = _repository(args)
+    store = _store(args, repository)
+    if store.git_common_dir != repository.common_git_dir:
+        raise StateInconsistencyError(
+            "consent gitCommonDir does not match the discovered repository"
+        )
+    return repository, store
+
+
+def _consent_config_source(
+    path: Path,
+    *,
+    explicit: bool,
+    label: str,
+) -> tuple[str, str | None]:
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        if explicit:
+            raise InvalidInputError(f"{label} does not exist: {resolved}")
+        return str(resolved), None
+    if not resolved.is_file():
+        raise InvalidInputError(f"{label} is not a regular file: {resolved}")
+    return str(resolved), sha256_file(resolved)
+
+
+def _load_bound_consent_config(
+    request: Mapping[str, Any],
+) -> Any:
+    def checked_path(prefix: str) -> str | None:
+        path = Path(request[f"{prefix}ConfigPath"])
+        expected_sha256 = request[f"{prefix}ConfigSha256"]
+        if expected_sha256 is None:
+            if path.exists():
+                raise ConsentError(
+                    f"{prefix} config appeared after consent disclosure"
+                )
+            return None
+        if not path.is_file() or sha256_file(path) != expected_sha256:
+            raise ConsentError(
+                f"{prefix} config changed after consent disclosure"
+            )
+        return str(path)
+
+    return load_config(
+        user_path=checked_path("user"),
+        project_path=checked_path("project"),
+        discover_defaults=False,
+    )
+
+
+def _cmd_prepare_consent(args: argparse.Namespace) -> CommandOutput:
+    repository, store = _consent_store(args)
+    operations = sorted(dict.fromkeys(args.operation))
+    user_config_path, user_config_sha256 = _consent_config_source(
+        (
+            Path(args.user_config)
+            if args.user_config
+            else Path.home() / ".claude" / "crossforge.json"
+        ),
+        explicit=args.user_config is not None,
+        label="user config",
+    )
+    project_config_path, project_config_sha256 = _consent_config_source(
+        (
+            Path(args.project_config)
+            if args.project_config
+            else repository.root / ".claude" / "crossforge.json"
+        ),
+        explicit=args.project_config is not None,
+        label="project config",
+    )
+    config = load_config(
+        user_path=(
+            user_config_path if user_config_sha256 is not None else None
+        ),
+        project_path=(
+            project_config_path
+            if project_config_sha256 is not None
+            else None
+        ),
+        discover_defaults=False,
+    )
+    allow_file = (
+        str(Path(args.allow_file).expanduser().resolve())
+        if args.allow_file
+        else None
+    )
+    allow_entries = load_allow_entries(allow_file) if allow_file else ()
     executable_path, executable_sha256 = resolve_provider_executable(
         args.provider
     )
+    (
+        context_manifest_path,
+        context_manifest_sha256,
+        context_file_count,
+        context_total_bytes,
+    ) = _consent_context_metadata(operations, args.context_manifest)
+    prepared_at = datetime.now(timezone.utc).replace(microsecond=0)
+    request_id = random_secrets.token_hex(32)
+    request = validate_consent_request(
+        {
+            "schemaVersion": CONSENT_REQUEST_SCHEMA_VERSION,
+            "producer": CONSENT_REQUEST_PRODUCER,
+            "requestId": request_id,
+            "repositoryRoot": str(repository.root),
+            "gitCommonDir": str(repository.common_git_dir),
+            "repositoryIdentity": repository_identity(repository),
+            "provider": args.provider,
+            "operationClasses": operations,
+            "denyPolicySha256": deny_policy_hash(
+                config.deny_paths,
+                DETECTOR_NAMES,
+                allow_entries,
+                _CONTEXT_POLICY,
+            ),
+            "managedPolicySha256": _require_managed_policy_sha256(
+                args.managed_policy_sha256
+            ),
+            "providerExecutablePath": str(executable_path),
+            "providerExecutableSha256": executable_sha256,
+            "preparedAt": prepared_at.isoformat().replace("+00:00", "Z"),
+            "requestedExpiresAt": (
+                prepared_at + timedelta(days=args.ttl_days)
+            ).isoformat().replace("+00:00", "Z"),
+            "requestValidUntil": (
+                prepared_at + CONSENT_REQUEST_LIFETIME
+            ).isoformat().replace("+00:00", "Z"),
+            "ttlDays": args.ttl_days,
+            "userConfigPath": user_config_path,
+            "userConfigSha256": user_config_sha256,
+            "projectConfigPath": project_config_path,
+            "projectConfigSha256": project_config_sha256,
+            "allowFile": allow_file,
+            "contextManifestPath": context_manifest_path,
+            "contextManifestSha256": context_manifest_sha256,
+            "contextFileCount": context_file_count,
+            "contextTotalBytes": context_total_bytes,
+        }
+    )
+    request_directory = ensure_private_directory(
+        store.root / "consent-requests"
+    )
+    request_path = request_directory / f"{request_id}.json"
+    atomic_write_json(request_path, request)
+    request_sha256 = sha256_file(request_path)
+    return CommandOutput(
+        f"Prepared consent request for {args.provider}",
+        {
+            "requestPath": str(request_path),
+            "requestSha256": request_sha256,
+            "summary": consent_request_summary(request),
+        },
+    )
+
+
+def _load_runtime_consent_request(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], Path, StateStore]:
+    raw_request_path = Path(args.request).expanduser()
+    if raw_request_path.is_symlink():
+        raise ConsentError("consent request path must not be a symlink")
+    request_path = raw_request_path.resolve()
+    request_metadata = request_path.stat()
+    if (
+        not stat.S_ISREG(request_metadata.st_mode)
+        or request_metadata.st_mode & 0o077
+        or (
+            hasattr(os, "getuid")
+            and request_metadata.st_uid != os.getuid()
+        )
+    ):
+        raise ConsentError(
+            "consent request must be an owner-only regular file"
+        )
+    request = load_consent_request(
+        request_path,
+        expected_sha256=args.request_sha256,
+    )
+    repository = discover_repository(request["repositoryRoot"])
+    store = StateStore(Path(request["gitCommonDir"]))
+    if repository.common_git_dir != store.git_common_dir:
+        raise StateInconsistencyError(
+            "consent request gitCommonDir does not match its repository"
+        )
+    expected_directory = (store.root / "consent-requests").resolve()
+    if request_path.parent != expected_directory:
+        raise ConsentError(
+            "consent request is outside the repository consent-request directory"
+        )
+    if request_path.name != f"{request['requestId']}.json":
+        raise ConsentError("consent request path does not match its requestId")
+    directory_metadata = expected_directory.stat()
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_mode & 0o077
+        or (
+            hasattr(os, "getuid")
+            and directory_metadata.st_uid != os.getuid()
+        )
+    ):
+        raise ConsentError(
+            "consent request directory must be owner-only"
+        )
+    now = datetime.now(timezone.utc)
+    prepared_at = datetime.fromisoformat(
+        request["preparedAt"].replace("Z", "+00:00")
+    )
+    valid_until = datetime.fromisoformat(
+        request["requestValidUntil"].replace("Z", "+00:00")
+    )
+    if prepared_at > now + timedelta(seconds=5):
+        raise ConsentError("consent request is future-dated")
+    if now >= valid_until or now - prepared_at > CONSENT_REQUEST_LIFETIME:
+        raise ConsentError("consent request expired before approval")
+    if request["repositoryIdentity"] != repository_identity(repository):
+        raise ConsentError("repository identity changed after consent disclosure")
+    executable_path, executable_sha256 = resolve_provider_executable(
+        request["provider"]
+    )
+    if (
+        request["providerExecutablePath"] != str(executable_path)
+        or request["providerExecutableSha256"] != executable_sha256
+    ):
+        raise ConsentError(
+            "provider executable changed after consent disclosure"
+        )
+    config = _load_bound_consent_config(request)
+    allow_entries = (
+        load_allow_entries(request["allowFile"])
+        if request["allowFile"] is not None
+        else ()
+    )
+    actual_deny_hash = deny_policy_hash(
+        config.deny_paths,
+        DETECTOR_NAMES,
+        allow_entries,
+        _CONTEXT_POLICY,
+    )
+    if request["denyPolicySha256"] != actual_deny_hash:
+        raise ConsentError("deny policy changed after consent disclosure")
+    if request["contextManifestPath"] is not None:
+        manifest_path = Path(request["contextManifestPath"])
+        if sha256_file(manifest_path) != request["contextManifestSha256"]:
+            raise ConsentError("context manifest changed after consent disclosure")
+        (
+            _path,
+            _sha256,
+            file_count,
+            total_bytes,
+        ) = _consent_context_metadata(
+            request["operationClasses"],
+            str(manifest_path),
+        )
+        if (
+            file_count != request["contextFileCount"]
+            or total_bytes != request["contextTotalBytes"]
+        ):
+            raise ConsentError(
+                "context manifest counts changed after consent disclosure"
+            )
+    return request, request_path, store
+
+
+def _cmd_record_consent(args: argparse.Namespace) -> CommandOutput:
+    request, _request_path, store = _load_runtime_consent_request(args)
+    expires_at = datetime.fromisoformat(
+        request["requestedExpiresAt"].replace("Z", "+00:00")
+    )
+    executable_path, executable_sha256 = resolve_provider_executable(
+        request["provider"]
+    )
     value = record_consent(
-        args.path,
-        repository_identity=args.repository_identity,
-        provider=args.provider,
-        operation_classes=args.operation,
-        deny_policy_sha256=args.deny_policy_sha256,
-        managed_policy_sha256=args.managed_policy_sha256,
+        store.root / "consent.json",
+        repository_identity=request["repositoryIdentity"],
+        provider=request["provider"],
+        operation_classes=request["operationClasses"],
+        deny_policy_sha256=request["denyPolicySha256"],
+        managed_policy_sha256=request["managedPolicySha256"],
         provider_executable_path=str(executable_path),
         provider_executable_sha256=executable_sha256,
-        ttl_days=args.ttl_days,
+        ttl_days=request["ttlDays"],
+        expires_at=expires_at,
     )
-    return CommandOutput(f"Recorded consent for {args.provider}", value)
+    return CommandOutput(
+        f"Recorded consent for {request['provider']}",
+        {
+            "requestSha256": args.request_sha256,
+            "summary": consent_request_summary(request),
+            "consent": value,
+        },
+    )
 
 
 def _cmd_record_capability(args: argparse.Namespace) -> CommandOutput:
@@ -2700,9 +3036,11 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--run-id")
     item.add_argument("--task-id")
 
-    item = command("record-consent", "record repository-bound provider consent")
-    item.add_argument("--path", required=True)
-    item.add_argument("--repository-identity", required=True)
+    item = command(
+        "prepare-consent",
+        "prepare a sealed provider-consent disclosure for user approval",
+    )
+    _add_state(item, repository=True)
     item.add_argument("--provider", choices=("codex", "grok"), required=True)
     item.add_argument(
         "--operation",
@@ -2710,9 +3048,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("probe", "plan", "review", "implement"),
         required=True,
     )
-    item.add_argument("--deny-policy-sha256", required=True)
     item.add_argument("--managed-policy-sha256", required=True)
     item.add_argument("--ttl-days", type=int, default=90)
+    item.add_argument("--user-config")
+    item.add_argument(
+        "--project-config",
+        "--config",
+        dest="project_config",
+    )
+    item.add_argument("--allow-file")
+    item.add_argument("--context-manifest")
 
     item = command(
         "record-capability",
@@ -2820,7 +3165,7 @@ def build_parser() -> argparse.ArgumentParser:
         "materialize-tasks": _cmd_materialize_tasks,
         "start-task": _cmd_start_task,
         "route-task": _cmd_route_task,
-        "record-consent": _cmd_record_consent,
+        "prepare-consent": _cmd_prepare_consent,
         "record-capability": _cmd_record_capability,
         "create-candidate": _cmd_create_candidate,
         "invoke": _cmd_invoke,
@@ -2840,6 +3185,39 @@ def build_parser() -> argparse.ArgumentParser:
         raise RuntimeError("CLI handler registry does not match required command order")
     for name, handler in handlers.items():
         subparsers.choices[name].set_defaults(handler=handler)
+    return parser
+
+
+def build_consent_parser() -> argparse.ArgumentParser:
+    """Build the user-invoked approval surface, disjoint from the main CLI."""
+
+    parser = CrossforgeArgumentParser(
+        prog="crossforge_consent.py",
+        description="Crossforge explicit provider-consent control layer",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit only machine-readable JSON",
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=CrossforgeArgumentParser,
+    )
+    item = subparsers.add_parser(
+        "record-consent",
+        help="approve one exact sealed provider-consent request",
+        description="approve one exact sealed provider-consent request",
+    )
+    _add_json_option(item)
+    item.add_argument("--request", required=True)
+    item.add_argument("--request-sha256", required=True)
+    item.set_defaults(handler=_cmd_record_consent)
+    if tuple(subparsers.choices) != CONSENT_COMMANDS:
+        raise RuntimeError(
+            "Consent CLI handler registry does not match required command order"
+        )
     return parser
 
 
@@ -2920,6 +3298,11 @@ def _emit_error(error: CrossforgeError, *, use_json: bool) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
+    return _run_parser(parser, argv)
+
+
+def consent_main(argv: Sequence[str] | None = None) -> int:
+    parser = build_consent_parser()
     return _run_parser(parser, argv)
 
 

@@ -9,8 +9,9 @@ candidates; a standard-library-only Python control layer enforces plan
 approval, provider consent, exact file scope, sandboxed verification, durable
 state, and local commits.
 
-Crossforge does not push during its normal workflow. Publishing is a separate,
-explicit `crossforge-ship` operation.
+Crossforge does not approve provider access or push during its normal
+model-invoked workflow. Provider consent and publishing are separate,
+user-invoked `crossforge-consent` and `crossforge-ship` operations.
 
 > Crossforge 0.1.0 is an alpha release. Its offline suite uses fake provider,
 > sandbox, and forge executables. No real provider call or publication is made
@@ -22,6 +23,11 @@ explicit `crossforge-ship` operation.
 
 ```text
 User
+  -> Claude architect
+      -> deterministic Crossforge control layer
+          -> sealed consent request
+  -> crossforge-consent
+      -> explicit user approval
   -> Claude architect
       -> deterministic Crossforge control layer
           -> Codex candidate worktree
@@ -92,11 +98,12 @@ names are:
 
 ```text
 /crossforge:crossforge
+/crossforge:crossforge-consent
 /crossforge:crossforge-ship
 ```
 
-Bare `/crossforge` and `/crossforge-ship` aliases may appear when no installed
-skill collides with them; automation should use the canonical names.
+Bare aliases may appear when no installed skill collides with them; automation
+should use the canonical names.
 
 Authenticate provider CLIs separately. Crossforge invokes their existing
 sessions and never reads, copies, or refreshes their tokens:
@@ -184,6 +191,16 @@ prompt. A source-bearing call additionally shows the provider, operation
 classes, repository identity prefix, deny-policy and managed-policy hash
 prefixes, expiry, context file count, and total bytes. Crossforge never prints
 secret values in this prompt.
+
+The normal skill can only run `prepare-consent`, which derives these facts,
+writes a private request with a 15-minute approval window, and returns its
+exact byte hash. It then stops. Only the explicitly user-invoked
+`/crossforge:crossforge-consent` skill can submit that request to
+`record-consent`. Its hook revalidates the request, repository, policy,
+provider executable, and context-manifest bindings and forces a user
+permission prompt containing the disclosure. The normal skill cannot call the
+approval launcher or use file-mutation/subagent tools, and the approval skill
+allows only its single canonical consent transaction.
 
 Consent becomes invalid when the repository identity, provider, operation
 class, expiry, deny policy, local exceptions, provider-visible context policy,
@@ -302,11 +319,11 @@ Durable state is stored outside the working tree:
 <absolute-git-common-dir>/crossforge/
 ```
 
-It contains repository consent, provider statistics, locks, `active` and
-`latest-complete` pointers, and a directory per run. Run records include the
-canonical plan and approval hash, task state, decisions, interfaces, worktree
-registry, shipment checkpoints, and owner-only evidence. Do not edit these
-files by hand.
+It contains repository consent, short-lived unapproved consent requests,
+provider statistics, locks, `active` and `latest-complete` pointers, and a
+directory per run. Run records include the canonical plan and approval hash,
+task state, decisions, interfaces, worktree registry, shipment checkpoints,
+and owner-only evidence. Do not edit these files by hand.
 
 Candidate worktrees default to:
 

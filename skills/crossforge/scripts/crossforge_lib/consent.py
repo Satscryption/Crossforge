@@ -19,6 +19,9 @@ from .errors import ConsentError
 from .util import atomic_write_json
 
 SCHEMA_VERSION = 2
+CONSENT_REQUEST_SCHEMA_VERSION = 1
+CONSENT_REQUEST_PRODUCER = "crossforge-consent-request/v1"
+CONSENT_REQUEST_LIFETIME = timedelta(minutes=15)
 VALID_OPERATION_CLASSES = frozenset({"probe", "plan", "review", "implement"})
 NO_MANAGED_POLICY = "no-managed-policy"
 
@@ -70,10 +73,31 @@ def _require_sha256(value: object, field: str, *, allow_literal: bool = False) -
     return value
 
 
+def _require_nullable_sha256(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return _require_sha256(value, field)
+
+
 def _require_nonempty_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ConsentError(f"{field} must be a non-empty string")
     return value
+
+
+def _require_absolute_path(
+    value: object,
+    field: str,
+    *,
+    nullable: bool = False,
+) -> str | None:
+    if nullable and value is None:
+        return None
+    raw = _require_nonempty_string(value, field)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ConsentError(f"{field} must be an absolute path")
+    return str(path.resolve())
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -226,6 +250,228 @@ def load_consent(path: str | os.PathLike[str]) -> dict[str, Any] | None:
     return validate_consent(raw)
 
 
+def validate_consent_request(record: Mapping[str, object]) -> dict[str, Any]:
+    """Validate and normalize a short-lived, unapproved consent request."""
+
+    expected_keys = {
+        "schemaVersion",
+        "producer",
+        "requestId",
+        "repositoryRoot",
+        "gitCommonDir",
+        "repositoryIdentity",
+        "provider",
+        "operationClasses",
+        "denyPolicySha256",
+        "managedPolicySha256",
+        "providerExecutablePath",
+        "providerExecutableSha256",
+        "preparedAt",
+        "requestedExpiresAt",
+        "requestValidUntil",
+        "ttlDays",
+        "userConfigPath",
+        "userConfigSha256",
+        "projectConfigPath",
+        "projectConfigSha256",
+        "allowFile",
+        "contextManifestPath",
+        "contextManifestSha256",
+        "contextFileCount",
+        "contextTotalBytes",
+    }
+    if set(record) != expected_keys:
+        raise ConsentError(
+            "consent request has unknown or missing top-level keys"
+        )
+    if record.get("schemaVersion") != CONSENT_REQUEST_SCHEMA_VERSION:
+        raise ConsentError("unsupported consent request schema version")
+    if record.get("producer") != CONSENT_REQUEST_PRODUCER:
+        raise ConsentError("unsupported consent request producer")
+    request_id = _require_sha256(record.get("requestId"), "requestId")
+    repository_root = _require_absolute_path(
+        record.get("repositoryRoot"), "repositoryRoot"
+    )
+    git_common_dir = _require_absolute_path(
+        record.get("gitCommonDir"), "gitCommonDir"
+    )
+    repository_identity = _require_sha256(
+        record.get("repositoryIdentity"), "repositoryIdentity"
+    )
+    provider = _require_nonempty_string(record.get("provider"), "provider")
+    raw_operations = record.get("operationClasses")
+    if not isinstance(raw_operations, list) or not all(
+        isinstance(item, str) for item in raw_operations
+    ):
+        raise ConsentError("operationClasses must be an array of strings")
+    operations = _validate_operations(raw_operations)
+    deny_policy_sha256 = _require_sha256(
+        record.get("denyPolicySha256"), "denyPolicySha256"
+    )
+    managed_policy_sha256 = _require_sha256(
+        record.get("managedPolicySha256"), "managedPolicySha256"
+    )
+    executable_path = _require_absolute_path(
+        record.get("providerExecutablePath"), "providerExecutablePath"
+    )
+    executable_sha256 = _require_sha256(
+        record.get("providerExecutableSha256"), "providerExecutableSha256"
+    )
+    prepared_at = _parse_timestamp(record.get("preparedAt"), "preparedAt")
+    requested_expires_at = _parse_timestamp(
+        record.get("requestedExpiresAt"), "requestedExpiresAt"
+    )
+    request_valid_until = _parse_timestamp(
+        record.get("requestValidUntil"), "requestValidUntil"
+    )
+    ttl_days = record.get("ttlDays")
+    if isinstance(ttl_days, bool) or not isinstance(ttl_days, int):
+        raise ConsentError("ttlDays must be an integer")
+    if not 1 <= ttl_days <= 365:
+        raise ConsentError("ttlDays must be from 1 through 365")
+    if requested_expires_at != prepared_at + timedelta(days=ttl_days):
+        raise ConsentError("requestedExpiresAt does not match ttlDays")
+    if (
+        request_valid_until <= prepared_at
+        or request_valid_until > prepared_at + CONSENT_REQUEST_LIFETIME
+    ):
+        raise ConsentError("consent request validity window is invalid")
+
+    user_config_path = _require_absolute_path(
+        record.get("userConfigPath"), "userConfigPath"
+    )
+    user_config_sha256 = _require_nullable_sha256(
+        record.get("userConfigSha256"), "userConfigSha256"
+    )
+    project_config_path = _require_absolute_path(
+        record.get("projectConfigPath"), "projectConfigPath"
+    )
+    project_config_sha256 = _require_nullable_sha256(
+        record.get("projectConfigSha256"), "projectConfigSha256"
+    )
+    allow_file = _require_absolute_path(
+        record.get("allowFile"), "allowFile", nullable=True
+    )
+    source_bearing = any(operation != "probe" for operation in operations)
+    if source_bearing:
+        context_manifest_path = _require_absolute_path(
+            record.get("contextManifestPath"), "contextManifestPath"
+        )
+        context_manifest_sha256 = _require_sha256(
+            record.get("contextManifestSha256"), "contextManifestSha256"
+        )
+        context_file_count = record.get("contextFileCount")
+        context_total_bytes = record.get("contextTotalBytes")
+        if (
+            isinstance(context_file_count, bool)
+            or not isinstance(context_file_count, int)
+            or context_file_count < 0
+        ):
+            raise ConsentError("contextFileCount must be a non-negative integer")
+        if (
+            isinstance(context_total_bytes, bool)
+            or not isinstance(context_total_bytes, int)
+            or context_total_bytes < 0
+        ):
+            raise ConsentError("contextTotalBytes must be a non-negative integer")
+    else:
+        if any(
+            record.get(field) is not None
+            for field in (
+                "contextManifestPath",
+                "contextManifestSha256",
+                "contextFileCount",
+                "contextTotalBytes",
+            )
+        ):
+            raise ConsentError(
+                "source-free consent requests must not contain context metadata"
+            )
+        context_manifest_path = None
+        context_manifest_sha256 = None
+        context_file_count = None
+        context_total_bytes = None
+
+    return {
+        "schemaVersion": CONSENT_REQUEST_SCHEMA_VERSION,
+        "producer": CONSENT_REQUEST_PRODUCER,
+        "requestId": request_id,
+        "repositoryRoot": repository_root,
+        "gitCommonDir": git_common_dir,
+        "repositoryIdentity": repository_identity,
+        "provider": provider,
+        "operationClasses": operations,
+        "denyPolicySha256": deny_policy_sha256,
+        "managedPolicySha256": managed_policy_sha256,
+        "providerExecutablePath": executable_path,
+        "providerExecutableSha256": executable_sha256,
+        "preparedAt": _format_timestamp(prepared_at),
+        "requestedExpiresAt": _format_timestamp(requested_expires_at),
+        "requestValidUntil": _format_timestamp(request_valid_until),
+        "ttlDays": ttl_days,
+        "userConfigPath": user_config_path,
+        "userConfigSha256": user_config_sha256,
+        "projectConfigPath": project_config_path,
+        "projectConfigSha256": project_config_sha256,
+        "allowFile": allow_file,
+        "contextManifestPath": context_manifest_path,
+        "contextManifestSha256": context_manifest_sha256,
+        "contextFileCount": context_file_count,
+        "contextTotalBytes": context_total_bytes,
+    }
+
+
+def load_consent_request(
+    path: str | os.PathLike[str],
+    *,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Load a consent request only when its exact bytes match *expected_sha256*."""
+
+    expected_sha256 = _require_sha256(expected_sha256, "requestSha256")
+    request_path = Path(path)
+    try:
+        raw_bytes = request_path.read_bytes()
+    except OSError as exc:
+        raise ConsentError(f"could not read consent request: {exc}") from exc
+    if hashlib.sha256(raw_bytes).hexdigest() != expected_sha256:
+        raise ConsentError("consent request bytes changed after disclosure")
+    try:
+        raw = json.loads(raw_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConsentError(f"could not parse consent request: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise ConsentError("consent request must be a JSON object")
+    return validate_consent_request(raw)
+
+
+def consent_request_summary(request: Mapping[str, object]) -> dict[str, object]:
+    """Return the exact non-sensitive disclosure for a consent request."""
+
+    normalized = validate_consent_request(request)
+    context_manifest = None
+    if normalized["contextManifestPath"] is not None:
+        context_manifest = {
+            "fileCount": normalized["contextFileCount"],
+            "totalBytes": normalized["contextTotalBytes"],
+        }
+    summary = consent_summary(
+        repository_identity=normalized["repositoryIdentity"],
+        provider=normalized["provider"],
+        operation_classes=normalized["operationClasses"],
+        deny_policy_sha256=normalized["denyPolicySha256"],
+        managed_policy_sha256=normalized["managedPolicySha256"],
+        provider_executable_path=normalized["providerExecutablePath"],
+        provider_executable_sha256=normalized["providerExecutableSha256"],
+        expires_at=_parse_timestamp(
+            normalized["requestedExpiresAt"], "requestedExpiresAt"
+        ),
+        context_manifest=context_manifest,
+    )
+    summary["requestIdPrefix"] = normalized["requestId"][:12]
+    return summary
+
+
 def record_consent(
     path: str | os.PathLike[str],
     *,
@@ -238,6 +484,7 @@ def record_consent(
     provider_executable_sha256: str,
     ttl_days: int,
     now: datetime | None = None,
+    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Record explicit approval for one provider.
 
@@ -273,7 +520,16 @@ def record_consent(
     if not 1 <= ttl_days <= 365:
         raise ConsentError("ttlDays must be from 1 through 365")
     approved_at = _as_utc(now or _utc_now())
-    expires_at = approved_at + timedelta(days=ttl_days)
+    consent_expires_at = (
+        _as_utc(expires_at)
+        if expires_at is not None
+        else approved_at + timedelta(days=ttl_days)
+    )
+    if (
+        consent_expires_at <= approved_at
+        or consent_expires_at > approved_at + timedelta(days=ttl_days)
+    ):
+        raise ConsentError("expiresAt is outside the approved TTL")
 
     existing = load_consent(path)
     providers: dict[str, Any] = {}
@@ -287,7 +543,7 @@ def record_consent(
         "providerExecutablePath": executable_path,
         "providerExecutableSha256": provider_executable_sha256,
         "approvedAt": _format_timestamp(approved_at),
-        "expiresAt": _format_timestamp(expires_at),
+        "expiresAt": _format_timestamp(consent_expires_at),
     }
     result = validate_consent(
         {
@@ -392,16 +648,22 @@ def consent_summary(
 __all__ = [
     "ConsentCheck",
     "ConsentError",
+    "CONSENT_REQUEST_LIFETIME",
+    "CONSENT_REQUEST_PRODUCER",
+    "CONSENT_REQUEST_SCHEMA_VERSION",
     "NO_MANAGED_POLICY",
     "SCHEMA_VERSION",
     "VALID_OPERATION_CLASSES",
     "canonical_json_sha256",
     "check_consent",
     "consent_summary",
+    "consent_request_summary",
     "deny_policy_hash",
     "load_consent",
+    "load_consent_request",
     "managed_policy_hash",
     "record_consent",
     "require_consent",
     "validate_consent",
+    "validate_consent_request",
 ]

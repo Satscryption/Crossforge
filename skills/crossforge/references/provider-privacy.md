@@ -13,14 +13,19 @@ availability never implies consent.
 3. For remote readiness calls, obtain `probe` consent and send a fixed,
    source-free prompt with no repository path, remote, or file name.
 4. Before source-bearing work, enumerate the complete provider-readable
-   context, quarantine denied content, scan it, and obtain consent for the
-   required operation class.
-5. Use `record-consent`; scripts never infer approval.
+   context, quarantine denied content, scan it, and use `prepare-consent` for
+   the required operation class and exact manifest.
+5. Show the sealed request summary, then stop. Only the user-invoked
+   `/crossforge:crossforge-consent` skill may record the request; scripts never
+   infer approval.
 
 Consent is bound to repository identity, provider, operation classes, expiry,
-the deny-policy hash, and the discovered managed-policy hash. A change to
-either policy hash invalidates it. Show the user hash prefixes, expiry, file
-count, and total bytes—never findings, contents, tokens, or credential values.
+the deny-policy hash, the discovered managed-policy hash, and the canonical
+provider executable identity. A change to any binding invalidates it. The
+short-lived request binds exact bytes and shows the user hash prefixes,
+expiry, file count, and total bytes—never findings, contents, tokens, or
+credential values. The normal model-invocable skill cannot call the approval
+surface.
 
 ## Context preparation
 

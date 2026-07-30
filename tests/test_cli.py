@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -67,6 +68,17 @@ def invoke_cli(*arguments: str) -> tuple[int, str, str]:
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         try:
             result = crossforge_cli.main(list(arguments))
+        except SystemExit as error:
+            result = int(error.code)
+    return int(result), stdout.getvalue(), stderr.getvalue()
+
+
+def invoke_consent_cli(*arguments: str) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            result = crossforge_cli.consent_main(list(arguments))
         except SystemExit as error:
             result = int(error.code)
     return int(result), stdout.getvalue(), stderr.getvalue()
@@ -352,6 +364,216 @@ class ApprovalAndStateCLIRegressionTests(CLITestCase):
         self.assertEqual(2, payload["exitCode"])
         self.assertNotIn("Traceback", stdout + stderr)
         self.assertEqual("", stderr)
+
+
+class ConsentCLIRegressionTests(CLITestCase):
+    def test_only_user_consent_surface_can_record_prepared_request(self) -> None:
+        executable = Path(sys.executable).resolve()
+        executable_hash = sha256_file(executable)
+        managed_hash = "b" * 64
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, executable_hash),
+        ):
+            code, stdout, stderr = invoke_cli(
+                "prepare-consent",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--provider",
+                "codex",
+                "--operation",
+                "probe",
+                "--managed-policy-sha256",
+                managed_hash,
+                "--ttl-days",
+                "30",
+                "--json",
+            )
+        self.assertEqual(0, code, stdout + stderr)
+        prepared = json.loads(stdout)["result"]
+        request_path = Path(prepared["requestPath"])
+        consent_path = self.common / "crossforge" / "consent.json"
+        self.assertEqual(
+            request_path.parent,
+            self.common / "crossforge" / "consent-requests",
+        )
+        self.assertFalse(consent_path.exists())
+        self.assertEqual(prepared["summary"]["operationClasses"], ["probe"])
+
+        code, _stdout, _stderr = invoke_cli(
+            "record-consent",
+            "--request",
+            str(request_path),
+            "--request-sha256",
+            prepared["requestSha256"],
+            "--json",
+        )
+        self.assertEqual(2, code)
+        self.assertFalse(consent_path.exists())
+
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, "f" * 64),
+        ):
+            code, _stdout, _stderr = invoke_consent_cli(
+                "record-consent",
+                "--request",
+                str(request_path),
+                "--request-sha256",
+                prepared["requestSha256"],
+                "--json",
+            )
+        self.assertEqual(8, code)
+        self.assertFalse(consent_path.exists())
+
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, executable_hash),
+        ):
+            code, stdout, stderr = invoke_consent_cli(
+                "record-consent",
+                "--request",
+                str(request_path),
+                "--request-sha256",
+                prepared["requestSha256"],
+                "--json",
+            )
+        self.assertEqual(0, code, stdout + stderr)
+        result = json.loads(stdout)["result"]
+        self.assertEqual(result["summary"], prepared["summary"])
+        self.assertTrue(consent_path.exists())
+        self.assertEqual(
+            result["consent"]["providers"]["codex"]["operationClasses"],
+            ["probe"],
+        )
+
+    def test_forged_future_dated_request_cannot_extend_approval_window(self) -> None:
+        executable = Path(sys.executable).resolve()
+        executable_hash = sha256_file(executable)
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, executable_hash),
+        ):
+            code, stdout, stderr = invoke_cli(
+                "prepare-consent",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--provider",
+                "codex",
+                "--operation",
+                "probe",
+                "--managed-policy-sha256",
+                "b" * 64,
+                "--ttl-days",
+                "30",
+                "--json",
+            )
+        self.assertEqual(0, code, stdout + stderr)
+        prepared = json.loads(stdout)["result"]
+        request_path = Path(prepared["requestPath"])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        future = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(
+            days=1
+        )
+        request["preparedAt"] = future.isoformat().replace("+00:00", "Z")
+        request["requestValidUntil"] = (
+            future + timedelta(minutes=15)
+        ).isoformat().replace("+00:00", "Z")
+        request["requestedExpiresAt"] = (
+            future + timedelta(days=30)
+        ).isoformat().replace("+00:00", "Z")
+        atomic_write_json(request_path, request)
+        forged_sha256 = sha256_file(request_path)
+
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, executable_hash),
+        ):
+            code, _stdout, _stderr = invoke_consent_cli(
+                "record-consent",
+                "--request",
+                str(request_path),
+                "--request-sha256",
+                forged_sha256,
+                "--json",
+            )
+        self.assertEqual(8, code)
+        self.assertFalse(
+            (self.common / "crossforge" / "consent.json").exists()
+        )
+
+    def test_source_bearing_request_requires_consistent_manifest(self) -> None:
+        executable = Path(sys.executable).resolve()
+        executable_hash = sha256_file(executable)
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, executable_hash),
+        ):
+            code, _stdout, _stderr = invoke_cli(
+                "prepare-consent",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--provider",
+                "codex",
+                "--operation",
+                "implement",
+                "--managed-policy-sha256",
+                "b" * 64,
+                "--json",
+            )
+        self.assertNotEqual(0, code)
+
+        manifest = self.root / "context-manifest.json"
+        atomic_write_json(
+            manifest,
+            {
+                "files": [
+                    {
+                        "path": "app.txt",
+                        "size": 5,
+                    }
+                ],
+                "fileCount": 1,
+                "totalBytes": 5,
+            },
+        )
+        with mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, executable_hash),
+        ):
+            code, stdout, stderr = invoke_cli(
+                "prepare-consent",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--provider",
+                "codex",
+                "--operation",
+                "implement",
+                "--managed-policy-sha256",
+                "b" * 64,
+                "--context-manifest",
+                str(manifest),
+                "--json",
+            )
+        self.assertEqual(0, code, stdout + stderr)
+        summary = json.loads(stdout)["result"]["summary"]
+        self.assertEqual(summary["contextFileCount"], 1)
+        self.assertEqual(summary["contextTotalBytes"], 5)
 
 
 class ProviderBoundaryCLIRegressionTests(CLITestCase):

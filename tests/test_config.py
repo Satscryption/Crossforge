@@ -72,6 +72,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.codex.model, "o3")
         self.assertEqual(config.codex.effort.value, "xhigh")
 
+    def test_default_discovery_can_be_disabled_for_bound_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "crossforge.json").write_text(
+                '{"budget":"quality"}\n',
+                encoding="utf-8",
+            )
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                discovered = load_config()
+                bound = load_config(discover_defaults=False)
+            finally:
+                os.chdir(previous)
+        self.assertEqual(discovered.budget, Budget.QUALITY)
+        self.assertEqual(bound.budget, Budget.BALANCED)
+
     def test_merge_replaces_arrays_in_full(self) -> None:
         merged = merge_config(
             {"nested": {"array": ["old"], "kept": True}},
