@@ -124,8 +124,9 @@ provider request.
 Provider consent uses a split prepare/approve protocol. The normal Crossforge
 surface exposes only `prepare-consent`, which derives repository identity,
 effective deny policy, provider executable identity, expiry, and
-context-manifest counts into an owner-private request with a 15-minute
-validity window and an exact byte hash. It cannot write `consent.json`.
+the canonical context-manifest hash and counts into an owner-private request
+with a 15-minute validity window and an exact byte hash. It cannot write
+`consent.json`.
 
 Approval is isolated in the `crossforge-consent` skill, which is marked
 `disable-model-invocation: true` and has a disjoint launcher. Its
@@ -134,6 +135,12 @@ returns `permissionDecision: ask` with the exact `consent_summary()`
 disclosure. The CLI revalidates the same byte hash after approval before
 recording consent. This makes the user permission decision—not model text or a
 caller boolean—the provenance of approval.
+
+The durable consent entry preserves the approved context-manifest hash and
+counts. Source-bearing invocation compares both the early candidate snapshot
+and a writer-lock-held snapshot against that binding before the provider can
+read source. A changed candidate therefore requires a fresh request and user
+approval.
 
 The managed-policy digest remains an input from managed-policy discovery and
 is displayed and bound exactly; improving that discovery trust anchor belongs

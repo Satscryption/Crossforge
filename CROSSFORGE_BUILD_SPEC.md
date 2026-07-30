@@ -1884,7 +1884,7 @@ and explicit-port examples.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 3,
   "repositoryIdentity": "hex",
   "providers": {
     "codex": {
@@ -1899,6 +1899,9 @@ and explicit-port examples.
       "managedPolicySha256": "hex-or-no-managed-policy",
       "providerExecutablePath": "/canonical/absolute/path",
       "providerExecutableSha256": "hex",
+      "contextManifestSha256": "hex",
+      "contextFileCount": 123,
+      "contextTotalBytes": 456789,
       "approvedAt": "RFC3339 UTC",
       "expiresAt": "RFC3339 UTC"
     },
@@ -1913,6 +1916,9 @@ and explicit-port examples.
       "managedPolicySha256": "hex-or-no-managed-policy",
       "providerExecutablePath": "/canonical/absolute/path",
       "providerExecutableSha256": "hex",
+      "contextManifestSha256": "hex",
+      "contextFileCount": 123,
+      "contextTotalBytes": 456789,
       "approvedAt": "RFC3339 UTC",
       "expiresAt": "RFC3339 UTC"
     }
@@ -1932,16 +1938,21 @@ be marked `disable-model-invocation: true`, use a disjoint launcher, and have a
 `permissionDecision: ask` with `consent_summary()` as the user-only reason.
 After approval, the CLI revalidates the same request hash and every live
 derivable binding before writing consent. Its hook allows no other tool call.
-The normal skill's hooks block file-mutation and subagent tools so the model
-cannot hand-write the consent record around the CLI. The normal skill and
-provider availability must never infer or mint approval.
+The normal skill's fail-closed hook permits only explicitly listed tools,
+blocks file tools from the Git-common Crossforge state and any
+`consent.json`, and permits only the bundled read-only advisor/reviewer agent
+types. The normal skill and provider availability must never infer or mint
+approval.
 
 Before approval, show provider, operation classes, repository identity prefix,
 deny-policy hash prefix, managed-policy hash prefix, provider executable path
 and content-hash prefix, consent expiry, and—for source-bearing operations—the
 context-manifest file count and total bytes. Persist the canonical executable
-identity in consent; any later path or byte change invalidates approval. Do not
-display secret findings or file contents in the consent prompt.
+identity and, for source-bearing operations, the canonical context-manifest
+hash and counts in consent. Recheck the live source manifest while holding the
+candidate writer lock; any later path or byte change invalidates approval. Do
+not display secret findings or file contents in the consent prompt. Probe-only
+entries store null context fields.
 
 Local executable discovery, version output, help inspection, and local login
 status may run before consent because they transmit no repository content and

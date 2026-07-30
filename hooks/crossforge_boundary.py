@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,6 +45,9 @@ CONSENT_COMMANDS = frozenset({"record-consent"})
 SHIP_COMMANDS = frozenset(
     {"ship-preflight", "authorize-shipment", "cancel-shipment", "record-shipment"}
 )
+MAIN_READ_TOOLS = frozenset({"Read", "Grep", "Glob", "AskUserQuestion"})
+MAIN_FILE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
+MAIN_AGENT_TYPES = frozenset({"commitment-advisor", "independent-reviewer"})
 FORBIDDEN_SHELL_SYNTAX = (
     "&&",
     "||",
@@ -125,6 +130,95 @@ def _consent_approval(tokens: list[str]) -> int:
     return 0
 
 
+def _tool_input(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("malformed hook input")
+    value = payload.get("tool_input")
+    if not isinstance(value, dict):
+        raise ValueError("malformed hook input")
+    return value
+
+
+def _git_common_dir(cwd: Path) -> Path:
+    executable = shutil.which("git")
+    if executable is None:
+        raise ValueError("Git is unavailable")
+    completed = subprocess.run(
+        (
+            str(Path(executable).resolve(strict=True)),
+            "-C",
+            str(cwd),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise ValueError("repository Git common directory is unavailable")
+    return Path(completed.stdout.strip()).resolve(strict=True)
+
+
+def _same_or_within_casefold(path: Path, root: Path) -> bool:
+    path_parts = tuple(part.casefold() for part in path.parts)
+    root_parts = tuple(part.casefold() for part in root.parts)
+    return (
+        len(path_parts) >= len(root_parts)
+        and path_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _main_file_tool(payload: dict[str, object], tool_name: str) -> int:
+    try:
+        tool_input = _tool_input(payload)
+        field = "notebook_path" if tool_name == "NotebookEdit" else "file_path"
+        raw_path = tool_input.get(field)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"{tool_name} is missing {field}")
+        raw_cwd = payload.get("cwd", os.getcwd())
+        if not isinstance(raw_cwd, str) or not raw_cwd:
+            raise ValueError("hook input is missing cwd")
+        cwd = Path(raw_cwd).expanduser().resolve(strict=True)
+        path = Path(raw_path).expanduser()
+        resolved = (
+            path.resolve(strict=False)
+            if path.is_absolute()
+            else (cwd / path).resolve(strict=False)
+        )
+        if resolved.name.casefold() == "consent.json":
+            return deny("the normal skill cannot write a consent record")
+        state_root = _git_common_dir(cwd) / "crossforge"
+        if _same_or_within_casefold(resolved, state_root):
+            return deny("the normal skill cannot edit Crossforge durable state")
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return deny(str(error))
+    return 0
+
+
+def _main_non_bash(payload: dict[str, object], tool_name: str) -> int:
+    if tool_name in MAIN_READ_TOOLS:
+        return 0
+    if tool_name in MAIN_FILE_TOOLS:
+        return _main_file_tool(payload, tool_name)
+    if tool_name == "Agent":
+        try:
+            tool_input = _tool_input(payload)
+            agent_type = tool_input.get("subagent_type")
+            if not isinstance(agent_type, str) or not agent_type:
+                raise ValueError("Agent is missing subagent_type")
+            if agent_type.rsplit(":", 1)[-1] not in MAIN_AGENT_TYPES:
+                raise ValueError("Agent type is outside the read-only allowlist")
+        except ValueError as error:
+            return deny(str(error))
+        return 0
+    return deny(f"{tool_name} is outside the deterministic control surface")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         return deny("invalid hook mode")
@@ -139,13 +233,13 @@ def main(argv: list[str]) -> int:
         return deny("missing tool name")
     if not isinstance(permission_mode, str) or not permission_mode:
         return deny("missing permission mode")
-    if mode == "deny-mutation":
-        return deny(f"{tool_name} is outside the deterministic control surface")
+    if mode == "main" and tool_name != "Bash":
+        return _main_non_bash(payload, tool_name)
     if mode == "consent" and tool_name != "Bash":
         return deny("only the canonical consent launcher is allowed")
     try:
-        command = payload["tool_input"]["command"]
-    except (KeyError, TypeError):
+        command = _tool_input(payload)["command"]
+    except (KeyError, TypeError, ValueError):
         return deny("malformed hook input")
     if not isinstance(command, str) or not command.strip():
         return deny("missing command")

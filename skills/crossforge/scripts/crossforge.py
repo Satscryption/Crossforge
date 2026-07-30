@@ -1095,7 +1095,17 @@ def _consent_context_metadata(
         raise InvalidInputError("context manifest fileCount is inconsistent")
     if manifest.get("totalBytes") != total_bytes:
         raise InvalidInputError("context manifest totalBytes is inconsistent")
-    return str(resolved), sha256_file(resolved), len(files), total_bytes
+    canonical_bytes = canonical_json_bytes(manifest)
+    if resolved.read_bytes() != canonical_bytes:
+        raise InvalidInputError(
+            "context manifest must use canonical Crossforge JSON bytes"
+        )
+    return (
+        str(resolved),
+        sha256_bytes(canonical_bytes),
+        len(files),
+        total_bytes,
+    )
 
 
 def _consent_store(
@@ -1381,8 +1391,14 @@ def _cmd_record_consent(args: argparse.Namespace) -> CommandOutput:
         managed_policy_sha256=request["managedPolicySha256"],
         provider_executable_path=str(executable_path),
         provider_executable_sha256=executable_sha256,
+        context_manifest_sha256=request["contextManifestSha256"],
+        context_file_count=request["contextFileCount"],
+        context_total_bytes=request["contextTotalBytes"],
         ttl_days=request["ttlDays"],
         expires_at=expires_at,
+        prepared_at=datetime.fromisoformat(
+            request["preparedAt"].replace("Z", "+00:00")
+        ),
     )
     return CommandOutput(
         f"Recorded consent for {request['provider']}",
@@ -1795,18 +1811,9 @@ def _prepare_invoke_lane(
         raise PreconditionError(
             "provider capability evidence uses a different managed policy"
         )
+    consent = load_consent(store.root / "consent.json")
     require_consent(
-        load_consent(store.root / "consent.json"),
-        repository_identity=str(run["repositoryIdentity"]),
-        provider=provider,
-        operation_class=str(request["operation"]),
-        deny_policy_sha256=str(request["denyPolicySha256"]),
-        managed_policy_sha256=str(request["managedPolicySha256"]),
-        provider_executable_path=str(executable_path),
-        provider_executable_sha256=executable_sha256,
-    )
-    require_consent(
-        load_consent(store.root / "consent.json"),
+        consent,
         repository_identity=str(run["repositoryIdentity"]),
         provider=provider,
         operation_class="probe",
@@ -1816,6 +1823,21 @@ def _prepare_invoke_lane(
         provider_executable_sha256=executable_sha256,
     )
     initial_manifest = build_context_manifest(candidate.path)
+    require_consent(
+        consent,
+        repository_identity=str(run["repositoryIdentity"]),
+        provider=provider,
+        operation_class=str(request["operation"]),
+        deny_policy_sha256=str(request["denyPolicySha256"]),
+        managed_policy_sha256=str(request["managedPolicySha256"]),
+        provider_executable_path=str(executable_path),
+        provider_executable_sha256=executable_sha256,
+        context_manifest_sha256=sha256_bytes(
+            canonical_json_bytes(initial_manifest)
+        ),
+        context_file_count=int(initial_manifest["fileCount"]),
+        context_total_bytes=int(initial_manifest["totalBytes"]),
+    )
     quarantine = denied_paths(
         [str(item["path"]) for item in initial_manifest["files"]],
         config.deny_paths,
@@ -2000,6 +2022,25 @@ def _invoke_lane(
             "sandboxPolicySha256": sandbox_policy_sha256,
         },
     ) as context:
+        require_consent(
+            load_consent(store.root / "consent.json"),
+            repository_identity=str(run["repositoryIdentity"]),
+            provider=provider,
+            operation_class=str(request["operation"]),
+            deny_policy_sha256=str(request["denyPolicySha256"]),
+            managed_policy_sha256=str(request["managedPolicySha256"]),
+            provider_executable_path=str(
+                capability_record["executablePath"]
+            ),
+            provider_executable_sha256=str(
+                capability_record["executableSha256"]
+            ),
+            context_manifest_sha256=sha256_bytes(
+                canonical_json_bytes(context.source_manifest)
+            ),
+            context_file_count=int(context.source_manifest["fileCount"]),
+            context_total_bytes=int(context.source_manifest["totalBytes"]),
+        )
         findings = scan_context(
             candidate.path,
             context.context_manifest,

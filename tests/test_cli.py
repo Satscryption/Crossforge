@@ -651,6 +651,7 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             (),
             crossforge_cli._CONTEXT_POLICY,
         )
+        consent_manifest = crossforge_cli.build_context_manifest(candidate.path)
         record_consent(
             store.root / "consent.json",
             repository_identity=identity,
@@ -660,6 +661,11 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             managed_policy_sha256=managed_hash,
             provider_executable_path=str(executable),
             provider_executable_sha256=sha256_file(executable),
+            context_manifest_sha256=crossforge_cli.sha256_bytes(
+                crossforge_cli.canonical_json_bytes(consent_manifest)
+            ),
+            context_file_count=int(consent_manifest["fileCount"]),
+            context_total_bytes=int(consent_manifest["totalBytes"]),
             ttl_days=90,
         )
         with mock.patch.object(
@@ -796,6 +802,65 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         self.assertEqual(1, store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"])
         self.assertTrue((candidate.path / ".git").is_file())
         self.assertEqual("provider change\n", (candidate.path / "app.txt").read_text())
+        stale_code, stale_stdout, stale_stderr = invoke_cli(
+            "invoke", "--request", str(request), "--json"
+        )
+        self.assertNotEqual(0, stale_code)
+        self.assertIn(
+            "context_manifest_changed",
+            stale_stdout + stale_stderr,
+        )
+        self.assertEqual(
+            1,
+            store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"],
+        )
+        refreshed_manifest = crossforge_cli.build_context_manifest(candidate.path)
+        record_consent(
+            store.root / "consent.json",
+            repository_identity=identity,
+            provider="codex",
+            operation_classes=["implement", "probe"],
+            deny_policy_sha256=deny_hash,
+            managed_policy_sha256=managed_hash,
+            provider_executable_path=str(executable),
+            provider_executable_sha256=sha256_file(executable),
+            context_manifest_sha256=crossforge_cli.sha256_bytes(
+                crossforge_cli.canonical_json_bytes(refreshed_manifest)
+            ),
+            context_file_count=int(refreshed_manifest["fileCount"]),
+            context_total_bytes=int(refreshed_manifest["totalBytes"]),
+            ttl_days=90,
+        )
+
+        class RacingAdapter(FakeAdapter):
+            def probe(
+                self, requested_model: str, effort: str
+            ) -> ProviderProbe:
+                result = super().probe(requested_model, effort)
+                (candidate.path / "app.txt").write_text(
+                    "changed after early consent check\n",
+                    encoding="utf-8",
+                )
+                return result
+
+            def implement(self, **kwargs) -> ProviderInvocation:
+                raise AssertionError("provider must not run after context changes")
+
+        with mock.patch.object(
+            crossforge_cli, "_provider_adapter", return_value=RacingAdapter()
+        ):
+            raced_code, raced_stdout, raced_stderr = invoke_cli(
+                "invoke", "--request", str(request), "--json"
+            )
+        self.assertNotEqual(0, raced_code)
+        self.assertIn(
+            "context_manifest_changed",
+            raced_stdout + raced_stderr,
+        )
+        self.assertEqual(
+            2,
+            store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"],
+        )
 
     def test_forged_capability_cannot_invoke_without_durable_boundary(self) -> None:
         worktree = self.root / "candidate"

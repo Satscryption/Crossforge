@@ -92,16 +92,20 @@ files, binary artifacts, or unrelated source to a provider.
 
 - Provider availability is never consent.
 - Consent binds repository identity, provider, operation class, expiry,
-  deny-policy hash, managed-policy hash, and canonical provider executable.
+  deny-policy hash, managed-policy hash, canonical provider executable, and
+  source-manifest hash and counts.
 - The normal model-invoked skill can only prepare a 15-minute, exact-byte-hash
-  consent request. Its hook blocks direct file-mutation and subagent tools, so
-  it cannot hand-write durable consent around the control CLI.
+  consent request. Its fail-closed hook permits only known tools, blocks writes
+  to durable Crossforge state or any `consent.json`, and allows only the two
+  bundled read-only agent types.
 - Only a directly user-invoked, non-model-invocable consent skill can record
   the request. It permits only the canonical consent transaction; its host
   hook recomputes live bindings and forces a user permission prompt containing
   `consent_summary()` output.
 - Every provider-readable regular file and symlink is manifested with path,
   type, size, and SHA-256.
+- Source-bearing consent is rechecked against the candidate manifest while
+  holding its writer lock, before any provider source access.
 - Denied tracked files are quarantined; denied untracked files are omitted.
 - Binary files require exact path/hash approval.
 - Readable text is secret-scanned; findings expose metadata, never values.

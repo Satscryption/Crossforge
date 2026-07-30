@@ -41,6 +41,9 @@ class ConsentTests(unittest.TestCase):
         self.managed = "c" * 64
         self.executable = str(Path(self.temporary.name) / "bin" / "codex")
         self.executable_sha256 = "e" * 64
+        self.context_manifest_sha256 = "f" * 64
+        self.context_file_count = 2
+        self.context_total_bytes = 99
 
     def record(self, **overrides):
         arguments = {
@@ -51,10 +54,26 @@ class ConsentTests(unittest.TestCase):
             "managed_policy_sha256": self.managed,
             "provider_executable_path": self.executable,
             "provider_executable_sha256": self.executable_sha256,
+            "context_manifest_sha256": self.context_manifest_sha256,
+            "context_file_count": self.context_file_count,
+            "context_total_bytes": self.context_total_bytes,
             "ttl_days": 30,
             "now": self.now,
         }
         arguments.update(overrides)
+        if all(
+            operation == "probe"
+            for operation in arguments["operation_classes"]
+        ):
+            arguments["context_manifest_sha256"] = overrides.get(
+                "context_manifest_sha256"
+            )
+            arguments["context_file_count"] = overrides.get(
+                "context_file_count"
+            )
+            arguments["context_total_bytes"] = overrides.get(
+                "context_total_bytes"
+            )
         return record_consent(self.path, **arguments)
 
     def check(self, record, **overrides):
@@ -66,6 +85,9 @@ class ConsentTests(unittest.TestCase):
             "managed_policy_sha256": self.managed,
             "provider_executable_path": self.executable,
             "provider_executable_sha256": self.executable_sha256,
+            "context_manifest_sha256": self.context_manifest_sha256,
+            "context_file_count": self.context_file_count,
+            "context_total_bytes": self.context_total_bytes,
             "now": self.now + timedelta(days=1),
         }
         arguments.update(overrides)
@@ -125,6 +147,10 @@ class ConsentTests(unittest.TestCase):
         record = self.record()
         self.assertTrue(self.check(load_consent(self.path)))
         self.assertEqual(record["providers"]["codex"]["operationClasses"], ["plan", "probe"])
+        self.assertEqual(
+            record["providers"]["codex"]["contextManifestSha256"],
+            self.context_manifest_sha256,
+        )
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
     def test_expiry(self):
@@ -159,6 +185,32 @@ class ConsentTests(unittest.TestCase):
             provider_executable_sha256="f" * 64,
         )
         self.assertEqual(result.reason, "provider_executable_changed")
+
+    def test_source_context_change_requires_new_consent(self):
+        record = self.record()
+        changed_manifest = self.check(
+            record,
+            context_manifest_sha256="0" * 64,
+        )
+        self.assertEqual(
+            changed_manifest.reason,
+            "context_manifest_changed",
+        )
+        changed_counts = self.check(record, context_total_bytes=100)
+        self.assertEqual(changed_counts.reason, "context_counts_changed")
+
+    def test_probe_ignores_source_context_binding(self):
+        record = self.record(
+            operation_classes=["probe"],
+        )
+        result = self.check(
+            record,
+            operation_class="probe",
+            context_manifest_sha256=None,
+            context_file_count=None,
+            context_total_bytes=None,
+        )
+        self.assertTrue(result)
 
     def test_repository_change_discards_previous_provider_approvals(self):
         self.record()
@@ -284,6 +336,22 @@ class ConsentTests(unittest.TestCase):
             self.record(
                 now=self.now + timedelta(minutes=1),
                 expires_at=self.now + timedelta(days=31),
+            )
+
+    def test_record_consent_accepts_disclosed_expiry_with_clock_skew(self):
+        prepared_at = self.now + timedelta(seconds=5)
+        record = self.record(
+            prepared_at=prepared_at,
+            expires_at=prepared_at + timedelta(days=30),
+        )
+        self.assertEqual(
+            record["providers"]["codex"]["expiresAt"],
+            "2026-08-23T12:00:05Z",
+        )
+        with self.assertRaisesRegex(ConsentError, "clock skew"):
+            self.record(
+                prepared_at=self.now + timedelta(seconds=6),
+                expires_at=self.now + timedelta(days=30),
             )
 
     def test_invalid_ttl_and_unknown_operation_rejected(self):

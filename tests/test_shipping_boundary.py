@@ -23,6 +23,8 @@ class ShippingBoundaryTests(unittest.TestCase):
         environment: dict[str, str] | None = None,
         permission_mode: str = "default",
         tool_name: str = "Bash",
+        tool_input: dict[str, object] | None = None,
+        cwd: Path = PROJECT_ROOT,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             (sys.executable, str(HOOK), mode),
@@ -30,7 +32,12 @@ class ShippingBoundaryTests(unittest.TestCase):
                 {
                     "tool_name": tool_name,
                     "permission_mode": permission_mode,
-                    "tool_input": {"command": command},
+                    "tool_input": (
+                        {"command": command}
+                        if tool_input is None
+                        else tool_input
+                    ),
+                    "cwd": str(cwd),
                 }
             ),
             text=True,
@@ -47,11 +54,64 @@ class ShippingBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(0, self._run("main", local).returncode)
         self.assertEqual(
-            2,
+            0,
             self._run(
-                "deny-mutation",
+                "main",
                 "",
                 tool_name="Write",
+                tool_input={"file_path": str(PROJECT_ROOT / "selection.md")},
+            ).returncode,
+        )
+        common = subprocess.run(
+            ("git", "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            cwd=PROJECT_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            check=True,
+        ).stdout.strip()
+        for protected in (
+            Path(common) / "crossforge" / "run.json",
+            Path(common) / "CROSSFORGE" / "run.json",
+            Path(common).with_name(Path(common).name.upper())
+            / "crossforge"
+            / "run.json",
+            PROJECT_ROOT / "consent.json",
+            PROJECT_ROOT / "Consent.JSON",
+        ):
+            self.assertEqual(
+                2,
+                self._run(
+                    "main",
+                    "",
+                    tool_name="Write",
+                    tool_input={"file_path": str(protected)},
+                ).returncode,
+            )
+        self.assertEqual(
+            2,
+            self._run(
+                "main",
+                "",
+                tool_name="mcp__filesystem__write_file",
+                tool_input={"path": str(PROJECT_ROOT / "forged.json")},
+            ).returncode,
+        )
+        self.assertEqual(
+            0,
+            self._run(
+                "main",
+                "",
+                tool_name="Agent",
+                tool_input={"subagent_type": "crossforge:commitment-advisor"},
+            ).returncode,
+        )
+        self.assertEqual(
+            2,
+            self._run(
+                "main",
+                "",
+                tool_name="Agent",
+                tool_input={"subagent_type": "general-purpose"},
             ).returncode,
         )
         prepare = (
@@ -243,8 +303,8 @@ class ShippingBoundaryTests(unittest.TestCase):
             PROJECT_ROOT / "skills/crossforge-ship/SKILL.md"
         ).read_text(encoding="utf-8")
         self.assertIn("crossforge_boundary.py", main_skill)
-        self.assertIn('matcher: "Write|Edit|NotebookEdit|Agent"', main_skill)
-        self.assertIn("deny-mutation", main_skill)
+        self.assertIn('matcher: "*"', main_skill)
+        self.assertNotIn("deny-mutation", main_skill)
         self.assertIn("disable-model-invocation: true", ship_skill)
         self.assertIn("crossforge_boundary.py", ship_skill)
         consent_skill = (

@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .errors import ConsentError
 from .util import atomic_write_json
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CONSENT_REQUEST_SCHEMA_VERSION = 1
 CONSENT_REQUEST_PRODUCER = "crossforge-consent-request/v1"
 CONSENT_REQUEST_LIFETIME = timedelta(minutes=15)
@@ -184,6 +184,9 @@ def validate_consent(record: Mapping[str, object]) -> dict[str, Any]:
         "managedPolicySha256",
         "providerExecutablePath",
         "providerExecutableSha256",
+        "contextManifestSha256",
+        "contextFileCount",
+        "contextTotalBytes",
         "approvedAt",
         "expiresAt",
     }
@@ -203,9 +206,49 @@ def validate_consent(record: Mapping[str, object]) -> dict[str, Any]:
             isinstance(item, str) for item in raw_operations
         ):
             raise ConsentError("operationClasses must be an array of strings")
+        operations = _validate_operations(raw_operations)
+        source_bearing = any(operation != "probe" for operation in operations)
+        if source_bearing:
+            context_manifest_sha256 = _require_sha256(
+                raw_entry.get("contextManifestSha256"),
+                "contextManifestSha256",
+            )
+            context_file_count = raw_entry.get("contextFileCount")
+            context_total_bytes = raw_entry.get("contextTotalBytes")
+            if (
+                isinstance(context_file_count, bool)
+                or not isinstance(context_file_count, int)
+                or context_file_count < 0
+            ):
+                raise ConsentError(
+                    "contextFileCount must be a non-negative integer"
+                )
+            if (
+                isinstance(context_total_bytes, bool)
+                or not isinstance(context_total_bytes, int)
+                or context_total_bytes < 0
+            ):
+                raise ConsentError(
+                    "contextTotalBytes must be a non-negative integer"
+                )
+        else:
+            if any(
+                raw_entry.get(field) is not None
+                for field in (
+                    "contextManifestSha256",
+                    "contextFileCount",
+                    "contextTotalBytes",
+                )
+            ):
+                raise ConsentError(
+                    "probe-only consent must not contain context metadata"
+                )
+            context_manifest_sha256 = None
+            context_file_count = None
+            context_total_bytes = None
         normalized_providers[provider] = {
             "approved": True,
-            "operationClasses": _validate_operations(raw_operations),
+            "operationClasses": operations,
             "denyPolicySha256": _require_sha256(
                 raw_entry.get("denyPolicySha256"), "denyPolicySha256"
             ),
@@ -224,6 +267,9 @@ def validate_consent(record: Mapping[str, object]) -> dict[str, Any]:
                 raw_entry.get("providerExecutableSha256"),
                 "providerExecutableSha256",
             ),
+            "contextManifestSha256": context_manifest_sha256,
+            "contextFileCount": context_file_count,
+            "contextTotalBytes": context_total_bytes,
             "approvedAt": _format_timestamp(approved_at),
             "expiresAt": _format_timestamp(expires_at),
         }
@@ -482,9 +528,13 @@ def record_consent(
     managed_policy_sha256: str,
     provider_executable_path: str,
     provider_executable_sha256: str,
+    context_manifest_sha256: str | None = None,
+    context_file_count: int | None = None,
+    context_total_bytes: int | None = None,
     ttl_days: int,
     now: datetime | None = None,
     expires_at: datetime | None = None,
+    prepared_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Record explicit approval for one provider.
 
@@ -515,11 +565,43 @@ def record_consent(
     if not isinstance(provider, str) or not provider:
         raise ConsentError("provider must be a non-empty string")
     operations = _validate_operations(operation_classes)
+    source_bearing = any(operation != "probe" for operation in operations)
+    if source_bearing:
+        context_manifest_sha256 = _require_sha256(
+            context_manifest_sha256, "contextManifestSha256"
+        )
+        if (
+            isinstance(context_file_count, bool)
+            or not isinstance(context_file_count, int)
+            or context_file_count < 0
+        ):
+            raise ConsentError("contextFileCount must be a non-negative integer")
+        if (
+            isinstance(context_total_bytes, bool)
+            or not isinstance(context_total_bytes, int)
+            or context_total_bytes < 0
+        ):
+            raise ConsentError("contextTotalBytes must be a non-negative integer")
+    elif any(
+        value is not None
+        for value in (
+            context_manifest_sha256,
+            context_file_count,
+            context_total_bytes,
+        )
+    ):
+        raise ConsentError("probe-only consent must not contain context metadata")
     if isinstance(ttl_days, bool) or not isinstance(ttl_days, int):
         raise ConsentError("ttlDays must be an integer")
     if not 1 <= ttl_days <= 365:
         raise ConsentError("ttlDays must be from 1 through 365")
     approved_at = _as_utc(now or _utc_now())
+    ttl_anchor = (
+        _as_utc(prepared_at) if prepared_at is not None else approved_at
+    )
+    if ttl_anchor > approved_at + timedelta(seconds=5):
+        raise ConsentError("preparedAt is outside the allowed clock skew")
+    ttl_anchor = max(approved_at, ttl_anchor)
     consent_expires_at = (
         _as_utc(expires_at)
         if expires_at is not None
@@ -527,7 +609,7 @@ def record_consent(
     )
     if (
         consent_expires_at <= approved_at
-        or consent_expires_at > approved_at + timedelta(days=ttl_days)
+        or consent_expires_at > ttl_anchor + timedelta(days=ttl_days)
     ):
         raise ConsentError("expiresAt is outside the approved TTL")
 
@@ -542,6 +624,9 @@ def record_consent(
         "managedPolicySha256": managed_policy_sha256,
         "providerExecutablePath": executable_path,
         "providerExecutableSha256": provider_executable_sha256,
+        "contextManifestSha256": context_manifest_sha256,
+        "contextFileCount": context_file_count,
+        "contextTotalBytes": context_total_bytes,
         "approvedAt": _format_timestamp(approved_at),
         "expiresAt": _format_timestamp(consent_expires_at),
     }
@@ -566,6 +651,9 @@ def check_consent(
     managed_policy_sha256: str,
     provider_executable_path: str,
     provider_executable_sha256: str,
+    context_manifest_sha256: str | None = None,
+    context_file_count: int | None = None,
+    context_total_bytes: int | None = None,
     now: datetime | None = None,
 ) -> ConsentCheck:
     """Check consent without mutating state or inferring approval."""
@@ -595,6 +683,20 @@ def check_consent(
         return ConsentCheck(False, "provider_executable_changed")
     if entry["providerExecutableSha256"] != provider_executable_sha256:
         return ConsentCheck(False, "provider_executable_changed")
+    if operation_class != "probe":
+        try:
+            actual_manifest_sha256 = _require_sha256(
+                context_manifest_sha256, "contextManifestSha256"
+            )
+        except ConsentError:
+            return ConsentCheck(False, "context_manifest_missing")
+        if entry["contextManifestSha256"] != actual_manifest_sha256:
+            return ConsentCheck(False, "context_manifest_changed")
+        if (
+            entry["contextFileCount"] != context_file_count
+            or entry["contextTotalBytes"] != context_total_bytes
+        ):
+            return ConsentCheck(False, "context_counts_changed")
     current_time = _as_utc(now or _utc_now())
     if current_time >= _parse_timestamp(entry["expiresAt"], "expiresAt"):
         return ConsentCheck(False, "consent_expired")

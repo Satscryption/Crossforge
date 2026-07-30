@@ -135,13 +135,15 @@ source-free readiness prompt requires `probe` consent. Source-bearing
 operations require consent for their exact provider and operation class.
 
 Consent is also bound to expiry, the deny-policy hash, the discovered
-managed-policy hash, and the exact provider executable path and content hash.
+managed-policy hash, the exact provider executable path and content hash, and
+for source-bearing operations the canonical context-manifest hash and counts.
 The normal skill derives those facts and a context-manifest summary into an
 owner-private request whose exact bytes are valid for at most 15 minutes. It
 cannot approve the request. The separate `crossforge-consent` skill requires
 direct user invocation, revalidates every live binding and the request hash,
 and returns `permissionDecision: ask` from its `PreToolUse` hook with the exact
 non-sensitive disclosure. Only the consent CLI can then write `consent.json`.
+Invocation rechecks the manifest after acquiring the candidate writer lock.
 Provider capability evidence must prove denial of network, outside-worktree
 access, common Git state, orchestration checkout, and credential directories.
 Failed or inconclusive proof marks the provider unavailable.
