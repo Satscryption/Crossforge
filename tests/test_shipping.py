@@ -263,8 +263,8 @@ class ShippingTests(unittest.TestCase):
         with self.assertRaisesRegex(PreconditionError, "clean"):
             self._plan()
 
-    def test_explicit_publication_and_target_change_are_required(self) -> None:
-        with self.assertRaisesRegex(PreconditionError, "authorize publication"):
+    def test_caller_attested_publication_and_target_change_are_required(self) -> None:
+        with self.assertRaisesRegex(PreconditionError, "caller-attested publication"):
             ship_preflight(
                 self.store,  # type: ignore[arg-type]
                 self.repository,
@@ -276,7 +276,10 @@ class ShippingTests(unittest.TestCase):
                 final_gate=self._gate_evidence,
                 inspect_remote=self.remote.inspect,
             )
-        with self.assertRaisesRegex(PreconditionError, "explicit approval"):
+        with self.assertRaisesRegex(
+            PreconditionError,
+            "caller-attested destination approval",
+        ):
             ship_preflight(
                 self.store,  # type: ignore[arg-type]
                 self.repository,
@@ -907,7 +910,7 @@ class ShippingTests(unittest.TestCase):
             idempotency_key=KEY,
             publication_requested=True,
         )
-        with self.assertRaisesRegex(PreconditionError, "authorize publication"):
+        with self.assertRaisesRegex(PreconditionError, "caller-attested publication"):
             reconcile_push(
                 self.store,  # type: ignore[arg-type]
                 self.repository,

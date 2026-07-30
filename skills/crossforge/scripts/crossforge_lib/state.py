@@ -1458,7 +1458,8 @@ class StateStore:
                 self._validate_private_path(decisions, directory=False)
                 if not decisions.read_text(encoding="utf-8").strip():
                     raise PreconditionError(
-                        "blocked task requires a recorded user-approved recovery decision"
+                        "blocked task requires a recorded caller-attested "
+                        "recovery decision"
                     )
                 if task.get("acceptanceIntent") is not None:
                     changes.setdefault("acceptanceIntent", None)

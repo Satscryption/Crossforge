@@ -30,15 +30,21 @@ unambiguously. Never create or depend on a duplicate command alias.
 
 ## Authority and evidence
 
-Keep these five categories explicit in decisions and user summaries:
+Keep these six categories explicit in decisions and user summaries:
 
 - **Claude judgment:** interpret the goal, identify product semantics, classify
   risk upward when uncertain, resolve critiques, choose among eligible
-  candidates, and request user approval.
+  candidates, and ask for workflow approval. Unless a forced
+  user-confirmation hook applies, record the resulting decision as an
+  attestation.
 - **Script-enforced invariants:** configuration, Git identity, locks, canonical
   plan validation and hashing, consent, context screening, provider invocation,
   scope, sandboxed gates, evidence hashes, state transitions, patch
   acceptance, staging, commits, and cleanup.
+- **User-confirmed decisions:** provider consent only. The separate
+  non-model-invocable consent skill forces a host `ask` prompt over the sealed
+  control-generated disclosure before the control layer revalidates and
+  records it.
 - **Caller/model attestations:** plan semantics and `planApproval`, recovery
   decisions, and semantic micro-fix inputs. The control layer validates their
   shape and bindings but does not prove human provenance. Never describe them

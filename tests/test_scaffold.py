@@ -65,34 +65,109 @@ class ScaffoldTests(unittest.TestCase):
         threat_model = (PROJECT_ROOT / "docs/THREAT_MODEL.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("## Assurance vocabulary and orchestrator boundary", threat_model)
-        self.assertIn("**Control-verified**", threat_model)
-        self.assertIn("**User-confirmed**", threat_model)
-        self.assertIn("**Caller-attested** or **model-attested**", threat_model)
-        self.assertIn("`planApproval`", threat_model)
-        self.assertIn("`--publication-requested`", threat_model)
-        self.assertNotIn(
-            "Neither can silently weaken deterministic invariants during a run",
-            threat_model,
-        )
+        normalized_threat_model = " ".join(threat_model.split())
+        for expected in (
+            "## Assurance vocabulary and orchestrator boundary",
+            "**Control-verified**",
+            "**User-confirmed**",
+            "**Caller-attested** or **model-attested**",
+            "`planApproval`",
+            "`--publication-requested`",
+            "cannot authenticate their semantic",
+        ):
+            self.assertIn(" ".join(expected.split()), normalized_threat_model)
 
-        assurance_docs = (
-            "README.md",
-            "CROSSFORGE_BUILD_SPEC.md",
-            "docs/ARCHITECTURE.md",
-            "docs/LIVE_TESTING.md",
-            "skills/crossforge/SKILL.md",
-            "skills/crossforge/references/plan-contract.md",
-            "skills/crossforge/references/recovery.md",
-            "skills/crossforge-ship/SKILL.md",
-            "skills/crossforge-ship/references/shipping-protocol.md",
-        )
-        for relative_path in assurance_docs:
+        required_by_document = {
+            "README.md": (
+                "Trust and assurance boundary",
+                "plan-approval record is model-attested",
+                "destination-override flags are caller-attested",
+            ),
+            "CROSSFORGE_BUILD_SPEC.md": (
+                "**Caller-attested/model-attested:**",
+                "`planApproval`",
+                "`--target-change-approved`",
+            ),
+            "docs/ARCHITECTURE.md": (
+                "Plan content and `planApproval` provenance",
+                "caller-attested approval",
+            ),
+            "docs/IMPLEMENTATION_DECISIONS.md": (
+                "DEV-010",
+                "`planApproval` remains model-attested",
+            ),
+            "docs/LIVE_TESTING.md": (
+                "user-invoked surfaces",
+                "publication/destination flags remain caller-attested",
+            ),
+            "skills/crossforge/SKILL.md": (
+                "**User-confirmed decisions:**",
+                "**Caller/model attestations:**",
+            ),
+            "skills/crossforge/references/candidate-selection.md": (
+                "caller-attested decision",
+            ),
+            "skills/crossforge/references/plan-contract.md": (
+                "approval record",
+                "model-attested",
+                "not human provenance",
+            ),
+            "skills/crossforge/references/recovery.md": (
+                "caller-attested recovery",
+                "cannot authenticate",
+            ),
+            "skills/crossforge/references/worktree-protocol.md": (
+                "caller-attested recovery approval",
+            ),
+            "skills/crossforge-ship/SKILL.md": (
+                "`--publication-requested`",
+                "caller attestations",
+            ),
+            "skills/crossforge-ship/references/shipping-protocol.md": (
+                "`--target-change-approved`",
+                "caller-attested inputs",
+            ),
+        }
+        all_text = threat_model
+        for relative_path, expected_phrases in required_by_document.items():
             with self.subTest(path=relative_path):
                 text = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
-                self.assertTrue(
-                    "caller-attested" in text or "model-attested" in text
-                )
+                all_text += "\n" + text
+                normalized_text = " ".join(text.split())
+                for expected in expected_phrases:
+                    self.assertIn(" ".join(expected.split()), normalized_text)
+
+        normalized_all_text = " ".join(all_text.split())
+        for overclaim in (
+            "Neither can silently weaken deterministic invariants during a run",
+            "user-approved recovery decision",
+            "explicit user approval when host identity differs",
+        ):
+            self.assertNotIn(overclaim, normalized_all_text)
+
+    def test_operator_messages_label_caller_attestations(self) -> None:
+        sources = {
+            relative_path: (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+            for relative_path in (
+                "skills/crossforge/scripts/crossforge.py",
+                "skills/crossforge/scripts/crossforge_lib/locking.py",
+                "skills/crossforge/scripts/crossforge_lib/shipping.py",
+                "skills/crossforge/scripts/crossforge_lib/state.py",
+            )
+        }
+        for relative_path, text in sources.items():
+            with self.subTest(path=relative_path):
+                self.assertIn("caller-attested", text)
+
+        combined = "\n".join(sources.values())
+        for overclaim in (
+            "current user request explicitly authorizes publication",
+            "current user request does not authorize publication",
+            "user-approved recovery decision",
+            "requires explicit approval",
+            "needs explicit approval",
+        ):
+            self.assertNotIn(overclaim, combined)
 
 
 if __name__ == "__main__":
