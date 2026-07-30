@@ -622,7 +622,7 @@ def validate_shipment(value: object) -> dict[str, Any]:
 def _assert_complete_build(
     store: StateStore, repository: GitRepository, run_id: str
 ) -> dict[str, Any]:
-    run = store.load_run(run_id)
+    run, tasks = store.load_state(run_id)
     if run["mode"] != RunMode.BUILD.value or run["status"] not in {
         RunStatus.COMPLETE.value,
         RunStatus.SHIPPED.value,
@@ -630,7 +630,6 @@ def _assert_complete_build(
         raise PreconditionError("only a completed Crossforge build can be shipped")
     if run["activeTaskId"] is not None or run["blockedReason"] is not None:
         raise PreconditionError("run still has an active or blocked task")
-    tasks = store.load_tasks(run_id)
     unfinished = [
         item["id"]
         for item in tasks["tasks"]
@@ -1261,10 +1260,12 @@ def record_shipment(
     completed["completedAt"] = completed["completedAt"] or utc_now()
     result = _write_shipment(store, completed)
     run = store.load_run(run_id)
-    if run["status"] == RunStatus.COMPLETE.value:
-        store.mark_shipped(run_id)
-    elif run["status"] != RunStatus.SHIPPED.value:
+    if run["status"] not in {
+        RunStatus.COMPLETE.value,
+        RunStatus.SHIPPED.value,
+    }:
         raise StateInconsistencyError("run is not complete or shipped")
+    store.mark_shipped_in_transaction(run_id)
     return result
 
 
@@ -1426,11 +1427,12 @@ def resolve_authorized_forge_repository(remote_url: str) -> str:
 
 
 # Serialize authorization and external checkpoints across processes.  The
-# internal implementations remain separate so record_shipment can transition
-# run state without attempting a nested, non-reentrant StateStore lock.
+# internal implementations remain separate so terminal shipment recording can
+# use StateStore's transaction-held shipped transition without nested locks.
 _authorize_shipment_unlocked = authorize_shipment
 _reconcile_push_unlocked = reconcile_push
 _reconcile_pull_request_unlocked = reconcile_pull_request
+_record_shipment_unlocked = record_shipment
 _cancel_shipment_unlocked = cancel_shipment
 
 
@@ -1512,6 +1514,31 @@ def reconcile_pull_request(
                 draft=draft,
                 publication_requested=publication_requested,
                 final_gate=final_gate,
+                forge_identity=forge_identity,
+                runner=runner,
+            )
+
+
+def record_shipment(
+    store: StateStore,
+    repository: GitRepository,
+    *,
+    run_id: str,
+    inspect_remote: Callable[[str, str, str, str], RemoteReadback],
+    push_only: bool,
+    publication_requested: bool,
+    forge_identity: Mapping[str, Any] | ExecutableIdentity | None = None,
+    runner: CommandRunner = default_command_runner,
+) -> dict[str, Any]:
+    with repository_lock(store.root, timeout=getattr(store, "lock_timeout", 0)):
+        with run_lock(store.run_dir(run_id), timeout=getattr(store, "lock_timeout", 0)):
+            return _record_shipment_unlocked(
+                store,
+                repository,
+                run_id=run_id,
+                inspect_remote=inspect_remote,
+                push_only=push_only,
+                publication_requested=publication_requested,
                 forge_identity=forge_identity,
                 runner=runner,
             )

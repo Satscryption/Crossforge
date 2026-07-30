@@ -371,6 +371,13 @@ plan approval, tasks, locks, worktrees, evidence, scope, sandbox, and provider
 capabilities before continuing. It never reconstructs state from conversation
 memory.
 
+Multi-record run/task mutations, including the task-completion interface ledger
+update, use a bound before/after journal while holding the repository lock
+followed by the run lock. Recovery uses the same lock order and behaves as a
+compare-and-swap: it completes only a recognized partial snapshot while the
+active pointer still agrees, removes an already-completed journal
+idempotently, and refuses to overwrite newer or terminal state.
+
 Cleanup operates only on a canonical path recorded under the configured
 worktree root. Dirty captured candidates require successful exact reverse-patch
 proof and a clean result before ordinary `git worktree remove`. Crossforge
@@ -386,7 +393,10 @@ repository identity, run, remote, head, target, and final commit.
 It performs remote readback before each write, never force-pushes, durably
 records a confirmed remote commit before PR work, and creates no PR when an
 exact matching one already exists. A retry resumes from the last shipment
-checkpoint. Dry-run performs no authorization or write.
+checkpoint. Shipment recording and the final run transition share the
+repository→run lock scope, so a retry can finish either side of an interrupted
+terminal checkpoint without racing another shipping mutator. Dry-run performs
+no authorization or write.
 
 ## Security analysis
 

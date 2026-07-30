@@ -80,12 +80,50 @@ _PROCESS_LOCKS: set[str] = set()
 _THREAD_STATE = threading.local()
 
 
+def _ensure_thread_state_pid() -> None:
+    current_pid = os.getpid()
+    if getattr(_THREAD_STATE, "pid", None) != current_pid:
+        _THREAD_STATE.pid = current_pid
+        _THREAD_STATE.held_ranks = []
+        _THREAD_STATE.held_paths = []
+
+
 def _held_ranks() -> list[int]:
+    _ensure_thread_state_pid()
     ranks = getattr(_THREAD_STATE, "held_ranks", None)
     if ranks is None:
         ranks = []
         _THREAD_STATE.held_ranks = ranks
     return ranks
+
+
+def _held_paths() -> list[str]:
+    _ensure_thread_state_pid()
+    paths = getattr(_THREAD_STATE, "held_paths", None)
+    if paths is None:
+        paths = []
+        _THREAD_STATE.held_paths = paths
+    return paths
+
+
+def current_thread_holds_lock(path: str | os.PathLike[str]) -> bool:
+    """Return whether the calling thread owns the exact file lock."""
+
+    return str(Path(path).absolute()) in _held_paths()
+
+
+def _reset_locks_after_fork() -> None:
+    global _PROCESS_LOCKS_GUARD
+
+    _PROCESS_LOCKS_GUARD = threading.Lock()
+    _PROCESS_LOCKS.clear()
+    _THREAD_STATE.pid = os.getpid()
+    _THREAD_STATE.held_ranks = []
+    _THREAD_STATE.held_paths = []
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_locks_after_fork)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -149,10 +187,12 @@ class FileLock:
         self.poll_interval = poll_interval
         self.approve_foreign_stale = approve_foreign_stale
         self.hostname = hostname or socket.gethostname()
-        self.pid = pid or os.getpid()
+        self._pid_override = pid
+        self.pid = pid if pid is not None else os.getpid()
         self.metadata: LockMetadata | None = None
         self._identity: tuple[int, int] | None = None
         self._acquired = False
+        self._owner_pid: int | None = None
 
     def _validate_order(self) -> None:
         ranks = _held_ranks()
@@ -213,8 +253,14 @@ class FileLock:
         return True
 
     def _try_create(self) -> bool:
+        effective_pid = (
+            self._pid_override
+            if self._pid_override is not None
+            else os.getpid()
+        )
+        self.pid = effective_pid
         metadata = LockMetadata(
-            pid=self.pid,
+            pid=effective_pid,
             hostname=self.hostname,
             provider=self.provider,
             worktree=self.worktree,
@@ -274,7 +320,9 @@ class FileLock:
                     # exclusive file creation, which is impossible.
                     _PROCESS_LOCKS.add(key)
                 _held_ranks().append(_LOCK_RANKS[self.kind])
+                _held_paths().append(key)
                 self._acquired = True
+                self._owner_pid = os.getpid()
                 return self
             try:
                 holder, identity = self._read_holder()
@@ -293,6 +341,14 @@ class FileLock:
     def release(self) -> None:
         if not self._acquired:
             return
+        if self._owner_pid != os.getpid():
+            # A forked child inherits the Python object, not ownership of the
+            # parent's live filesystem lock.
+            self._acquired = False
+            self._owner_pid = None
+            self.metadata = None
+            self._identity = None
+            return
         key = str(self.path)
         try:
             try:
@@ -306,10 +362,14 @@ class FileLock:
             _fsync_directory(self.path.parent)
         finally:
             self._acquired = False
+            self._owner_pid = None
             self.metadata = None
             self._identity = None
             with _PROCESS_LOCKS_GUARD:
                 _PROCESS_LOCKS.discard(key)
+            paths = _held_paths()
+            if key in paths:
+                paths.remove(key)
             ranks = _held_ranks()
             rank = _LOCK_RANKS[self.kind]
             if ranks and ranks[-1] == rank:

@@ -264,8 +264,8 @@ def validate_acceptance_state(
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Read and cross-check durable state without transitioning it."""
 
-    run = state_store.load_run(run_id)
-    tasks = state_store.load_tasks(run_id)["tasks"]
+    run, task_record = state_store.load_state(run_id)
+    tasks = task_record["tasks"]
     matches = [task for task in tasks if task["id"] == task_id]
     if len(matches) != 1:
         raise StateInconsistencyError(f"unknown or duplicate task ID: {task_id}")

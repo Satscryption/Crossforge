@@ -206,6 +206,24 @@ retains the intent as audit/retry evidence. If a process stops after staging or
 commit, the next identical request must revalidate repository, candidate, and
 evidence state, then finish or idempotently bind the exact result.
 
+### DEV-007: Multi-record state recovery is snapshot-bound
+
+Task start, exhausted-attempt blocking, and task completion update
+`run.json` and `tasks.json` under the repository lock followed by the run lock.
+Before the first canonical write, a versioned journal records the exact
+operation and before/after snapshots; task completion also binds the
+append-only interface ledger update. Recovery takes the same locks, requires
+the active pointer to name the run, validates every run/task edge, and accepts
+only canonical components equal to a recorded before- or after-image. Newer,
+terminal, malformed, and unsafe legacy partial state fails closed.
+
+Public run/task reads use the same lock pair and can request one coherent
+snapshot. Lock ownership is thread-, process-, and path-bound; forked children
+neither inherit ownership nor release parent locks. Shipping finalization also
+shares the repository/run transaction and repeats its idempotent shipped
+transition on retry, repairing an interrupted `latest-complete` pointer without
+repeating an external publication.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

@@ -24,6 +24,15 @@ Never guess, overwrite evidence, discard changes, or clear a foreign-host lock.
 A same-host stale lock may be cleared only after proving its PID is absent; a
 foreign-host lock requires explicit user approval.
 
+Interrupted mutations of `run.json`, `tasks.json`, and any associated interface
+ledger update are recovered only under `repository.lock` followed by
+`run.lock`. The transaction journal binds the operation and exact before/after
+records. Recovery proceeds only when each canonical record still matches one
+of those snapshots, `active` still names the run, and the recorded run and task
+transitions remain valid. Divergent or legacy partial journals fail closed; an
+after-image-only legacy journal is removed only when both canonical records
+already equal its target.
+
 Blocked tasks resume only after the blocker and user-approved recovery decision
 are appended to `decisions.md`. Use normal transition commands rather than
 editing JSON. `status` is strictly read-only and reports provider availability

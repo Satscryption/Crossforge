@@ -80,6 +80,10 @@ layer—not the skill directly—queries remote state before deciding to write:
    `result: discovered`; if none exists, create one, read it back, and record
    `result: created`.
 5. Mark the run shipped only after recorded state is independently read back.
+   Shipment checkpoint validation, the terminal checkpoint write, and the run
+   transition are serialized under `repository.lock` then `run.lock`. A retry
+   after interruption preserves the first terminal `completedAt` and completes
+   the run transition without repeating an external write.
 
 A retained `performed` or `created` result is not downgraded to `discovered`
 when a retry observes its prior write.
