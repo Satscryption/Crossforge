@@ -28,7 +28,10 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SHELL_SHORT_INLINE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 _SHELL_EXPRESSION = re.compile(r"(?:\$\(|`|&&|\|\||(?:^|[0-9])>>?|<<|[|;])")
 _SENSITIVE_ENVIRONMENT = re.compile(
-    r"(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH|PRIVATE_KEY|SSH_AUTH_SOCK)",
+    r"(?:"
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH|PRIVATE_KEY|"
+    r"SSH_AUTH_SOCK|API_?KEY|ACCESS_?KEY|DATABASE_URL|KUBECONFIG"
+    r")",
     re.IGNORECASE,
 )
 _SHELLS = frozenset(

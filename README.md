@@ -231,6 +231,13 @@ Configuration precedence, highest first:
 
 Objects merge recursively. Arrays replace the lower-precedence array in full.
 Unknown keys, invalid enum values, and out-of-range values are errors.
+Because project configuration is repository-controlled, three security fields
+are tighten-only relative to user configuration and safe defaults:
+`gateEnvironmentAllowlist` and a non-empty
+`gates.executableAllowlist` may only shrink, while `denyPaths` may only grow.
+An empty executable allowlist means the exact executables approved in
+`plan.json`, so a project may replace that implicit set with a narrower
+explicit restriction.
 
 ```json
 {
@@ -310,6 +317,9 @@ Provider and gate timeouts must be 10–7200 seconds, consent TTL 1–365
 days, and micro-fix size 0–10 changed lines. Gate network policy is always
 `deny`. A non-empty gate executable allowlist further restricts—not expands—
 the exact executables approved in `plan.json`.
+Credential-shaped environment names are removed even if allowlisted,
+including API/access keys, tokens, secrets, authentication variables,
+`DATABASE_URL`, and `KUBECONFIG`.
 
 ## State, worktrees, and evidence
 

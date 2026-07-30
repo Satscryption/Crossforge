@@ -101,6 +101,13 @@ class GateTests(unittest.TestCase):
             "LANG": "C",
             "CI": "1",
             "PROVIDER_TOKEN": "secret-value",
+            "OPENAI_API_KEY": "openai-secret",
+            "ANTHROPIC_API_KEY": "anthropic-secret",
+            "XAI_APIKEY": "xai-secret",
+            "AWS_ACCESS_KEY_ID": "aws-secret",
+            "DATABASE_URL": "database-secret",
+            "KUBECONFIG": "/private/kubeconfig",
+            "KEYBOARD_LAYOUT": "gb",
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -108,12 +115,31 @@ class GateTests(unittest.TestCase):
                 (root / name).mkdir()
             environment = minimal_gate_environment(
                 inherited,
-                allowlist=("LANG",),
+                allowlist=(
+                    "LANG",
+                    "OPENAI_API_KEY",
+                    "ANTHROPIC_API_KEY",
+                    "XAI_APIKEY",
+                    "AWS_ACCESS_KEY_ID",
+                    "DATABASE_URL",
+                    "KUBECONFIG",
+                    "KEYBOARD_LAYOUT",
+                ),
                 home=root / "home",
                 tmpdir=root / "tmp",
                 cache=root / "cache",
             )
         self.assertNotIn("PROVIDER_TOKEN", environment)
+        for name in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "XAI_APIKEY",
+            "AWS_ACCESS_KEY_ID",
+            "DATABASE_URL",
+            "KUBECONFIG",
+        ):
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["KEYBOARD_LAYOUT"], "gb")
         recorded = environment_evidence(environment)
         self.assertNotIn("secret-value", repr(recorded))
         self.assertTrue(all(set(item) == {"name", "valueSha256"} for item in recorded))

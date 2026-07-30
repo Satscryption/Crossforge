@@ -118,6 +118,23 @@ user remains responsible for repository classification. An agent run outside
 the installed Crossforge skill hooks shares the user's operating-system
 identity and is outside this plugin-enforced approval boundary.
 
+### Repository-controlled policy weakening
+
+**Threat:** A checked-out `.claude/crossforge.json` removes deny paths, exposes
+additional inherited environment variables, or widens the executables allowed
+to run in an independent gate.
+
+**Mitigations:**
+
+- Safe defaults and user configuration establish the trusted policy floor.
+- Project `denyPaths` must retain every trusted pattern and may only add more.
+- Project gate environment allowlists may only remove trusted names.
+- A project may narrow a non-empty user executable allowlist, never widen or
+  remove it. When the trusted list is empty, a project list adds a restriction
+  to the exact executables already approved in the plan.
+- Credential-shaped environment names are filtered after allowlist merging,
+  including API/access keys, database URLs, and Kubernetes configuration.
+
 ### Git-history disclosure
 
 **Threat:** A linked worktree’s `.git` control file gives provider tools access

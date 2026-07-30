@@ -63,7 +63,7 @@ library.
 
 | Module | Responsibility |
 | --- | --- |
-| `config.py`, `models.py`, `plan.py` | Strict configuration and canonical plan models, validation, rendering, approval hashes, and task materialization |
+| `config.py`, `models.py`, `plan.py` | Trust-separated configuration, canonical plan models, validation, rendering, approval hashes, and task materialization |
 | `git.py`, `scope.py` | Repository discovery and identity, dedicated branches, exact changed-path calculation, mode/symlink checks, and filter-free staging |
 | `state.py`, `locking.py` | Owner-private repository-common state, valid transitions, atomic pointers, and repository/run/writer locks |
 | `consent.py`, `secrets.py` | Byte-bound short-lived consent requests, expiring policy-bound provider consent, deny-path quarantine, complete readable-context manifests, binary controls, and secret screening |
@@ -78,6 +78,12 @@ library.
 The Markdown agents under `agents/` are read-only advisors. They are not
 provider lane supervisors and cannot invoke Bash. Detailed skill protocols live
 under `skills/crossforge/references/`.
+
+User configuration and safe defaults establish the gate/context trust floor.
+Repository-controlled project configuration keeps precedence for ordinary
+settings but cannot add gate environment variables, remove deny paths, or
+widen a non-empty executable restriction. Gate environment construction also
+removes credential-shaped names after allowlist resolution.
 
 ## Plan and run lifecycle
 
