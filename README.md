@@ -187,16 +187,21 @@ secret values in this prompt.
 
 Consent becomes invalid when the repository identity, provider, operation
 class, expiry, deny policy, local exceptions, provider-visible context policy,
-or detected managed policy changes. Provider-readable files count as
-transmitted context even if the prompt does not mention them.
+detected managed policy, or operator-approved provider executable path/hash
+changes. Provider-readable files count as transmitted context even if the
+prompt does not mention them.
 
 Provider capability evidence is not an operator-authored checklist.
 After repository-bound `probe` consent is valid, `record-capability` resolves
-the installed provider executable itself, runs a fresh source-free
+the exact executable pinned when consent was recorded, runs a fresh source-free
 negative-probe transaction, and derives each sandbox result from observed
-filesystem and loopback-network effects. It accepts neither an evidence file
-nor an executable override. Failed, skipped, partial, stale, or caller-writable
-probe inputs leave the provider unavailable.
+filesystem and loopback-network effects. Codex runs the fixed helper directly
+through `codex sandbox`, with no model-authored result path. Grok requires an
+owner-private control-host hook receipt for the exact helper command. The
+parent also re-hashes the helper, sealed specification, hook, and hook settings
+after execution. It accepts neither an evidence file nor an executable
+override. Failed, skipped, forged, mutated, partial, or stale probe inputs
+leave the provider unavailable.
 
 ## Configuration
 

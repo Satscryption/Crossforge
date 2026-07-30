@@ -203,6 +203,39 @@ class ProviderAdapterTests(unittest.TestCase):
         ]
         self.assertEqual(allow_values, ["Read", "Grep", "Glob"])
 
+    def test_current_grok_shape_uses_shared_production_policy(self) -> None:
+        env = dict(self.env)
+        env["FAKE_CURRENT_HELP"] = "1"
+        adapter = GrokCLIAdapter(
+            env=env,
+            capability_source=safe_capability,
+            verification_command_prefixes=(("python3", "-m", "unittest"),),
+        )
+        probe = adapter.probe("auto", "high")
+        self.assertTrue(probe.available, probe)
+
+        result = adapter.implement(
+            spec_path=self.spec,
+            worktree=self.worktree,
+            requested_model="auto",
+            effort="high",
+            timeout_seconds=5,
+            final_output_path=self.root / "grok-current" / "final.txt",
+        )
+
+        self.assertIn("--single", result.argv)
+        self.assertNotIn("--prompt", result.argv)
+        self.assertIn("--disable-web-search", result.argv)
+        tools = result.argv[result.argv.index("--tools") + 1].split(",")
+        self.assertEqual(
+            tools,
+            ["Read", "Search", "ListDir", "Edit", "Execute"],
+        )
+        self.assertEqual(
+            result.argv[result.argv.index("--sandbox") + 1],
+            "workspace-write",
+        )
+
     def test_grok_incompatible_help_and_model_unavailable(self) -> None:
         env = dict(self.env)
         env["FAKE_UNSAFE_HELP"] = "1"

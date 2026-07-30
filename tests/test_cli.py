@@ -23,7 +23,7 @@ if str(SCRIPTS) not in sys.path:
 import crossforge as crossforge_cli  # noqa: E402
 from crossforge_lib.config import load_config  # noqa: E402
 from crossforge_lib.consent import deny_policy_hash, record_consent  # noqa: E402
-from crossforge_lib.errors import InvalidInputError  # noqa: E402
+from crossforge_lib.errors import InvalidInputError, PreconditionError  # noqa: E402
 from crossforge_lib.gates import ProbeCheck, SandboxProbeResult  # noqa: E402
 from crossforge_lib.git import (  # noqa: E402
     discover_repository,
@@ -403,9 +403,13 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             "recordedAt": utc_now(),
             "executablePath": str(executable),
             "executableSha256": sha256_file(executable),
-            "sandboxPolicySha256": "a" * 64,
+            "sandboxPolicySha256": crossforge_cli.provider_sandbox_policy_sha256(
+                "codex"
+            ),
             "managedPolicySha256": managed_hash,
-            "probeContractSha256": "c" * 64,
+            "probeContractSha256": (
+                crossforge_cli.provider_capability_contract_sha256()
+            ),
             "probeResultSha256": "d" * 64,
             "message": "all boundaries proven",
             "sandboxEnforced": True,
@@ -432,12 +436,18 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             operation_classes=["implement", "probe"],
             deny_policy_sha256=deny_hash,
             managed_policy_sha256=managed_hash,
+            provider_executable_path=str(executable),
+            provider_executable_sha256=sha256_file(executable),
             ttl_days=90,
         )
         with mock.patch.object(
             crossforge_cli,
             "produce_provider_capability",
             return_value=capability_record,
+        ), mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, sha256_file(executable)),
         ), mock.patch.object(
             crossforge_cli.shutil,
             "which",
@@ -705,6 +715,8 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             operation_classes=["probe"],
             deny_policy_sha256=deny_hash,
             managed_policy_sha256="b" * 64,
+            provider_executable_path=str(executable),
+            provider_executable_sha256=sha256_file(executable),
             ttl_days=90,
         )
         failed = {
@@ -715,9 +727,13 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             "recordedAt": utc_now(),
             "executablePath": str(executable),
             "executableSha256": sha256_file(executable),
-            "sandboxPolicySha256": "a" * 64,
+            "sandboxPolicySha256": crossforge_cli.provider_sandbox_policy_sha256(
+                "codex"
+            ),
             "managedPolicySha256": "b" * 64,
-            "probeContractSha256": "c" * 64,
+            "probeContractSha256": (
+                crossforge_cli.provider_capability_contract_sha256()
+            ),
             "probeResultSha256": "d" * 64,
             "message": "credential read escaped",
             "sandboxEnforced": True,
@@ -734,6 +750,10 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             crossforge_cli,
             "produce_provider_capability",
             return_value=failed,
+        ), mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, sha256_file(executable)),
         ), mock.patch.object(
             crossforge_cli.shutil,
             "which",
@@ -835,6 +855,48 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
                 provider="codex",
                 executable=str(executable),
             )
+
+    def test_stale_probe_contract_or_policy_is_not_accepted(self) -> None:
+        executable = Path(sys.executable).resolve()
+        record = {
+            "schemaVersion": 2,
+            "producer": crossforge_cli.CAPABILITY_PRODUCER_ID,
+            "provider": "codex",
+            "sourceFree": True,
+            "recordedAt": utc_now(),
+            "executablePath": str(executable),
+            "executableSha256": sha256_file(executable),
+            "sandboxPolicySha256": (
+                crossforge_cli.provider_sandbox_policy_sha256("codex")
+            ),
+            "managedPolicySha256": "b" * 64,
+            "probeContractSha256": (
+                crossforge_cli.provider_capability_contract_sha256()
+            ),
+            "probeResultSha256": "d" * 64,
+            "message": "all boundaries proven",
+            "sandboxEnforced": True,
+            "networkDenied": True,
+            "outsideWriteDenied": True,
+            "credentialReadDenied": True,
+            "orchestrationReadDenied": True,
+            "gitCommonDirReadDenied": True,
+            "outsideSentinelReadDenied": True,
+            "finalOutputProtected": True,
+            "conclusive": True,
+        }
+        for field in ("probeContractSha256", "sandboxPolicySha256"):
+            with self.subTest(field=field):
+                changed = dict(record)
+                changed[field] = "f" * 64
+                with self.assertRaisesRegex(
+                    PreconditionError, "different"
+                ):
+                    crossforge_cli._validate_capability_record(
+                        changed,
+                        provider="codex",
+                        executable=str(executable),
+                    )
 
     def test_source_free_provider_probe_excludes_repository_and_source(self) -> None:
         log = self.root / "probe.jsonl"

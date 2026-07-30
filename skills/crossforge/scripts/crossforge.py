@@ -88,7 +88,10 @@ from crossforge_lib.preflight import (
 )
 from crossforge_lib.provider_capability import (
     PRODUCER_ID as CAPABILITY_PRODUCER_ID,
+    provider_capability_contract_sha256,
+    provider_sandbox_policy_sha256,
     produce_provider_capability,
+    resolve_provider_executable,
 )
 from crossforge_lib.providers.base import CapabilityProbe
 from crossforge_lib.providers.codex_cli import CodexCLIAdapter
@@ -364,6 +367,14 @@ def _validate_capability_record(
     ):
         if len(value[name]) != 64 or any(character not in "0123456789abcdef" for character in value[name]):
             raise InvalidInputError(f"Provider capability field {name} is not SHA-256")
+    if value["probeContractSha256"] != provider_capability_contract_sha256():
+        raise PreconditionError(
+            "Provider capability evidence uses a different probe contract"
+        )
+    if value["sandboxPolicySha256"] != provider_sandbox_policy_sha256(provider):
+        raise PreconditionError(
+            "Provider capability evidence uses a different sandbox policy"
+        )
     try:
         recorded_at = datetime.fromisoformat(
             value["recordedAt"].replace("Z", "+00:00")
@@ -1030,6 +1041,9 @@ def _cmd_route_task(args: argparse.Namespace) -> CommandOutput:
 
 
 def _cmd_record_consent(args: argparse.Namespace) -> CommandOutput:
+    executable_path, executable_sha256 = resolve_provider_executable(
+        args.provider
+    )
     value = record_consent(
         args.path,
         repository_identity=args.repository_identity,
@@ -1037,6 +1051,8 @@ def _cmd_record_consent(args: argparse.Namespace) -> CommandOutput:
         operation_classes=args.operation,
         deny_policy_sha256=args.deny_policy_sha256,
         managed_policy_sha256=args.managed_policy_sha256,
+        provider_executable_path=str(executable_path),
+        provider_executable_sha256=executable_sha256,
         ttl_days=args.ttl_days,
     )
     return CommandOutput(f"Recorded consent for {args.provider}", value)
@@ -1049,8 +1065,12 @@ def _cmd_record_capability(args: argparse.Namespace) -> CommandOutput:
     if run["status"] != RunStatus.ACTIVE.value:
         raise PreconditionError("capability probe requires an active run")
     config = load_config()
+    executable_path, executable_sha256 = resolve_provider_executable(
+        args.provider
+    )
+    consent = load_consent(store.root / "consent.json")
     require_consent(
-        load_consent(store.root / "consent.json"),
+        consent,
         repository_identity=repository_identity(repository),
         provider=args.provider,
         operation_class="probe",
@@ -1061,6 +1081,8 @@ def _cmd_record_capability(args: argparse.Namespace) -> CommandOutput:
             _CONTEXT_POLICY,
         ),
         managed_policy_sha256=args.managed_policy_sha256,
+        provider_executable_path=str(executable_path),
+        provider_executable_sha256=executable_sha256,
     )
     record = produce_provider_capability(
         provider=args.provider,
@@ -1074,6 +1096,8 @@ def _cmd_record_capability(args: argparse.Namespace) -> CommandOutput:
             store.root,
             Path(tempfile.gettempdir()),
         ),
+        expected_executable_path=executable_path,
+        expected_executable_sha256=executable_sha256,
         timeout_seconds=args.timeout_seconds,
     )
     _validate_capability_record(
@@ -1398,6 +1422,9 @@ def _prepare_invoke_lane(
     executable = lane.get("executable")
     if executable is not None and not isinstance(executable, str):
         raise InvalidInputError("invoke lane executable must be a string")
+    executable_path, executable_sha256 = resolve_provider_executable(
+        provider, executable
+    )
     _capability, capability_record = _capability_record(
         _request_value(lane, "capabilityEvidence", str),
         provider=provider,
@@ -1439,6 +1466,8 @@ def _prepare_invoke_lane(
         operation_class=str(request["operation"]),
         deny_policy_sha256=str(request["denyPolicySha256"]),
         managed_policy_sha256=str(request["managedPolicySha256"]),
+        provider_executable_path=str(executable_path),
+        provider_executable_sha256=executable_sha256,
     )
     require_consent(
         load_consent(store.root / "consent.json"),
@@ -1447,6 +1476,8 @@ def _prepare_invoke_lane(
         operation_class="probe",
         deny_policy_sha256=str(request["denyPolicySha256"]),
         managed_policy_sha256=str(request["managedPolicySha256"]),
+        provider_executable_path=str(executable_path),
+        provider_executable_sha256=executable_sha256,
     )
     initial_manifest = build_context_manifest(candidate.path)
     quarantine = denied_paths(

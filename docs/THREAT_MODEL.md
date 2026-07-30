@@ -292,12 +292,18 @@ intentional availability tradeoff. Recovery preserves evidence and requires
 explicit user decisions where automated proof is insufficient.
 
 Provider capability booleans are derived by the control layer, not accepted
-from a caller-authored file. The producer uses a fresh nonce and fixed helper,
-then validates actual filesystem and loopback-network effects. It refuses
-provider executables resolved beneath repository, state, or temporary roots.
-This makes the evidence a control-layer observation; it does not protect
-against a compromised authenticated provider CLI host, which remains out of
-scope.
+from a caller-authored or model-writable result alone. The producer uses a
+fresh nonce and fixed helper, then validates actual filesystem and
+loopback-network effects. Codex uses the CLI's direct sandbox command, avoiding
+a model-authored execution decision. Grok must emit an owner-private
+control-host receipt for the exact helper command; absence or mismatch fails
+closed. Helper, specification, hook, and hook-settings bytes are sealed and
+rechecked after the run. Consent pins the canonical provider executable path
+and hash, and the producer also refuses provider executables beneath
+repository, state, or temporary roots. This makes the evidence a control-layer
+observation; it does not protect against a compromised executable that the
+operator explicitly approved, or a compromised authenticated provider CLI
+host, which remain out of scope.
 
 ## Out of scope
 

@@ -106,13 +106,17 @@ alpha limitation pending dedicated durable non-build transaction state.
 
 `record-capability` runs Crossforge's fixed, source-free negative-probe helper
 through the installed provider's workspace sandbox and atomically binds only
-the resulting producer-marked schema-v2 evidence. The parent observes a
+the resulting producer-marked schema-v2 evidence. Codex uses its direct
+`sandbox` command; Grok requires a control-host hook receipt for the exact
+sealed helper command. The parent rechecks all contract bytes and observes a
 positive workspace control plus denied network, outside-write, credential,
-orchestration, Git-common, outside-sentinel, and final-output operations. The
+orchestration, Git-common, outside-sentinel, and final-output operations.
+`record-consent` pins the resolved executable path and hash. The capability
 command accepts no caller-authored evidence or executable override. A missing
-helper execution, malformed or partial result, unsafe executable location, or
-failed check leaves the provider unavailable. Repository-bound `probe` consent
-is checked before executable resolution or any external request.
+receipt or helper execution, contract mutation, malformed or partial result,
+unsafe or changed executable identity, or failed check leaves the provider
+unavailable. Repository-bound `probe` consent is checked before any external
+provider request.
 
 ## Verification limitations
 

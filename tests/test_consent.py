@@ -33,6 +33,8 @@ class ConsentTests(unittest.TestCase):
         self.repository = "a" * 64
         self.deny = "b" * 64
         self.managed = "c" * 64
+        self.executable = str(Path(self.temporary.name) / "bin" / "codex")
+        self.executable_sha256 = "e" * 64
 
     def record(self, **overrides):
         arguments = {
@@ -41,6 +43,8 @@ class ConsentTests(unittest.TestCase):
             "operation_classes": ["probe", "plan"],
             "deny_policy_sha256": self.deny,
             "managed_policy_sha256": self.managed,
+            "provider_executable_path": self.executable,
+            "provider_executable_sha256": self.executable_sha256,
             "ttl_days": 30,
             "now": self.now,
         }
@@ -54,6 +58,8 @@ class ConsentTests(unittest.TestCase):
             "operation_class": "plan",
             "deny_policy_sha256": self.deny,
             "managed_policy_sha256": self.managed,
+            "provider_executable_path": self.executable,
+            "provider_executable_sha256": self.executable_sha256,
             "now": self.now + timedelta(days=1),
         }
         arguments.update(overrides)
@@ -63,6 +69,16 @@ class ConsentTests(unittest.TestCase):
         result = self.check(None)
         self.assertFalse(result)
         self.assertEqual(result.reason, "missing_consent")
+
+    def test_legacy_unpinned_consent_is_rejected(self):
+        legacy = {
+            "schemaVersion": 1,
+            "repositoryIdentity": self.repository,
+            "providers": {},
+        }
+        result = self.check(legacy)
+        self.assertFalse(result)
+        self.assertEqual(result.reason, "invalid_consent")
 
     def test_valid_consent_is_persisted_owner_only(self):
         record = self.record()
@@ -95,6 +111,13 @@ class ConsentTests(unittest.TestCase):
     def test_managed_policy_change(self):
         result = self.check(self.record(), managed_policy_sha256="d" * 64)
         self.assertEqual(result.reason, "managed_policy_changed")
+
+    def test_provider_executable_change(self):
+        result = self.check(
+            self.record(),
+            provider_executable_sha256="f" * 64,
+        )
+        self.assertEqual(result.reason, "provider_executable_changed")
 
     def test_repository_change_discards_previous_provider_approvals(self):
         self.record()
@@ -138,6 +161,8 @@ class ConsentTests(unittest.TestCase):
             operation_classes=["plan"],
             deny_policy_sha256=self.deny,
             managed_policy_sha256=self.managed,
+            provider_executable_path=self.executable,
+            provider_executable_sha256=self.executable_sha256,
             expires_at=self.now + timedelta(days=30),
             context_manifest={
                 "fileCount": 2,
@@ -148,6 +173,10 @@ class ConsentTests(unittest.TestCase):
         encoded = json.dumps(summary)
         self.assertEqual(summary["contextFileCount"], 2)
         self.assertEqual(summary["contextTotalBytes"], 99)
+        self.assertEqual(
+            summary["providerExecutableSha256Prefix"],
+            self.executable_sha256[:12],
+        )
         self.assertNotIn("findings", encoded)
         self.assertNotIn("must not leak", encoded)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import socket
@@ -17,6 +18,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 from crossforge_lib.provider_capability import (  # noqa: E402
     PRODUCER_ID,
+    provider_capability_contract_sha256,
+    provider_sandbox_policy_sha256,
     produce_provider_capability,
 )
 from crossforge_lib.errors import ProviderUnavailableError  # noqa: E402
@@ -86,6 +89,8 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
         *,
         escaped_field: str | None = None,
         execute: bool = True,
+        record_control_receipt: bool = True,
+        mutate_contract: str | None = None,
     ):
         def run(
             argv: Sequence[str],
@@ -103,16 +108,42 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
             stdout_preview = b""
             if tuple(argv)[1:] == ("--help",):
                 stdout_preview = (
-                    b"--cwd --output-format --permission-mode --sandbox "
+                    b"--cwd --model --output-format --permission-mode --sandbox "
                     b"--disable-web-search --no-subagents --no-memory "
-                    b"--max-turns --tools --allow --single"
+                    b"--max-turns --tools --allow --deny --single"
                 )
                 stdout_path.write_bytes(stdout_preview)
             elif execute:
-                prompt = (stdin_bytes or b"").decode("utf-8")
-                if not prompt and "--single" in argv:
-                    prompt = str(argv[argv.index("--single") + 1])
-                command = shlex.split(prompt.strip().splitlines()[-1])
+                if "sandbox" in argv and "--" in argv:
+                    command = list(argv[argv.index("--") + 1 :])
+                else:
+                    prompt = (stdin_bytes or b"").decode("utf-8")
+                    if not prompt and "--single" in argv:
+                        prompt = str(argv[argv.index("--single") + 1])
+                    if not prompt and "--prompt" in argv:
+                        prompt = str(argv[argv.index("--prompt") + 1])
+                    command = shlex.split(prompt.strip().splitlines()[-1])
+                    if record_control_receipt:
+                        settings = json.loads(
+                            (
+                                cwd / ".claude" / "settings.local.json"
+                            ).read_text(encoding="utf-8")
+                        )
+                        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+                        subprocess.run(
+                            shlex.split(hook["command"]),
+                            input=json.dumps(
+                                {
+                                    "toolName": "Execute",
+                                    "toolInput": {
+                                        "command": shlex.join(command)
+                                    },
+                                }
+                            ).encode("utf-8"),
+                            check=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
                 spec = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
                 Path(spec["workspaceMarker"]).write_text(
                     spec["nonce"], encoding="ascii"
@@ -135,6 +166,17 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
                 Path(command[-1]).write_text(
                     json.dumps(result), encoding="utf-8"
                 )
+                if mutate_contract == "helper":
+                    Path(command[-3]).unlink()
+                    Path(command[-3]).write_text(
+                        "# replaced after execution\n", encoding="utf-8"
+                    )
+                elif mutate_contract == "spec":
+                    Path(command[-2]).write_text("{}", encoding="utf-8")
+                elif mutate_contract == "settings":
+                    settings_path = cwd / ".claude" / "settings.local.json"
+                    settings_path.unlink()
+                    settings_path.write_text("{}", encoding="utf-8")
             return ProcessResult(
                 argv=tuple(argv),
                 exit_code=0,
@@ -158,6 +200,16 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
             git_common_dir=self.git_common,
             orchestration_path=self.orchestration,
             credential_paths=(self.credentials,),
+            expected_executable_path=(
+                self.executable if provider == "codex" else self.grok_executable
+            ),
+            expected_executable_sha256=hashlib.sha256(
+                (
+                    self.executable
+                    if provider == "codex"
+                    else self.grok_executable
+                ).read_bytes()
+            ).hexdigest(),
             timeout_seconds=10,
             runner=runner,
             listener_factory=FakeListener,
@@ -168,6 +220,14 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
 
         self.assertEqual(2, record["schemaVersion"])
         self.assertEqual(PRODUCER_ID, record["producer"])
+        self.assertEqual(
+            provider_capability_contract_sha256(),
+            record["probeContractSha256"],
+        )
+        self.assertEqual(
+            provider_sandbox_policy_sha256("codex"),
+            record["sandboxPolicySha256"],
+        )
         self.assertTrue(record["sourceFree"])
         for field in (
             "sandboxEnforced",
@@ -192,10 +252,21 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
 
     def test_current_grok_cli_shape_uses_same_observed_contract(self) -> None:
         observed_argv: list[tuple[str, ...]] = []
+        observed_environment: list[dict[str, str] | None] = []
+        observed_git_roots: list[bool] = []
         delegate = self._runner()
 
         def recording_runner(argv: Sequence[str], **kwargs: object) -> ProcessResult:
             observed_argv.append(tuple(argv))
+            if "--single" in argv:
+                environment = kwargs.get("env")
+                observed_environment.append(
+                    dict(environment) if isinstance(environment, dict) else None
+                )
+                cwd = kwargs["cwd"]
+                observed_git_roots.append(
+                    isinstance(cwd, Path) and (cwd / ".git" / "HEAD").is_file()
+                )
             return delegate(argv, **kwargs)
 
         record = self._produce(recording_runner, provider="grok")
@@ -207,6 +278,77 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
         self.assertTrue(
             invocation[invocation.index("--allow") + 1].startswith("Execute(")
         )
+        self.assertNotIn(":*)", invocation[invocation.index("--allow") + 1])
+        self.assertEqual("0", observed_environment[0]["GROK_FOLDER_TRUST"])
+        self.assertEqual([True], observed_git_roots)
+
+    def test_codex_uses_direct_sandbox_without_model_prompt(self) -> None:
+        observed_argv: list[tuple[str, ...]] = []
+        delegate = self._runner()
+
+        def recording_runner(argv: Sequence[str], **kwargs: object) -> ProcessResult:
+            observed_argv.append(tuple(argv))
+            return delegate(argv, **kwargs)
+
+        record = self._produce(recording_runner)
+
+        self.assertTrue(record["conclusive"])
+        invocation = observed_argv[-1]
+        self.assertEqual("sandbox", invocation[1])
+        self.assertIn("--permission-profile", invocation)
+        self.assertEqual(
+            ":workspace",
+            invocation[invocation.index("--permission-profile") + 1],
+        )
+        self.assertIn("--include-managed-config", invocation)
+        self.assertNotIn("exec", invocation)
+
+    def test_grok_forged_result_without_control_receipt_is_inconclusive(self) -> None:
+        record = self._produce(
+            self._runner(record_control_receipt=False),
+            provider="grok",
+        )
+
+        self.assertIs(record["conclusive"], False)
+        self.assertIn("conclusive", record["message"])
+
+    def test_grok_control_hook_denies_any_nonexact_command(self) -> None:
+        command = "/usr/bin/python3 /sealed/probe.py"
+        command_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        nonce = "d" * 64
+        receipt = self.root / "hook-receipt.json"
+        hook = SCRIPTS / "provider_capability_hook.py"
+
+        denied = subprocess.run(
+            (
+                sys.executable,
+                str(hook),
+                command_sha256,
+                nonce,
+                str(receipt),
+            ),
+            input=json.dumps(
+                {
+                    "toolName": "Execute",
+                    "toolInput": {"command": command + "; touch FORGED"},
+                }
+            ).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(2, denied.returncode)
+        self.assertFalse(receipt.exists())
+
+    def test_contract_mutation_is_inconclusive(self) -> None:
+        for target in ("helper", "spec", "settings"):
+            with self.subTest(target=target):
+                record = self._produce(
+                    self._runner(mutate_contract=target),
+                    provider="grok",
+                )
+                self.assertIs(record["conclusive"], False)
 
     def test_successful_forbidden_read_fails_closed(self) -> None:
         record = self._produce(
@@ -234,6 +376,44 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
                 orchestration_path=self.orchestration,
                 credential_paths=(self.credentials,),
                 forbidden_executable_roots=(self.root,),
+                expected_executable_path=self.executable,
+                expected_executable_sha256=hashlib.sha256(
+                    self.executable.read_bytes()
+                ).hexdigest(),
+                timeout_seconds=10,
+                runner=self._runner(),
+                listener_factory=FakeListener,
+            )
+
+    def test_executable_without_prior_operator_pin_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ProviderUnavailableError, "operator-approved identity"
+        ):
+            produce_provider_capability(
+                provider="codex",
+                executable=str(self.executable),
+                managed_policy_sha256="a" * 64,
+                git_common_dir=self.git_common,
+                orchestration_path=self.orchestration,
+                credential_paths=(self.credentials,),
+                timeout_seconds=10,
+                runner=self._runner(),
+                listener_factory=FakeListener,
+            )
+
+    def test_executable_different_from_operator_pin_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ProviderUnavailableError, "operator-approved identity"
+        ):
+            produce_provider_capability(
+                provider="codex",
+                executable=str(self.executable),
+                managed_policy_sha256="a" * 64,
+                git_common_dir=self.git_common,
+                orchestration_path=self.orchestration,
+                credential_paths=(self.credentials,),
+                expected_executable_path=self.executable,
+                expected_executable_sha256="f" * 64,
                 timeout_seconds=10,
                 runner=self._runner(),
                 listener_factory=FakeListener,
@@ -250,6 +430,10 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
                 git_common_dir=self.git_common,
                 orchestration_path=self.orchestration,
                 credential_paths=(self.credentials,),
+                expected_executable_path=self.executable,
+                expected_executable_sha256=hashlib.sha256(
+                    self.executable.read_bytes()
+                ).hexdigest(),
                 timeout_seconds=10,
                 runner=self._runner(),
                 listener_factory=FailingListener,
@@ -260,7 +444,7 @@ class ProviderCapabilityProducerTests(unittest.TestCase):
 
         def replacing_runner(argv: Sequence[str], **kwargs: object) -> ProcessResult:
             result = delegate(argv, **kwargs)
-            if tuple(argv)[1:2] == ("exec",):
+            if tuple(argv)[1:2] == ("sandbox",):
                 self.executable.write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
                 self.executable.chmod(
                     self.executable.stat().st_mode | stat.S_IXUSR

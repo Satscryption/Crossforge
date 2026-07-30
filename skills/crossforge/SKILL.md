@@ -159,8 +159,10 @@ Read only the references required for the selected mode:
 4. Resolve the canonical repository identity and the discovered managed-policy
    hash from control-layer output.
 5. Before a remote readiness call, show the provider, `probe` operation,
-   identity and policy-hash prefixes, expiry, and quota warning. Obtain an
-   explicit affirmative response, then use `record-consent`.
+   identity and policy-hash prefixes, canonical provider executable path and
+   content-hash prefix, expiry, and quota warning. Obtain an explicit
+   affirmative response, then use `record-consent`; that transaction pins the
+   executable identity.
 6. Only after valid `probe` consent, let `preflight` or `invoke` perform the
    fixed source-free readiness call. A probe contains no path, remote, file
    name, or source.
@@ -173,8 +175,8 @@ the control-layer candidate projection. Show the operation class, context file
 count and total bytes, policy hashes, and expiry—never findings or contents.
 Version 0.1.0 records `implement` or build-task `review` consent for external
 lanes; `plan` and standalone `review` are local-only. A provider change,
-expanded operation, repository change, expiry, or policy-hash change requires
-new consent.
+expanded operation, repository change, expiry, policy-hash change, or provider
+executable path/content change requires new consent.
 
 ## Plan mode
 
