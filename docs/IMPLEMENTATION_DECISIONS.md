@@ -224,6 +224,21 @@ shares the repository/run transaction and repeats its idempotent shipped
 transition on retry, repairing an interrupted `latest-complete` pointer without
 repeating an external publication.
 
+### DEV-008: State paths are repository-bound at the command boundary
+
+Every CLI surface that accepts or derives a Git common directory also
+discovers the target repository and requires exact resolved-path equality
+before reading state or causing side effects. Direct state commands expose the
+repository option, durable routing validates it only when state recording is
+requested, and the request-based task-finishing command validates its embedded
+Git common directory against the separately supplied repository.
+
+The check is centralized so status, initialization, task start/routing/finish,
+capability recording, completion, abandonment, and shipping use the same
+fail-closed rule. Cross-repository regression tests assert that rejected
+commands leave both repositories, run records, task records, and pointers
+unchanged.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

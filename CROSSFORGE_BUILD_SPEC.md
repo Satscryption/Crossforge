@@ -832,6 +832,13 @@ Create state and evidence directories with mode `0700` and files with mode
 `0600`, subject to the platform umask. Refuse to use an existing state path
 owned by another user or writable by group/other. WSL follows POSIX behavior.
 
+Every command that reads or mutates durable state must discover the supplied
+repository and require the resolved Git common directory to equal that
+repository's common Git directory before any state read, state write, provider
+call, or repository mutation. This applies equally to an explicit
+`--git-common-dir` and to a Git common directory carried inside a request
+record. A mismatch fails closed as inconsistent state.
+
 ### Run ID
 
 Use:
