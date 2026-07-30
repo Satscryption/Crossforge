@@ -9,6 +9,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import secrets as random_secrets
 import shutil
 import stat
@@ -30,6 +31,7 @@ from crossforge_lib.acceptance import (
     build_commit_message,
     check_micro_fix as assess_micro_fix,
     validate_acceptance_state,
+    verify_candidate_gates,
 )
 from crossforge_lib.consent import (
     CONSENT_REQUEST_LIFETIME,
@@ -71,7 +73,7 @@ from crossforge_lib.git import (
     resolve_commit,
     run_git,
 )
-from crossforge_lib.locking import run_lock
+from crossforge_lib.locking import repository_lock, run_lock
 from crossforge_lib.models import (
     Budget,
     ProviderStatus,
@@ -117,7 +119,14 @@ from crossforge_lib.routing import (
     promotion_decision,
     route_task,
 )
-from crossforge_lib.scope import check_scope, changed_entries, enforce_scope, read_allowlist
+from crossforge_lib.scope import (
+    check_scope,
+    changed_entries,
+    enforce_scope,
+    parse_allowlist,
+    read_allowlist,
+    scoped_tree_hash,
+)
 from crossforge_lib.secrets import (
     DETECTOR_NAMES,
     build_context_manifest,
@@ -861,20 +870,371 @@ def _load_bound_provider_report(
     return report
 
 
-def _gate_result_objects(values: Any) -> tuple[SimpleNamespace, ...]:
-    if not isinstance(values, list):
-        raise InvalidInputError("independentGateResults must be an array")
-    results: list[SimpleNamespace] = []
-    for value in values:
-        if not isinstance(value, Mapping):
-            raise InvalidInputError("independent gate results must be objects")
-        results.append(
-            SimpleNamespace(
-                passed=value.get("passed") is True,
-                provenance=value.get("provenance"),
-            )
+def _read_private_evidence_file(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+) -> tuple[Path, bytes]:
+    """Open evidence without following links and return bytes from that same fd."""
+
+    root = root.expanduser().absolute()
+    lexical = path.expanduser().absolute()
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as exc:
+        raise StateInconsistencyError(
+            f"{label} is outside canonical selection evidence"
+        ) from exc
+    if not relative.parts or any(
+        component in {"", ".", ".."} for component in relative.parts
+    ):
+        raise StateInconsistencyError(f"{label} path is not canonical")
+    root_parts = root.parts[1:]
+    lexical_parts = lexical.parts[1:]
+    if lexical_parts[: len(root_parts)] != root_parts:
+        raise StateInconsistencyError(
+            f"{label} is outside canonical selection evidence"
         )
-    return tuple(results)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+
+    def validate_private_directory(descriptor: int) -> None:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise StateInconsistencyError(
+                f"{label} parent is not a directory"
+            )
+        if info.st_mode & 0o077:
+            raise StateInconsistencyError(
+                f"{label} parent permissions are not private"
+            )
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise StateInconsistencyError(
+                f"{label} parent is not owned by the current user"
+            )
+
+    try:
+        descriptor = os.open(Path(root.anchor), directory_flags)
+        descriptors.append(descriptor)
+        for index, component in enumerate(lexical_parts[:-1], start=1):
+            descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=descriptor,
+            )
+            descriptors.append(descriptor)
+            if index >= len(root_parts):
+                validate_private_directory(descriptor)
+        file_descriptor = os.open(
+            lexical_parts[-1],
+            file_flags,
+            dir_fd=descriptor,
+        )
+        descriptors.append(file_descriptor)
+        info = os.fstat(file_descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise StateInconsistencyError(
+                f"{label} is not a regular file"
+            )
+        if info.st_nlink != 1:
+            raise StateInconsistencyError(
+                f"{label} must have exactly one hard link"
+            )
+        if info.st_mode & 0o077:
+            raise StateInconsistencyError(
+                f"{label} permissions are not private"
+            )
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise StateInconsistencyError(
+                f"{label} is not owned by the current user"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return lexical, b"".join(chunks)
+    except FileNotFoundError as exc:
+        raise StateInconsistencyError(f"{label} is missing") from exc
+    except OSError as exc:
+        raise StateInconsistencyError(
+            f"{label} cannot be opened safely"
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _load_selected_gate_receipt(
+    context: _ActiveCandidateContext,
+    candidate: WorktreeEntry,
+    task: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    receipt_path = task.get("selectedGateEvidencePath")
+    receipt_sha256 = task.get("selectedGateEvidenceSha256")
+    if (
+        not isinstance(receipt_path, str)
+        or not receipt_path
+        or not isinstance(receipt_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)
+        or candidate.captured_patch_sha256 is None
+    ):
+        raise StateInconsistencyError(
+            "selected candidate has no bound independent gate evidence"
+        )
+    gate_root = (
+        context.store.run_dir(context.run_id)
+        / "evidence"
+        / candidate.task_id
+        / "selection-gates"
+        / (
+            f"{candidate.provider}-"
+            f"{candidate.captured_patch_sha256[:12]}"
+        )
+    )
+    _, receipt_bytes = _read_private_evidence_file(
+        gate_root,
+        Path(receipt_path),
+        label="selected gate receipt",
+    )
+    if sha256_bytes(receipt_bytes) != receipt_sha256:
+        raise StateInconsistencyError(
+            "selected gate receipt differs from durable selection"
+        )
+    try:
+        receipt = json.loads(receipt_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise StateInconsistencyError(
+            "selected gate receipt is invalid JSON"
+        ) from exc
+    expected_fields = {
+        "schemaVersion",
+        "producer",
+        "repositoryIdentity",
+        "runId",
+        "planSha256",
+        "taskId",
+        "attempt",
+        "taskPolicySha256",
+        "provider",
+        "candidatePath",
+        "baseCommit",
+        "capturedPatchSha256",
+        "gatePolicySha256",
+        "gateCommandsSha256",
+        "quarantinePathsSha256",
+        "verifiedScopedTreeSha256",
+        "verificationWorktree",
+        "verificationCleanup",
+        "gateResults",
+        "passed",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_fields:
+        raise StateInconsistencyError(
+            "selected gate receipt has an invalid schema"
+        )
+    gate_policy = context.run.get("gateSandbox")
+    if not isinstance(gate_policy, Mapping):
+        raise StateInconsistencyError(
+            "active run has no durable gate sandbox policy"
+        )
+    task_policy = {
+        key: task[key]
+        for key in (
+            "id",
+            "baseCommit",
+            "allowedFiles",
+            "approvedBinaryContext",
+            "approvedSymlinks",
+            "verificationCommands",
+        )
+    }
+    expected = (
+        1,
+        "crossforge-selection-gates-v1",
+        context.run["repositoryIdentity"],
+        context.run_id,
+        context.run["planSha256"],
+        task["id"],
+        sha256_bytes(canonical_json_bytes(task_policy)),
+        candidate.provider,
+        str(candidate.path),
+        candidate.base_commit,
+        candidate.captured_patch_sha256,
+        sha256_bytes(canonical_json_bytes(dict(gate_policy))),
+        sha256_bytes(
+            canonical_json_bytes(task["verificationCommands"])
+        ),
+        "cleaned",
+        True,
+    )
+    observed = (
+        receipt["schemaVersion"],
+        receipt["producer"],
+        receipt["repositoryIdentity"],
+        receipt["runId"],
+        receipt["planSha256"],
+        receipt["taskId"],
+        receipt["taskPolicySha256"],
+        receipt["provider"],
+        receipt["candidatePath"],
+        receipt["baseCommit"],
+        receipt["capturedPatchSha256"],
+        receipt["gatePolicySha256"],
+        receipt["gateCommandsSha256"],
+        receipt["verificationCleanup"],
+        receipt["passed"],
+    )
+    if observed != expected:
+        raise StateInconsistencyError(
+            "selected gate receipt is not bound to the durable candidate"
+        )
+    attempt = receipt["attempt"]
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise StateInconsistencyError(
+            "selected gate receipt has an invalid attempt"
+        )
+    if (
+        not isinstance(receipt["quarantinePathsSha256"], str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", receipt["quarantinePathsSha256"]
+        )
+        or not isinstance(receipt["verifiedScopedTreeSha256"], str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", receipt["verifiedScopedTreeSha256"]
+        )
+        or not isinstance(receipt["verificationWorktree"], str)
+        or not receipt["verificationWorktree"]
+    ):
+        raise StateInconsistencyError(
+            "selected gate receipt has invalid verification metadata"
+        )
+    results = receipt["gateResults"]
+    commands = task["verificationCommands"]
+    if not isinstance(results, list) or len(results) != len(commands):
+        raise StateInconsistencyError(
+            "selected gate receipt does not contain every durable gate"
+        )
+    result_fields = {
+        "argv",
+        "workingDirectory",
+        "startedAt",
+        "completedAt",
+        "durationMs",
+        "exitCode",
+        "timedOut",
+        "outputPath",
+        "outputSha256",
+        "executable",
+        "sandboxBackend",
+        "sandboxPolicyPath",
+        "sandboxPolicySha256",
+        "environment",
+        "provenance",
+        "passed",
+    }
+    for index, (result, command) in enumerate(
+        zip(results, commands, strict=True), start=1
+    ):
+        result_name = (
+            f"selection-{task['id']}-attempt-{attempt:02d}-"
+            f"{index:02d}"
+        )
+        if (
+            not isinstance(result, dict)
+            or set(result) != result_fields
+            or result["argv"] != command["argv"]
+            or result["workingDirectory"]
+            != receipt["verificationWorktree"]
+            or result["timedOut"] is not False
+            or result["exitCode"] != 0
+            or result["passed"] is not True
+            or result["provenance"] != "independent"
+            or result["outputPath"]
+            != f"independent/gates/{result_name}.output"
+            or result["sandboxPolicyPath"]
+            != f"independent/gates/{result_name}.sandbox-policy.json"
+        ):
+            raise StateInconsistencyError(
+                "selected gate result is invalid or out of order"
+            )
+        expected_result_path = gate_root / (
+            f"independent/gates/{result_name}.result.json"
+        )
+        _, result_bytes = _read_private_evidence_file(
+            gate_root,
+            expected_result_path,
+            label=f"selected gate result {index}",
+        )
+        try:
+            stored_result = json.loads(result_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise StateInconsistencyError(
+                f"selected gate result {index} is invalid JSON"
+            ) from exc
+        if stored_result != result:
+            raise StateInconsistencyError(
+                f"selected gate result {index} differs from its receipt"
+            )
+        policy_bytes: bytes | None = None
+        for path_field, hash_field, label in (
+            ("outputPath", "outputSha256", "output"),
+            (
+                "sandboxPolicyPath",
+                "sandboxPolicySha256",
+                "sandbox policy",
+            ),
+        ):
+            relative = result[path_field]
+            digest = result[hash_field]
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                raise StateInconsistencyError(
+                    f"selected gate {label} reference is invalid"
+                )
+            _, artifact_bytes = _read_private_evidence_file(
+                gate_root,
+                gate_root / relative,
+                label=f"selected gate {label} {index}",
+            )
+            if sha256_bytes(artifact_bytes) != digest:
+                raise StateInconsistencyError(
+                    f"selected gate {label} {index} hash changed"
+                )
+            if path_field == "sandboxPolicyPath":
+                policy_bytes = artifact_bytes
+        if policy_bytes is None:
+            raise StateInconsistencyError(
+                f"selected gate sandbox policy {index} is missing"
+            )
+        try:
+            policy = json.loads(policy_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise StateInconsistencyError(
+                f"selected gate sandbox policy {index} is invalid JSON"
+            ) from exc
+        if (
+            not isinstance(policy, dict)
+            or policy.get("worktree")
+            != receipt["verificationWorktree"]
+            or policy.get("network") != "deny"
+            or policy.get("backend") != result["sandboxBackend"]
+        ):
+            raise StateInconsistencyError(
+                f"selected gate sandbox policy {index} is not bound"
+            )
+    return receipt
 
 
 def _acceptance_gate_factory(
@@ -971,6 +1331,38 @@ def _effective_gate_executable_allowlist(
     configured_names = set(configured)
     effective = planned & configured_names if configured_names else planned
     return tuple(sorted(effective))
+
+
+def _trusted_gate_specification(
+    *,
+    run: Mapping[str, Any],
+    repository: GitRepository,
+    gates: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    config = load_config()
+    backend_request = (
+        run["gateSandbox"].get("backend", "auto")
+        if isinstance(run.get("gateSandbox"), Mapping)
+        else "auto"
+    )
+    backend, executable = detect_sandbox_backend(backend_request)
+    credential_directories = list(_trusted_credential_directories())
+    return {
+        "backend": backend,
+        "executable": executable,
+        "environmentAllowlist": list(config.gate_environment_allowlist),
+        "readOnlyPaths": [str(path) for path in trusted_gate_read_only_paths()],
+        "repositoryGitDir": str(repository.common_git_dir),
+        "credentialDirectories": [
+            str(path) for path in credential_directories
+        ],
+        "executableAllowlist": list(
+            _effective_gate_executable_allowlist(
+                gates,
+                config.gates.executable_allowlist,
+            )
+        ),
+    }
 
 
 def _cmd_version(_args: argparse.Namespace) -> CommandOutput:
@@ -2822,6 +3214,22 @@ def _cmd_capture_candidate(args: argparse.Namespace) -> CommandOutput:
 
 def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
     value = _read_json_object(args.request, label="record-selection request")
+    required = frozenset(
+        {
+            "repository",
+            "gitCommonDir",
+            "worktreeRoot",
+            "registry",
+            "runId",
+            "taskId",
+            "candidatePath",
+            "providerReport",
+            "patchPath",
+            "planGuardrailsPassed",
+            "publicContractApproved",
+            "generatedAndBinaryContentExplained",
+        }
+    )
     context = _active_candidate_context(
         repository_path=_request_value(value, "repository", str),
         worktree_root=_request_value(value, "worktreeRoot", str),
@@ -2830,37 +3238,180 @@ def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
         git_common_dir=_request_value(value, "gitCommonDir", str),
         run_id=_request_value(value, "runId", str),
     )
+    _exact_request_keys(
+        value,
+        allowed=required | {"repositoryIdPrefix"},
+        required=required,
+        label="record-selection request",
+    )
     task = _active_candidate_task(
         context,
         _request_value(value, "taskId", str),
-        allowed_statuses=(TaskStatus.IN_PROGRESS.value,),
+        allowed_statuses=(
+            TaskStatus.IN_PROGRESS.value,
+            TaskStatus.CANDIDATE_READY.value,
+        ),
     )
     candidate = context.manager.registry.get(
         _request_value(value, "candidatePath", str)
     )
     _require_candidate_matches_task(candidate, task)
     repository = discover_repository(candidate.path)
-    allowlist = read_allowlist(
-        _request_value(value, "allowlistPath", str),
+    allowlist = parse_allowlist(
+        task["allowedFiles"],
         root=repository.root,
     )
-    approved_symlinks = value.get("approvedSymlinks", {})
     scope_result = enforce_scope(
         repository,
-        base_commit=_request_value(value, "taskBaseCommit", str),
+        base_commit=str(task["baseCommit"]),
         allowlist=allowlist,
-        approved_symlinks=approved_symlinks,
+        approved_symlinks=task["approvedSymlinks"],
     )
     report_path = _request_value(value, "providerReport", str)
     report = _load_bound_provider_report(context, candidate, report_path)
-    gate_results = _gate_result_objects(value.get("independentGateResults"))
+    if candidate.captured_patch_sha256 is None:
+        raise StateInconsistencyError(
+            "candidate has no durably captured patch"
+        )
+    if task["status"] == TaskStatus.CANDIDATE_READY.value:
+        retry_updates = {
+            "selectedCandidate": candidate.provider,
+            "selectedCandidatePath": str(candidate.path.resolve()),
+            "selectedGateEvidencePath": task.get(
+                "selectedGateEvidencePath"
+            ),
+            "selectedGateEvidenceSha256": task.get(
+                "selectedGateEvidenceSha256"
+            ),
+            "selectedInvocationEvidencePath": (
+                str(candidate.invocation_evidence_path.resolve())
+                if candidate.invocation_evidence_path is not None
+                else None
+            ),
+            "selectedInvocationEvidenceSha256": (
+                candidate.invocation_evidence_sha256
+            ),
+        }
+        patch_file = Path(
+            _request_value(value, "patchPath", str)
+        ).expanduser()
+        if (
+            not patch_file.is_file()
+            or patch_file.is_symlink()
+            or sha256_file(patch_file)
+            != candidate.captured_patch_sha256
+        ):
+            raise StateInconsistencyError(
+                "selection retry differs from durable candidate state"
+            )
+        receipt_holder: dict[str, Mapping[str, Any]] = {}
+
+        def validate_retry() -> None:
+            if context.manager.registry.get(candidate.path) != candidate:
+                raise StateInconsistencyError(
+                    "candidate changed before selection retry"
+                )
+            _load_bound_provider_report(context, candidate, report_path)
+            receipt_holder["receipt"] = _load_selected_gate_receipt(
+                context, candidate, {**task, **retry_updates}
+            )
+
+        transitioned = context.store.bind_candidate_selection(
+            context.run_id,
+            str(task["id"]),
+            expected_run=context.run,
+            expected_task=task,
+            updates=retry_updates,
+            validate_evidence=validate_retry,
+        )
+        receipt = receipt_holder["receipt"]
+        return CommandOutput(
+            "Candidate selection already recorded",
+            {
+                "idempotent": True,
+                "gateVerification": {
+                    "receiptPath": task["selectedGateEvidencePath"],
+                    "receiptSha256": task[
+                        "selectedGateEvidenceSha256"
+                    ],
+                    "verifiedScopedTreeSha256": receipt[
+                        "verifiedScopedTreeSha256"
+                    ],
+                    "verificationCleanup": receipt[
+                        "verificationCleanup"
+                    ],
+                },
+                "task": transitioned,
+            },
+        )
+    config = load_config()
+
+    def resolve_quarantine(worktree: Path) -> Sequence[str]:
+        manifest = build_context_manifest(worktree)
+        return denied_paths(
+            [str(item["path"]) for item in manifest["files"]],
+            config.deny_paths,
+        )
+
+    if not isinstance(context.run.get("gateSandbox"), Mapping):
+        raise StateInconsistencyError(
+            "active run has no durable gate sandbox policy"
+        )
+    gate_evidence = EvidenceStore(
+        context.store.run_dir(context.run_id)
+        / "evidence"
+        / str(task["id"])
+        / "selection-gates"
+        / (
+            f"{candidate.provider}-"
+            f"{candidate.captured_patch_sha256[:12]}"
+        )
+    )
+    gate_verification = verify_candidate_gates(
+        repository=context.repository,
+        worktree_manager=context.manager,
+        run_id=context.run_id,
+        task_id=str(task["id"]),
+        candidate=candidate,
+        patch_path=_request_value(value, "patchPath", str),
+        gate_runner_factory=_acceptance_gate_factory(
+            _trusted_gate_specification(
+                run=context.run,
+                repository=context.repository,
+                gates=task["verificationCommands"],
+            )
+        ),
+        evidence_store=gate_evidence,
+        state_root=context.store.root,
+        durable_task_policy=task,
+        repository_identity=str(context.run["repositoryIdentity"]),
+        plan_sha256=str(context.run["planSha256"]),
+        gate_policy=context.run["gateSandbox"],
+        quarantine_resolver=resolve_quarantine,
+    )
+    if context.manager.registry.get(candidate.path) != candidate:
+        raise StateInconsistencyError(
+            "candidate changed during independent gate verification"
+        )
+    report = _load_bound_provider_report(context, candidate, report_path)
+    _load_selected_gate_receipt(
+        context,
+        candidate,
+        {
+            **task,
+            "selectedGateEvidencePath": gate_verification.receipt_path,
+            "selectedGateEvidenceSha256": (
+                gate_verification.receipt_sha256
+            ),
+        },
+    )
     result = assess_candidate_eligibility(
         candidate=candidate,
         patch_path=_request_value(value, "patchPath", str),
-        task_base_commit=_request_value(value, "taskBaseCommit", str),
+        task_base_commit=str(task["baseCommit"]),
         scope_result=scope_result,
         provider_report=report,
-        independent_gate_results=gate_results,
+        independent_gate_results=gate_verification.gate_results,
         plan_guardrails_passed=value.get("planGuardrailsPassed") is True,
         public_contract_approved=value.get("publicContractApproved") is True,
         generated_and_binary_content_explained=(
@@ -2872,26 +3423,59 @@ def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
             "Selected candidate did not pass mandatory eligibility gates",
             details=result.to_dict(),
         )
-    transitioned = context.store.transition_task(
+    selection_updates = {
+        "selectedCandidate": candidate.provider,
+        "selectedCandidatePath": str(candidate.path.resolve()),
+        "selectedGateEvidencePath": gate_verification.receipt_path,
+        "selectedGateEvidenceSha256": (
+            gate_verification.receipt_sha256
+        ),
+        "selectedInvocationEvidencePath": (
+            str(candidate.invocation_evidence_path.resolve())
+            if candidate.invocation_evidence_path is not None
+            else None
+        ),
+        "selectedInvocationEvidenceSha256": (
+            candidate.invocation_evidence_sha256
+        ),
+    }
+
+    def validate_selection_binding() -> None:
+        if context.manager.registry.get(candidate.path) != candidate:
+            raise StateInconsistencyError(
+                "candidate changed before selection binding"
+            )
+        _load_bound_provider_report(context, candidate, report_path)
+        _load_selected_gate_receipt(
+            context,
+            candidate,
+            {**task, **selection_updates},
+        )
+
+    transitioned = context.store.bind_candidate_selection(
         context.run_id,
         str(task["id"]),
-        TaskStatus.CANDIDATE_READY,
-        updates={
-            "selectedCandidate": candidate.provider,
-            "selectedCandidatePath": str(candidate.path.resolve()),
-            "selectedInvocationEvidencePath": (
-                str(candidate.invocation_evidence_path.resolve())
-                if candidate.invocation_evidence_path is not None
-                else None
-            ),
-            "selectedInvocationEvidenceSha256": (
-                candidate.invocation_evidence_sha256
-            ),
-        },
+        expected_run=context.run,
+        expected_task=task,
+        updates=selection_updates,
+        validate_evidence=validate_selection_binding,
     )
     return CommandOutput(
         "Candidate selection recorded",
-        {"eligibility": result.to_dict(), "task": transitioned},
+        {
+            "eligibility": result.to_dict(),
+            "gateVerification": {
+                "receiptPath": gate_verification.receipt_path,
+                "receiptSha256": gate_verification.receipt_sha256,
+                "verifiedScopedTreeSha256": (
+                    gate_verification.verified_scoped_tree_sha256
+                ),
+                "verificationCleanup": (
+                    gate_verification.verification_cleanup
+                ),
+            },
+            "task": transitioned,
+        },
     )
 
 
@@ -2955,6 +3539,9 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         raise StateInconsistencyError(
             "candidate path differs from the durable selection"
         )
+    selected_gate_receipt = _load_selected_gate_receipt(
+        context, candidate, task
+    )
     if candidate.provider in {"codex", "grok"}:
         if (
             candidate.invocation_evidence_sha256 is None
@@ -2989,11 +3576,55 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
     allowlist = task["allowedFiles"]
     evidence = EvidenceStore(_request_value(value, "evidenceRoot", str))
     config = load_config()
-    candidate_manifest = build_context_manifest(candidate.path)
-    quarantine = denied_paths(
-        [str(item["path"]) for item in candidate_manifest["files"]],
-        config.deny_paths,
-    )
+    def resolve_quarantine(worktree: Path) -> Sequence[str]:
+        manifest = build_context_manifest(worktree)
+        return denied_paths(
+            [str(item["path"]) for item in manifest["files"]],
+            config.deny_paths,
+        )
+
+    def validate_selection_evidence(
+        verified_tree_sha256: str,
+        quarantine_paths_sha256: str,
+    ) -> None:
+        if (
+            store.active_run_id() != run_id
+            or store.load_run(run_id) != run
+        ):
+            raise StateInconsistencyError(
+                "active run changed during acceptance"
+            )
+        fresh_tasks = store.load_tasks(run_id)["tasks"]
+        fresh_matches = [
+            item for item in fresh_tasks if item["id"] == task_id
+        ]
+        if len(fresh_matches) != 1 or fresh_matches[0] != task:
+            raise StateInconsistencyError(
+                "selected task changed during acceptance"
+            )
+        if manager.registry.get(candidate.path) != candidate:
+            raise StateInconsistencyError(
+                "candidate changed during acceptance"
+            )
+        fresh_receipt = _load_selected_gate_receipt(
+            context, candidate, task
+        )
+        if (
+            fresh_receipt["verifiedScopedTreeSha256"]
+            != verified_tree_sha256
+            or fresh_receipt["quarantinePathsSha256"]
+            != quarantine_paths_sha256
+        ):
+            raise StateInconsistencyError(
+                "selection evidence does not match acceptance verification"
+            )
+        if fresh_receipt != selected_gate_receipt:
+            raise StateInconsistencyError(
+                "selection evidence changed during acceptance"
+            )
+        if candidate.provider in {"codex", "grok"}:
+            _load_bound_provider_report(context, candidate)
+
     backend_request = (
         run["gateSandbox"].get("backend", "auto")
         if isinstance(run.get("gateSandbox"), Mapping)
@@ -3015,6 +3646,77 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
             )
         ),
     }
+    accepted_holder: dict[str, Mapping[str, Any]] = {}
+
+    def finalize_acceptance(acceptance_result: Any) -> None:
+        expected_head = (
+            acceptance_result.commit
+            if acceptance_result.commit is not None
+            else candidate.base_commit
+        )
+        if resolve_commit(repository, "HEAD") != expected_head:
+            raise StateInconsistencyError(
+                "orchestration HEAD changed before acceptance binding"
+            )
+        if acceptance_result.commit is not None and run_git(
+            repository.root,
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            git_executable=repository.git_executable,
+        ).stdout_bytes:
+            raise StateInconsistencyError(
+                "orchestration checkout changed before acceptance binding"
+            )
+        if acceptance_result.commit is None:
+            canonical_allowlist = parse_allowlist(task["allowedFiles"])
+            enforce_scope(
+                repository,
+                base_commit=candidate.base_commit,
+                allowlist=canonical_allowlist,
+                approved_symlinks=task["approvedSymlinks"],
+            )
+            if scoped_tree_hash(
+                repository.root,
+                canonical_allowlist,
+                approved_symlinks={
+                    item["path"]: item["target"]
+                    for item in task["approvedSymlinks"]
+                },
+            ) != acceptance_result.applied_scoped_tree_sha256:
+                raise StateInconsistencyError(
+                    "orchestration tree changed before acceptance binding"
+                )
+            staged_diff = run_git(
+                repository.root,
+                [
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    candidate.base_commit,
+                    "--",
+                ],
+                git_executable=repository.git_executable,
+            ).stdout_bytes
+            if sha256_bytes(staged_diff) != candidate.captured_patch_sha256:
+                raise StateInconsistencyError(
+                    "orchestration index changed before acceptance binding"
+                )
+        accepted_holder["task"] = (
+            store.bind_candidate_acceptance_in_transaction(
+                run_id,
+                task_id,
+                expected_run=run,
+                expected_task=task,
+                selected_provider=candidate.provider,
+                commit=acceptance_result.commit,
+                validate_evidence=lambda: validate_selection_evidence(
+                    acceptance_result.verified_scoped_tree_sha256,
+                    acceptance_result.quarantine_paths_sha256,
+                ),
+            )
+        )
+
     result = perform_acceptance(
         repository=repository,
         worktree_manager=manager,
@@ -3033,24 +3735,18 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         approved_symlinks=task["approvedSymlinks"],
         approved_binary_context=task["approvedBinaryContext"],
         approved_binary_outputs=(),
-        quarantine_paths=quarantine,
+        quarantine_resolver=resolve_quarantine,
+        pre_apply_validator=validate_selection_evidence,
+        acceptance_finalizer=finalize_acceptance,
         no_commit=bool(run["noCommit"]),
         task_count=len(store.load_tasks(run_id)["tasks"]),
         keep_verification_worktree=value.get("keepVerificationWorktree") is True,
         durable_task_policy=task,
     )
-    accepted = store.transition_task(
-        run_id,
-        task_id,
-        TaskStatus.ACCEPTED,
-        updates={"selectedCandidate": candidate.provider},
-    )
-    if result.commit is not None:
-        accepted = store.transition_task(
-            run_id,
-            task_id,
-            TaskStatus.COMMITTED,
-            updates={"commit": result.commit},
+    accepted = accepted_holder.get("task")
+    if accepted is None:
+        raise StateInconsistencyError(
+            "acceptance completed without a durable task binding"
         )
     return CommandOutput(
         "Candidate accepted",
@@ -3146,25 +3842,28 @@ def _cmd_cleanup(args: argparse.Namespace) -> CommandOutput:
             RunStatus.BLOCKED.value,
         ),
     )
-    candidate = context.manager.registry.get(args.worktree)
-    task = _active_candidate_task(
-        context,
-        candidate.task_id,
-        allowed_statuses=(
-            TaskStatus.IN_PROGRESS.value,
-            TaskStatus.CANDIDATE_READY.value,
-            TaskStatus.ACCEPTED.value,
-            TaskStatus.COMMITTED.value,
-            TaskStatus.BLOCKED.value,
-        ),
-    )
-    _require_candidate_matches_task(candidate, task)
-    entry = context.manager.cleanup(
-        candidate,
-        args.patch,
-        evidence_durable=args.evidence_durable,
-        retention_permits=not args.retain,
-    )
+    with repository_lock(
+        context.store.root, timeout=context.store.lock_timeout
+    ):
+        candidate = context.manager.registry.get(args.worktree)
+        task = _active_candidate_task(
+            context,
+            candidate.task_id,
+            allowed_statuses=(
+                TaskStatus.IN_PROGRESS.value,
+                TaskStatus.CANDIDATE_READY.value,
+                TaskStatus.ACCEPTED.value,
+                TaskStatus.COMMITTED.value,
+                TaskStatus.BLOCKED.value,
+            ),
+        )
+        _require_candidate_matches_task(candidate, task)
+        entry = context.manager.cleanup(
+            candidate,
+            args.patch,
+            evidence_durable=args.evidence_durable,
+            retention_permits=not args.retain,
+        )
     return CommandOutput("Candidate cleanup complete", entry.to_json())
 
 

@@ -2088,7 +2088,7 @@ quarantined control file and repository-common Git directory.
 
 ### Candidate capture
 
-After scope and candidate gates:
+After scope:
 
 1. Mark untracked allowlisted files intent-to-add so they appear in diff.
 2. Capture:
@@ -2104,6 +2104,15 @@ After scope and candidate gates:
    the captured patch hash is unchanged.
 
 Do not commit from inside the provider invocation.
+
+After capture, selection must apply the exact recorded patch to a fresh
+verification worktree and run every durable task gate in order. Gate commands,
+allowlist, symlink approvals, sandbox policy, evidence root, and provenance are
+control-derived; `record-selection` must reject caller-supplied gate-result
+objects. Record a receipt bound to the repository, run, plan, task policy,
+candidate, provider, base, patch hash, scoped-tree hash, sandbox policy, and
+complete result/output hashes. Bind its canonical path and exact digest to the
+selected task and revalidate it during acceptance.
 
 ### Cleanup
 

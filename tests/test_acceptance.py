@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -15,11 +16,13 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "crossforge" / "scrip
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import crossforge as crossforge_cli  # noqa: E402
 from crossforge_lib.acceptance import (  # noqa: E402
     accept_candidate,
     assess_candidate_eligibility,
     build_commit_message,
     check_micro_fix,
+    verify_candidate_gates,
 )
 from crossforge_lib.evidence import EvidenceStore  # noqa: E402
 from crossforge_lib.errors import (  # noqa: E402
@@ -29,7 +32,14 @@ from crossforge_lib.errors import (  # noqa: E402
     StateInconsistencyError,
 )
 from crossforge_lib.git import discover_repository, resolve_commit  # noqa: E402
+from crossforge_lib.gates import ExecutableIdentity, GateResult  # noqa: E402
+from crossforge_lib.locking import LockHeldError, repository_lock  # noqa: E402
 from crossforge_lib.scope import check_scope  # noqa: E402
+from crossforge_lib.util import (  # noqa: E402
+    canonical_json_bytes,
+    sha256_bytes,
+    sha256_file,
+)
 from crossforge_lib.worktrees import WorktreeManager  # noqa: E402
 
 
@@ -69,6 +79,66 @@ class FakeGateRunner:
         if self.mutate:
             (self.root / "app.txt").write_text("gate-mutated\n", encoding="utf-8")
         return FakeGateResult(self.passed)
+
+
+class BoundFakeGateRunner:
+    def __init__(
+        self,
+        root: Path,
+        evidence: EvidenceStore,
+        *,
+        passed: bool = True,
+        mutate: bool = False,
+    ):
+        self.policy = SimpleNamespace(worktree=str(root))
+        self.root = root
+        self.evidence = evidence
+        self.passed = passed
+        self.mutate = mutate
+
+    def run(self, command, *, result_name: str, **_kwargs):
+        if self.mutate:
+            (self.root / "app.txt").write_text(
+                "gate-mutated\n", encoding="utf-8"
+            )
+        policy = self.evidence.write_independent_json(
+            f"gates/{result_name}.sandbox-policy.json",
+            {
+                "backend": "fake",
+                "worktree": str(self.root),
+                "network": "deny",
+            },
+        )
+        output = self.evidence.write_text(
+            f"independent/gates/{result_name}.output",
+            "ok\n" if self.passed else "failed\n",
+        )
+        result = GateResult(
+            argv=command.argv,
+            working_directory=str(self.root),
+            started_at="2026-07-24T12:00:00Z",
+            completed_at="2026-07-24T12:00:01Z",
+            duration_ms=1,
+            exit_code=0 if self.passed else 1,
+            timed_out=False,
+            output_path=output.relative_path,
+            output_sha256=output.sha256,
+            executable=ExecutableIdentity(
+                basename="true",
+                path="/usr/bin/true",
+                mode=0o100755,
+                sha256="a" * 64,
+            ),
+            sandbox_backend="fake",
+            sandbox_policy_path=policy.relative_path,
+            sandbox_policy_sha256=policy.sha256,
+            environment=(),
+        )
+        self.evidence.write_independent_json(
+            f"gates/{result_name}.result.json",
+            result.as_dict(),
+        )
+        return result
 
 
 class AcceptanceCase(unittest.TestCase):
@@ -183,6 +253,285 @@ class AcceptanceCase(unittest.TestCase):
 
 
 class AcceptanceTests(AcceptanceCase):
+    def test_selection_gates_are_control_run_against_captured_patch(self):
+        candidate, patch = self.candidate()
+        run_directory = self.sandbox / "state" / "run-1"
+        evidence = EvidenceStore(
+            run_directory
+            / "evidence"
+            / "T1"
+            / "selection-gates"
+            / f"codex-{candidate.captured_patch_sha256[:12]}"
+        )
+        runners = []
+
+        def factory(root, store):
+            runner = BoundFakeGateRunner(root, store)
+            runners.append(runner)
+            return runner
+
+        policy = {
+            "id": "T1",
+            "baseCommit": self.base,
+            "allowedFiles": ["app.txt"],
+            "verificationCommands": [
+                {"argv": ["true"], "timeoutSeconds": 10},
+                {"argv": ["true", "--version"], "timeoutSeconds": 20},
+            ],
+            "approvedSymlinks": [],
+            "approvedBinaryContext": [],
+        }
+        result = verify_candidate_gates(
+            repository=self.repository,
+            worktree_manager=self.manager,
+            run_id="run-1",
+            task_id="T1",
+            candidate=candidate,
+            patch_path=patch,
+            gate_runner_factory=factory,
+            evidence_store=evidence,
+            state_root=self.state_root,
+            durable_task_policy=policy,
+            repository_identity="b" * 64,
+            plan_sha256="c" * 64,
+            gate_policy={"backend": "fake", "network": "deny"},
+            quarantine_resolver=lambda root: (
+                self.assertNotEqual(root, candidate.path) or ["app.txt"]
+            ),
+        )
+
+        self.assertEqual(2, len(result.gate_results))
+        self.assertEqual("cleaned", result.verification_cleanup)
+        self.assertFalse(Path(result.verification_worktree).exists())
+        self.assertEqual(result.receipt_sha256, sha256_file(result.receipt_path))
+        self.assertEqual(resolve_commit(self.repository, "HEAD"), self.base)
+        self.assertEqual(
+            git(self.repository_path, "status", "--porcelain").stdout,
+            b"",
+        )
+        self.assertEqual(1, len(runners))
+        self.assertNotEqual(runners[0].root, self.repository_path)
+
+        selected_task = {
+            **policy,
+            "selectedGateEvidencePath": result.receipt_path,
+            "selectedGateEvidenceSha256": result.receipt_sha256,
+        }
+        context = SimpleNamespace(
+            store=SimpleNamespace(run_dir=lambda _run_id: run_directory),
+            run_id="run-1",
+            run={
+                "repositoryIdentity": "b" * 64,
+                "planSha256": "c" * 64,
+                "gateSandbox": {"backend": "fake", "network": "deny"},
+            },
+        )
+        receipt = crossforge_cli._load_selected_gate_receipt(
+            context,
+            candidate,
+            selected_task,
+        )
+        self.assertTrue(receipt["passed"])
+        self.assertEqual(
+            sha256_bytes(canonical_json_bytes(["app.txt"])),
+            receipt["quarantinePathsSha256"],
+        )
+
+        output = evidence.root / receipt["gateResults"][0]["outputPath"]
+        output.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            StateInconsistencyError,
+            "output 1 hash changed",
+        ):
+            crossforge_cli._load_selected_gate_receipt(
+                context,
+                candidate,
+                selected_task,
+            )
+
+    def test_gate_evidence_with_multiple_hard_links_is_rejected(self):
+        candidate, patch = self.candidate()
+        run_directory = self.sandbox / "state" / "run-1"
+        evidence = EvidenceStore(
+            run_directory
+            / "evidence"
+            / "T1"
+            / "selection-gates"
+            / f"codex-{candidate.captured_patch_sha256[:12]}"
+        )
+        policy = {
+            "id": "T1",
+            "baseCommit": self.base,
+            "allowedFiles": ["app.txt"],
+            "verificationCommands": [
+                {"argv": ["true"], "timeoutSeconds": 10}
+            ],
+            "approvedSymlinks": [],
+            "approvedBinaryContext": [],
+        }
+        result = verify_candidate_gates(
+            repository=self.repository,
+            worktree_manager=self.manager,
+            run_id="run-1",
+            task_id="T1",
+            candidate=candidate,
+            patch_path=patch,
+            gate_runner_factory=lambda root, store: BoundFakeGateRunner(
+                root, store
+            ),
+            evidence_store=evidence,
+            state_root=self.state_root,
+            durable_task_policy=policy,
+            repository_identity="b" * 64,
+            plan_sha256="c" * 64,
+            gate_policy={"backend": "fake", "network": "deny"},
+        )
+        receipt = json.loads(Path(result.receipt_path).read_text())
+        output = evidence.root / receipt["gateResults"][0]["outputPath"]
+        os.link(output, output.with_suffix(".linked"))
+        context = SimpleNamespace(
+            store=SimpleNamespace(
+                run_dir=lambda _run_id: run_directory
+            ),
+            run_id="run-1",
+            run={
+                "repositoryIdentity": "b" * 64,
+                "planSha256": "c" * 64,
+                "gateSandbox": {"backend": "fake", "network": "deny"},
+            },
+        )
+        selected_task = {
+            **policy,
+            "selectedGateEvidencePath": result.receipt_path,
+            "selectedGateEvidenceSha256": result.receipt_sha256,
+        }
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "exactly one hard link"
+        ):
+            crossforge_cli._load_selected_gate_receipt(
+                context, candidate, selected_task
+            )
+
+    def test_gate_evidence_with_symlinked_ancestor_is_rejected(self):
+        candidate, patch = self.candidate()
+        run_directory = self.sandbox / "state" / "run-1"
+        selection_root = (
+            run_directory / "evidence" / "T1" / "selection-gates"
+        )
+        evidence = EvidenceStore(
+            selection_root
+            / f"codex-{candidate.captured_patch_sha256[:12]}"
+        )
+        policy = {
+            "id": "T1",
+            "baseCommit": self.base,
+            "allowedFiles": ["app.txt"],
+            "verificationCommands": [
+                {"argv": ["true"], "timeoutSeconds": 10}
+            ],
+            "approvedSymlinks": [],
+            "approvedBinaryContext": [],
+        }
+        result = verify_candidate_gates(
+            repository=self.repository,
+            worktree_manager=self.manager,
+            run_id="run-1",
+            task_id="T1",
+            candidate=candidate,
+            patch_path=patch,
+            gate_runner_factory=lambda root, store: BoundFakeGateRunner(
+                root, store
+            ),
+            evidence_store=evidence,
+            state_root=self.state_root,
+            durable_task_policy=policy,
+            repository_identity="b" * 64,
+            plan_sha256="c" * 64,
+            gate_policy={"backend": "fake", "network": "deny"},
+        )
+        replay_root = run_directory / "replayed-selection-gates"
+        selection_root.rename(replay_root)
+        selection_root.symlink_to(replay_root, target_is_directory=True)
+        context = SimpleNamespace(
+            store=SimpleNamespace(run_dir=lambda _run_id: run_directory),
+            run_id="run-1",
+            run={
+                "repositoryIdentity": "b" * 64,
+                "planSha256": "c" * 64,
+                "gateSandbox": {"backend": "fake", "network": "deny"},
+            },
+        )
+        selected_task = {
+            **policy,
+            "selectedGateEvidencePath": result.receipt_path,
+            "selectedGateEvidenceSha256": result.receipt_sha256,
+        }
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "cannot be opened safely"
+        ):
+            crossforge_cli._load_selected_gate_receipt(
+                context, candidate, selected_task
+            )
+
+    def test_selection_gate_mutation_cannot_produce_receipt(self):
+        candidate, patch = self.candidate()
+        evidence = EvidenceStore(self.sandbox / "state" / "selection-mutated")
+        policy = {
+            "id": "T1",
+            "baseCommit": self.base,
+            "allowedFiles": ["app.txt"],
+            "verificationCommands": [
+                {"argv": ["true"], "timeoutSeconds": 10}
+            ],
+            "approvedSymlinks": [],
+            "approvedBinaryContext": [],
+        }
+
+        def factory(root, store):
+            return BoundFakeGateRunner(
+                root,
+                store,
+                mutate=True,
+            )
+
+        with self.assertRaises(GateFailureError):
+            verify_candidate_gates(
+                repository=self.repository,
+                worktree_manager=self.manager,
+                run_id="run-1",
+                task_id="T1",
+                candidate=candidate,
+                patch_path=patch,
+                gate_runner_factory=factory,
+                evidence_store=evidence,
+                state_root=self.state_root,
+                durable_task_policy=policy,
+                repository_identity="b" * 64,
+                plan_sha256="c" * 64,
+                gate_policy={"backend": "fake", "network": "deny"},
+            )
+        self.assertFalse(list(evidence.root.glob("**/*.suite.json")))
+
+        retried = verify_candidate_gates(
+            repository=self.repository,
+            worktree_manager=self.manager,
+            run_id="run-1",
+            task_id="T1",
+            candidate=candidate,
+            patch_path=patch,
+            gate_runner_factory=lambda root, store: BoundFakeGateRunner(
+                root, store
+            ),
+            evidence_store=evidence,
+            state_root=self.state_root,
+            durable_task_policy=policy,
+            repository_identity="b" * 64,
+            plan_sha256="c" * 64,
+            gate_policy={"backend": "fake", "network": "deny"},
+        )
+        receipt = json.loads(Path(retried.receipt_path).read_text())
+        self.assertEqual(2, receipt["attempt"])
+
     def test_fresh_verification_exact_staging_and_safe_commit(self):
         hook_marker = self.sandbox / "hook-ran"
         hook = self.repository.git_dir / "hooks" / "pre-commit"
@@ -214,6 +563,51 @@ class AcceptanceTests(AcceptanceCase):
         self.assertFalse(hook_marker.exists())
         self.assertEqual(len(runners), 1)
         self.assertNotEqual(runners[0].root.resolve(), self.repository_path.resolve())
+
+    def test_selection_binding_is_revalidated_before_orchestration_apply(self):
+        candidate, patch = self.candidate()
+        observed = []
+
+        def reject(tree_sha256, quarantine_sha256):
+            observed.append((tree_sha256, quarantine_sha256))
+            raise StateInconsistencyError("selection evidence changed")
+
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "selection evidence changed"
+        ):
+            self.accept(
+                candidate,
+                patch,
+                quarantine_resolver=lambda root: ["app.txt"],
+                pre_apply_validator=reject,
+            )
+        self.assertEqual(1, len(observed))
+        self.assertEqual(
+            sha256_bytes(canonical_json_bytes(["app.txt"])),
+            observed[0][1],
+        )
+        self.assertEqual(resolve_commit(self.repository, "HEAD"), self.base)
+        self.assertEqual(
+            (self.repository_path / "app.txt").read_text(encoding="utf-8"),
+            "base\n",
+        )
+
+    def test_acceptance_finalizer_runs_inside_repository_transaction(self):
+        candidate, patch = self.candidate()
+        finalized = []
+
+        def finalize(result):
+            finalized.append(result.commit)
+            with self.assertRaises(LockHeldError):
+                with repository_lock(self.state_root, timeout=0):
+                    self.fail("repository lock was released before finalizer")
+
+        self.accept(
+            candidate,
+            patch,
+            acceptance_finalizer=finalize,
+        )
+        self.assertEqual(1, len(finalized))
 
     def test_gate_failure_leaves_orchestration_clean_at_base(self):
         candidate, patch = self.candidate()

@@ -11,7 +11,7 @@ import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .errors import PreconditionError, StateInconsistencyError
 from .locking import repository_lock, run_lock
@@ -137,6 +137,8 @@ _TASK_FIELDS = {
 }
 _TASK_OPTIONAL_FIELDS = {
     "selectedCandidatePath",
+    "selectedGateEvidencePath",
+    "selectedGateEvidenceSha256",
     "selectedInvocationEvidencePath",
     "selectedInvocationEvidenceSha256",
 }
@@ -345,6 +347,7 @@ def validate_tasks_record(value: object) -> dict[str, Any]:
         _require_string(task["commit"], f"task {task['id']}.commit", nullable=True)
         for field in (
             "selectedCandidatePath",
+            "selectedGateEvidencePath",
             "selectedInvocationEvidencePath",
         ):
             _require_string(
@@ -352,14 +355,18 @@ def validate_tasks_record(value: object) -> dict[str, Any]:
                 f"task {task['id']}.{field}",
                 nullable=True,
             )
-        selected_evidence = task.get("selectedInvocationEvidenceSha256")
-        if selected_evidence is not None and (
-            not isinstance(selected_evidence, str)
-            or not _SHA256.fullmatch(selected_evidence)
+        for field in (
+            "selectedGateEvidenceSha256",
+            "selectedInvocationEvidenceSha256",
         ):
-            raise StateInconsistencyError(
-                f"task {task['id']}.selectedInvocationEvidenceSha256 is invalid"
-            )
+            selected_evidence = task.get(field)
+            if selected_evidence is not None and (
+                not isinstance(selected_evidence, str)
+                or not _SHA256.fullmatch(selected_evidence)
+            ):
+                raise StateInconsistencyError(
+                    f"task {task['id']}.{field} is invalid"
+                )
     dependencies = {
         dependency
         for task in record["tasks"]
@@ -787,6 +794,23 @@ class StateStore:
         if target not in _TASK_STATUSES:
             raise StateInconsistencyError(f"unknown task status: {target}")
         run_directory = self.run_dir(run_id)
+        with repository_lock(self.root, timeout=self.lock_timeout):
+            return self._transition_task_locked(
+                run_directory,
+                run_id,
+                task_id,
+                target,
+                updates or {},
+            )
+
+    def _transition_task_locked(
+        self,
+        run_directory: Path,
+        run_id: str,
+        task_id: str,
+        target: str,
+        updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
         with run_lock(run_directory, timeout=self.lock_timeout):
             record = self.load_tasks(run_id)
             matches = [task for task in record["tasks"] if task["id"] == task_id]
@@ -794,7 +818,7 @@ class StateStore:
                 raise StateInconsistencyError(f"unknown task ID: {task_id}")
             task = matches[0]
             current = task["status"]
-            changes = dict(updates or {})
+            changes = dict(updates)
             if current == target:
                 if all(task.get(key) == value for key, value in changes.items()):
                     return task
@@ -815,6 +839,155 @@ class StateStore:
             task.update(changes)
             task["status"] = target
             task["updatedAt"] = changes.get("updatedAt", utc_now())
+            validate_tasks_record(record)
+            atomic_write_json(run_directory / "tasks.json", record)
+            return task
+
+    def bind_candidate_selection(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        expected_run: Mapping[str, Any],
+        expected_task: Mapping[str, Any],
+        updates: Mapping[str, Any],
+        validate_evidence: Callable[[], None],
+    ) -> dict[str, Any]:
+        """CAS-bind a verified selection under repository and run locks."""
+
+        run_directory = self.run_dir(run_id)
+        changes = dict(updates)
+        with repository_lock(self.root, timeout=self.lock_timeout):
+            if self.active_run_id() != run_id:
+                raise StateInconsistencyError(
+                    "selection run is no longer active"
+                )
+            with run_lock(run_directory, timeout=self.lock_timeout):
+                run = self.load_run(run_id)
+                if (
+                    run != dict(expected_run)
+                    or run["mode"] != RunMode.BUILD.value
+                    or run["status"] != RunStatus.ACTIVE.value
+                    or run["activeTaskId"] != task_id
+                ):
+                    raise StateInconsistencyError(
+                        "selection run changed during gate verification"
+                    )
+                record = self.load_tasks(run_id)
+                matches = [
+                    task for task in record["tasks"] if task["id"] == task_id
+                ]
+                if len(matches) != 1:
+                    raise StateInconsistencyError(
+                        f"unknown or duplicate task ID: {task_id}"
+                    )
+                task = matches[0]
+                if task["status"] == TaskStatus.CANDIDATE_READY.value:
+                    if not all(
+                        task.get(key) == value
+                        for key, value in changes.items()
+                    ):
+                        raise StateInconsistencyError(
+                            "selection retry differs from durable task state"
+                        )
+                    validate_evidence()
+                    return task
+                if (
+                    task != dict(expected_task)
+                    or task["status"] != TaskStatus.IN_PROGRESS.value
+                    or task["baseCommit"] != run["currentCommit"]
+                ):
+                    raise StateInconsistencyError(
+                        "selection task changed during gate verification"
+                    )
+                validate_evidence()
+                task.update(changes)
+                task["status"] = TaskStatus.CANDIDATE_READY.value
+                task["updatedAt"] = utc_now()
+                validate_tasks_record(record)
+                atomic_write_json(run_directory / "tasks.json", record)
+                return task
+
+    def bind_candidate_acceptance(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        expected_run: Mapping[str, Any],
+        expected_task: Mapping[str, Any],
+        selected_provider: str,
+        commit: str | None,
+        validate_evidence: Callable[[], None],
+    ) -> dict[str, Any]:
+        """CAS-bind acceptance after revalidating selection evidence."""
+
+        with repository_lock(self.root, timeout=self.lock_timeout):
+            return self.bind_candidate_acceptance_in_transaction(
+                run_id,
+                task_id,
+                expected_run=expected_run,
+                expected_task=expected_task,
+                selected_provider=selected_provider,
+                commit=commit,
+                validate_evidence=validate_evidence,
+            )
+
+    def bind_candidate_acceptance_in_transaction(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        expected_run: Mapping[str, Any],
+        expected_task: Mapping[str, Any],
+        selected_provider: str,
+        commit: str | None,
+        validate_evidence: Callable[[], None],
+    ) -> dict[str, Any]:
+        """Bind acceptance while the caller holds the repository lock."""
+
+        run_directory = self.run_dir(run_id)
+        if self.active_run_id() != run_id:
+            raise StateInconsistencyError(
+                "acceptance run is no longer active"
+            )
+        with run_lock(run_directory, timeout=self.lock_timeout):
+            run = self.load_run(run_id)
+            if (
+                run != dict(expected_run)
+                or run["mode"] != RunMode.BUILD.value
+                or run["status"] != RunStatus.ACTIVE.value
+                or run["activeTaskId"] != task_id
+            ):
+                raise StateInconsistencyError(
+                    "acceptance run changed during verification"
+                )
+            record = self.load_tasks(run_id)
+            matches = [
+                task for task in record["tasks"] if task["id"] == task_id
+            ]
+            if len(matches) != 1:
+                raise StateInconsistencyError(
+                    f"unknown or duplicate task ID: {task_id}"
+                )
+            task = matches[0]
+            if (
+                task != dict(expected_task)
+                or task["status"] != TaskStatus.CANDIDATE_READY.value
+                or task.get("selectedCandidate") != selected_provider
+            ):
+                raise StateInconsistencyError(
+                    "selected task changed during acceptance"
+                )
+            validate_evidence()
+            task["selectedCandidate"] = selected_provider
+            task["status"] = (
+                TaskStatus.COMMITTED.value
+                if commit is not None
+                else TaskStatus.ACCEPTED.value
+            )
+            if commit is not None:
+                task["commit"] = commit
+            task["updatedAt"] = utc_now()
             validate_tasks_record(record)
             atomic_write_json(run_directory / "tasks.json", record)
             return task

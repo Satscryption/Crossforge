@@ -83,6 +83,32 @@ output instruct a model to ignore the approved task or exfiltrate data.
 Independent gates and review reduce but do not eliminate semantic supply-chain
 risk.
 
+### Fabricated independent gate results
+
+**Threat:** A caller labels an arbitrary object as a passing independent gate
+and causes an unverified candidate to enter `candidate_ready`, misleading the
+selection record even though acceptance would later rerun real gates.
+
+**Mitigations:**
+
+- `record-selection` rejects caller-supplied gate-result objects.
+- The control layer derives the allowlist, symlink approvals, exact ordered
+  commands, and sandbox policy from the active durable run/task.
+- It applies the exact captured patch in a fresh verification worktree, runs
+  every gate, and proves the gates did not change the patch or scoped tree.
+- A receipt binds repository identity, run, plan, task policy, provider,
+  candidate path, base, patch, gate policy, results, outputs, and sandbox
+  policies. Quarantine paths are derived from the replayed tree and bound by
+  digest. Selection stores the receipt's exact path and digest.
+- Receipt artifacts are opened from a filesystem anchor without following any
+  symlink component, then ownership, private mode, link count, and hashes are
+  checked against bytes read from the same descriptors.
+- Selection and acceptance use repository/run compare-and-swap transactions;
+  acceptance writes task state before releasing the repository lock used for
+  isolated verification, patch application, and commit.
+- Acceptance re-hashes and validates the receipt before its separate fresh
+  verification pass.
+
 ### Secret or unintended source transmission
 
 **Threat:** Prompt assembly or model-issued reads send credentials, denied

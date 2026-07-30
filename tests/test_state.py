@@ -218,6 +218,60 @@ class StateStoreTests(unittest.TestCase):
         with self.assertRaises(StateInconsistencyError):
             self.store.transition_task(run_id, "T1", TaskStatus.COMPLETE)
 
+    def test_selection_and_acceptance_bindings_are_compare_and_swap(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        self.store.start_task(run_id, "T1")
+        run = self.store.load_run(run_id)
+        task = self.store.load_tasks(run_id)["tasks"][0]
+        validated = []
+        updates = {
+            "selectedCandidate": "codex",
+            "selectedCandidatePath": str(self.repository / "candidate"),
+            "selectedGateEvidencePath": str(
+                self.store.run_dir(run_id) / "selection.json"
+            ),
+            "selectedGateEvidenceSha256": "2" * 64,
+            "selectedInvocationEvidencePath": None,
+            "selectedInvocationEvidenceSha256": None,
+        }
+        selected = self.store.bind_candidate_selection(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=task,
+            updates=updates,
+            validate_evidence=lambda: validated.append("selection"),
+        )
+        self.assertEqual("candidate_ready", selected["status"])
+        self.assertEqual(["selection"], validated)
+
+        accepted = self.store.bind_candidate_acceptance(
+            run_id,
+            "T1",
+            expected_run=run,
+            expected_task=selected,
+            selected_provider="codex",
+            commit=COMMIT_B,
+            validate_evidence=lambda: validated.append("acceptance"),
+        )
+        self.assertEqual("committed", accepted["status"])
+        self.assertEqual(COMMIT_B, accepted["commit"])
+        self.assertEqual(["selection", "acceptance"], validated)
+
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "selected task changed"
+        ):
+            self.store.bind_candidate_acceptance(
+                run_id,
+                "T1",
+                expected_run=run,
+                expected_task=selected,
+                selected_provider="codex",
+                commit=COMMIT_B,
+                validate_evidence=lambda: validated.append("stale"),
+            )
+        self.assertNotIn("stale", validated)
+
     def test_resume_succeeds_for_consistent_state(self) -> None:
         task = make_task(status="in_progress")
         run_id, _ = self.create_run(tasks=[task])

@@ -1609,7 +1609,7 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
         )
         self.assertNotEqual(0, code)
         self.assertIn(
-            "outside active run evidence",
+            "no bound independent gate evidence",
             stdout + stderr,
         )
 
@@ -1676,6 +1676,9 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
 
     def test_selection_report_must_match_invoke_bound_candidate(self) -> None:
         task = runtime_task(self.commit, status="in_progress")
+        task["verificationCommands"] = [
+            {"argv": ["true"], "timeoutSeconds": 10}
+        ]
         store, run_id = self.seed_state(tasks=[task], active_task="T1")
         identity = repository_identity(self.discovered)
         run = store.load_run(run_id)
@@ -1749,8 +1752,6 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
             invocation_evidence_path=canonical_report,
         )
         manager.registry.update(candidate)
-        allowlist = self.root / "allowlist.txt"
-        allowlist.write_text("app.txt\n", encoding="utf-8")
         request_path = self.root / "record-selection.json"
         request = {
             "repository": str(self.repository),
@@ -1761,32 +1762,23 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
             "runId": run_id,
             "taskId": "T1",
             "candidatePath": str(candidate.path),
-            "allowlistPath": str(allowlist),
-            "approvedSymlinks": {},
-            "taskBaseCommit": self.commit,
             "providerReport": str(outside_report),
-            "independentGateResults": [
-                {
-                    "passed": True,
-                    "provenance": "independent",
-                    "argv": ["python3", "-m", "unittest"],
-                    "exitCode": 0,
-                    "durationMs": 1,
-                    "outputPath": "tests.txt",
-                }
-            ],
             "patchPath": str(patch_path),
             "planGuardrailsPassed": True,
             "publicContractApproved": True,
             "generatedAndBinaryContentExplained": True,
         }
         atomic_write_json(request_path, request)
-        code, stdout, stderr = invoke_cli(
-            "record-selection",
-            "--request",
-            str(request_path),
-            "--json",
-        )
+        with mock.patch.object(
+            crossforge_cli, "verify_candidate_gates"
+        ) as verifier:
+            code, stdout, stderr = invoke_cli(
+                "record-selection",
+                "--request",
+                str(request_path),
+                "--json",
+            )
+        verifier.assert_not_called()
         self.assertNotEqual(0, code)
         self.assertIn(
             "differs from invoke-bound candidate evidence",
@@ -1794,13 +1786,51 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
         )
 
         request["providerReport"] = str(canonical_report)
+        request["independentGateResults"] = [
+            {"passed": True, "provenance": "independent"}
+        ]
         atomic_write_json(request_path, request)
-        code, stdout, stderr = invoke_cli(
-            "record-selection",
-            "--request",
-            str(request_path),
-            "--json",
-        )
+        with mock.patch.object(
+            crossforge_cli, "verify_candidate_gates"
+        ) as verifier:
+            code, stdout, stderr = invoke_cli(
+                "record-selection",
+                "--request",
+                str(request_path),
+                "--json",
+            )
+        verifier.assert_not_called()
+        self.assertNotEqual(0, code)
+        self.assertIn("independentGateResults", stdout + stderr)
+        unchanged = store.load_tasks(run_id)["tasks"][0]
+        self.assertEqual("in_progress", unchanged["status"])
+        self.assertIsNone(unchanged["selectedCandidate"])
+
+        request.pop("independentGateResults")
+        sandbox = PROJECT_ROOT / "tests" / "fixtures" / "fake_sandbox.py"
+
+        def passed_probe(*, policy, **_kwargs):
+            check = ProbeCheck("selection-boundary", "denied", "denied", True)
+            return SandboxProbeResult(
+                policy.backend, "fake-1", (check,), policy.sha256
+            )
+
+        atomic_write_json(request_path, request)
+        with mock.patch.object(
+            crossforge_cli,
+            "detect_sandbox_backend",
+            return_value=("bwrap", str(sandbox)),
+        ), mock.patch.object(
+            crossforge_cli,
+            "probe_sandbox",
+            side_effect=passed_probe,
+        ):
+            code, stdout, stderr = invoke_cli(
+                "record-selection",
+                "--request",
+                str(request_path),
+                "--json",
+            )
         self.assertEqual(0, code, stdout + stderr)
         selected = json.loads(stdout)["result"]["task"]
         self.assertEqual(
@@ -1811,10 +1841,33 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
             str(canonical_report.resolve()),
             selected["selectedInvocationEvidencePath"],
         )
+        self.assertEqual(
+            sha256_file(selected["selectedGateEvidencePath"]),
+            selected["selectedGateEvidenceSha256"],
+        )
+        receipt = Path(selected["selectedGateEvidencePath"])
+        verification_entries = [
+            entry
+            for entry in manager.registry.load()
+            if entry.provider.startswith("selection-verification-")
+        ]
+        code, stdout, stderr = invoke_cli(
+            "record-selection",
+            "--request",
+            str(request_path),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        self.assertTrue(json.loads(stdout)["result"]["idempotent"])
+        self.assertEqual(
+            verification_entries,
+            [
+                entry
+                for entry in manager.registry.load()
+                if entry.provider.startswith("selection-verification-")
+            ],
+        )
 
-        raw = json.loads(canonical_report.read_text(encoding="utf-8"))
-        raw["objective"] = "forged after selection"
-        atomic_write_json(canonical_report, raw)
         accept_request = self.root / "accept.json"
         atomic_write_json(
             accept_request,
@@ -1828,6 +1881,24 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
                 "candidatePath": str(candidate.path),
             },
         )
+        original_receipt = receipt.read_bytes()
+        receipt.write_text('{"forged":"after-selection"}\n', encoding="utf-8")
+        code, stdout, stderr = invoke_cli(
+            "accept-candidate",
+            "--request",
+            str(accept_request),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "differs from durable selection",
+            stdout + stderr,
+        )
+        atomic_write_bytes(receipt, original_receipt)
+
+        raw = json.loads(canonical_report.read_text(encoding="utf-8"))
+        raw["objective"] = "forged after selection"
+        atomic_write_json(canonical_report, raw)
         code, stdout, stderr = invoke_cli(
             "accept-candidate",
             "--request",

@@ -179,6 +179,21 @@ pass the external-provider capture, selection, or acceptance boundary.
 Cleanup is also permitted while the active run and task are blocked, so
 exhausting provider attempts cannot strand a safely reversible candidate.
 
+### DEV-006: Selection gates are control-run and patch-bound
+
+`record-selection` does not accept `independentGateResults`, caller allowlists,
+or caller symlink approvals. It derives policy from the active durable task,
+applies the captured patch to a fresh verification worktree, runs every
+verification command in durable order, and rejects failure, mutation, or
+incomplete evidence.
+
+After successful cleanup of that verification worktree, it writes a receipt
+bound to repository identity, run, approved plan, task policy, candidate,
+provider, base, patch, sandbox policy, scoped-tree hash, and complete gate
+results. The task stores the receipt's canonical path and exact SHA-256.
+Acceptance revalidates the receipt and referenced result, output, and sandbox
+policy files before independently rerunning acceptance gates.
+
 ## Verification limitations
 
 - The default suite uses fake provider, sandbox, and forge executables.

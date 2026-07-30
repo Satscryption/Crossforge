@@ -257,11 +257,13 @@ For each task:
 7. After every invocation or correction, call `check-scope`. A restoration,
    scope, mode, symlink, submodule, special-file, report-hash, base, or consent
    failure makes that candidate ineligible.
-8. Run only the task's structured candidate gates through `run-gate`.
-   Independently reproduced results, not provider claims, are evidence.
-9. When eligible, call `capture-candidate` to save and hash the binary-safe
+8. Call `capture-candidate` to save and hash the binary-safe
    patch and prove that it applies to the recorded base. External-provider
    candidates without `invoke`-bound evidence are rejected.
+9. Do not supply gate-result claims to selection. `record-selection` derives
+   the exact ordered gates and sandbox policy from durable state, applies the
+   captured patch in a fresh verification worktree, runs every gate, proves
+   the gates did not change the patch/tree, and records a hash-bound receipt.
 
 ### Review, select, and correct
 
@@ -276,7 +278,8 @@ For each task:
    maintainability, complexity, performance, and finally diff economy.
 5. Write the required `selection.md`; do not invent a numeric score. Call
    `record-selection`, which requires the supplied report bytes, provider,
-   base, and patch hash to match the selected candidate's `invoke` binding.
+   base, and patch hash to match the selected candidate's `invoke` binding and
+   independently reruns every durable task gate against that exact patch.
    Combining candidates requires a newly approved integration task.
 6. A correction brief names the exact failed command, sanitized relevant
    output, expected behavior, unchanged constraints, and current allowlist.
