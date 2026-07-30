@@ -259,13 +259,15 @@ the selection and commit history claim independent provider authorship.
   repository-common active run and reject every other registry.
 - The active run's repository identity, current commit, active task, task base,
   and repository-ID prefix are rechecked for each lifecycle operation.
-- `invoke` hashes the exact validated provider report and records that digest
-  on the candidate registry entry.
-- External-provider candidates cannot be captured without invocation evidence.
+- `invoke` records the canonical run-evidence report path and hashes the exact
+  validated report bytes on the candidate registry entry.
+- External-provider capture revalidates those report bytes and requires the
+  newly captured patch to have the report's exact patch hash.
 - Selection parses only the digest-bound report bytes and requires its
-  provider, base commit, and patch hash to match the recorded candidate.
-- Acceptance requires the candidate provider to equal the durable selection
-  and retains the invocation binding.
+  canonical path, provider, base commit, and patch hash to match the recorded
+  candidate, then durably binds candidate path, report path, and report digest.
+- Acceptance requires the candidate and evidence to equal that durable
+  selection and revalidates the report and patch before applying anything.
 
 ### Worktree cleanup traversal or data loss
 

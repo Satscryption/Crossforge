@@ -135,6 +135,11 @@ _TASK_FIELDS = {
     "createdAt",
     "updatedAt",
 }
+_TASK_OPTIONAL_FIELDS = {
+    "selectedCandidatePath",
+    "selectedInvocationEvidencePath",
+    "selectedInvocationEvidenceSha256",
+}
 
 
 def generate_run_id(now: datetime | None = None) -> str:
@@ -296,7 +301,13 @@ def validate_tasks_record(value: object) -> dict[str, Any]:
     seen: set[str] = set()
     for index, raw_task in enumerate(record["tasks"]):
         task = _require_object(raw_task, f"tasks[{index}]")
-        _require_exact_fields(task, _TASK_FIELDS, f"tasks[{index}]")
+        missing = sorted(_TASK_FIELDS - set(task))
+        unknown = sorted(set(task) - _TASK_FIELDS - _TASK_OPTIONAL_FIELDS)
+        if missing or unknown:
+            raise StateInconsistencyError(
+                f"tasks[{index}] has missing or unknown fields",
+                details={"missing": missing, "unknown": unknown},
+            )
         _require_string(task["id"], f"tasks[{index}].id")
         if task["id"] in seen:
             raise StateInconsistencyError(f"duplicate task ID: {task['id']}")
@@ -332,6 +343,23 @@ def validate_tasks_record(value: object) -> dict[str, Any]:
         ):
             raise StateInconsistencyError(f"task {task['id']} has invalid attempts")
         _require_string(task["commit"], f"task {task['id']}.commit", nullable=True)
+        for field in (
+            "selectedCandidatePath",
+            "selectedInvocationEvidencePath",
+        ):
+            _require_string(
+                task.get(field),
+                f"task {task['id']}.{field}",
+                nullable=True,
+            )
+        selected_evidence = task.get("selectedInvocationEvidenceSha256")
+        if selected_evidence is not None and (
+            not isinstance(selected_evidence, str)
+            or not _SHA256.fullmatch(selected_evidence)
+        ):
+            raise StateInconsistencyError(
+                f"task {task['id']}.selectedInvocationEvidenceSha256 is invalid"
+            )
     dependencies = {
         dependency
         for task in record["tasks"]

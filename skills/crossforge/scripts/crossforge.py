@@ -667,6 +667,7 @@ def _active_candidate_context(
     repository_id_prefix: str | None,
     git_common_dir: str | None,
     run_id: str | None,
+    allowed_run_statuses: Iterable[str] = (RunStatus.ACTIVE.value,),
 ) -> _ActiveCandidateContext:
     """Bind a candidate lifecycle operation to the active repository run."""
 
@@ -690,7 +691,7 @@ def _active_candidate_context(
     run = store.load_run(active_run_id)
     identity = repository_identity(repository)
     if (
-        run["status"] != "active"
+        run["status"] not in set(allowed_run_statuses)
         or run["mode"] != "build"
         or Path(str(run["repositoryRoot"])).resolve() != repository.root
         or Path(str(run["gitCommonDir"])).resolve()
@@ -770,25 +771,68 @@ def _require_candidate_matches_task(
 
 
 def _load_bound_provider_report(
+    context: _ActiveCandidateContext,
     candidate: WorktreeEntry,
-    report_path: str,
+    report_path: str | None = None,
+    *,
+    require_patch_match: bool = True,
 ) -> ProviderReport:
-    report_file = Path(report_path)
+    external_provider = candidate.provider in {"codex", "grok"}
     invocation_evidence_sha256 = candidate.invocation_evidence_sha256
-    if (
-        candidate.provider in {"codex", "grok"}
-        and invocation_evidence_sha256 is None
-    ):
-        raise StateInconsistencyError(
-            "candidate has no invoke-bound provider evidence"
+    invocation_evidence_path = candidate.invocation_evidence_path
+    if external_provider:
+        if (
+            invocation_evidence_sha256 is None
+            or invocation_evidence_path is None
+        ):
+            raise StateInconsistencyError(
+                "candidate has no invoke-bound provider evidence"
+            )
+        report_file = invocation_evidence_path.expanduser().resolve()
+        expected_root = (
+            context.store.run_dir(context.run_id)
+            / "evidence"
+            / candidate.task_id
+            / candidate.provider
+        ).resolve()
+        try:
+            relative_report = report_file.relative_to(expected_root)
+        except ValueError as exc:
+            raise StateInconsistencyError(
+                "invoke-bound provider report is outside active run evidence"
+            ) from exc
+        attempt_name = relative_report.parts[0] if relative_report.parts else ""
+        attempt_suffix = (
+            attempt_name[8:] if attempt_name.startswith("attempt-") else ""
         )
+        attempt_number = int(attempt_suffix) if attempt_suffix.isdigit() else 0
+        if (
+            len(relative_report.parts) != 2
+            or attempt_number <= 0
+            or attempt_name != f"attempt-{attempt_number:02d}"
+            or relative_report.name != "report.json"
+        ):
+            raise StateInconsistencyError(
+                "invoke-bound provider report path is not canonical"
+            )
+        if (
+            report_path is not None
+            and Path(report_path).expanduser().resolve() != report_file
+        ):
+            raise StateInconsistencyError(
+                "provider report path differs from invoke-bound candidate evidence"
+            )
+    else:
+        if report_path is None:
+            raise StateInconsistencyError("provider report path is required")
+        report_file = Path(report_path).expanduser().resolve()
     report = load_provider_report(
         report_file,
         require_evidence_files=True,
         verify_hashes=True,
         expected_sha256=(
             invocation_evidence_sha256
-            if candidate.provider in {"codex", "grok"}
+            if external_provider
             else None
         ),
     )
@@ -800,12 +844,15 @@ def _load_bound_provider_report(
     if (
         report.provider != expected_provider
         or report.data["baseCommit"] != candidate.base_commit
-        or report.data["patchSha256"] != candidate.captured_patch_sha256
+        or (
+            require_patch_match
+            and report.data["patchSha256"] != candidate.captured_patch_sha256
+        )
     ):
         raise StateInconsistencyError(
             "provider report does not describe the recorded candidate"
         )
-    if candidate.provider in {"codex", "grok"} and (
+    if external_provider and (
         sha256_file(report_file) != invocation_evidence_sha256
     ):
         raise StateInconsistencyError(
@@ -2397,6 +2444,7 @@ def _invoke_lane(
         replace(
             current_candidate,
             invocation_evidence_sha256=invocation_evidence_sha256,
+            invocation_evidence_path=report_path.resolve(),
         )
     )
     if int(budget["providerAttempt"]) >= 3 and (
@@ -2754,12 +2802,21 @@ def _cmd_capture_candidate(args: argparse.Namespace) -> CommandOutput:
     _require_candidate_matches_task(candidate, task)
     if (
         candidate.provider in {"codex", "grok"}
-        and candidate.invocation_evidence_sha256 is None
     ):
-        raise PreconditionError(
-            "candidate has no invoke-bound provider evidence"
+        report = _load_bound_provider_report(
+            context,
+            candidate,
+            require_patch_match=False,
         )
     entry = context.manager.capture_patch(candidate, args.patch)
+    if (
+        candidate.provider in {"codex", "grok"}
+        and report.data["patchSha256"] != entry.captured_patch_sha256
+    ):
+        context.manager.registry.update(replace(entry, status="blocked"))
+        raise StateInconsistencyError(
+            "captured patch differs from invoke-bound provider evidence"
+        )
     return CommandOutput("Candidate patch captured", entry.to_json())
 
 
@@ -2795,7 +2852,7 @@ def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
         approved_symlinks=approved_symlinks,
     )
     report_path = _request_value(value, "providerReport", str)
-    report = _load_bound_provider_report(candidate, report_path)
+    report = _load_bound_provider_report(context, candidate, report_path)
     gate_results = _gate_result_objects(value.get("independentGateResults"))
     result = assess_candidate_eligibility(
         candidate=candidate,
@@ -2819,7 +2876,18 @@ def _cmd_record_selection(args: argparse.Namespace) -> CommandOutput:
         context.run_id,
         str(task["id"]),
         TaskStatus.CANDIDATE_READY,
-        updates={"selectedCandidate": candidate.provider},
+        updates={
+            "selectedCandidate": candidate.provider,
+            "selectedCandidatePath": str(candidate.path.resolve()),
+            "selectedInvocationEvidencePath": (
+                str(candidate.invocation_evidence_path.resolve())
+                if candidate.invocation_evidence_path is not None
+                else None
+            ),
+            "selectedInvocationEvidenceSha256": (
+                candidate.invocation_evidence_sha256
+            ),
+        },
     )
     return CommandOutput(
         "Candidate selection recorded",
@@ -2882,12 +2950,24 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
             "candidate provider differs from the durable selection"
         )
     if (
-        candidate.provider in {"codex", "grok"}
-        and candidate.invocation_evidence_sha256 is None
+        task.get("selectedCandidatePath") != str(candidate.path.resolve())
     ):
         raise StateInconsistencyError(
-            "selected candidate has no invoke-bound provider evidence"
+            "candidate path differs from the durable selection"
         )
+    if candidate.provider in {"codex", "grok"}:
+        if (
+            candidate.invocation_evidence_sha256 is None
+            or candidate.invocation_evidence_path is None
+            or task.get("selectedInvocationEvidenceSha256")
+            != candidate.invocation_evidence_sha256
+            or task.get("selectedInvocationEvidencePath")
+            != str(candidate.invocation_evidence_path.resolve())
+        ):
+            raise StateInconsistencyError(
+                "selected candidate evidence differs from the durable selection"
+            )
+        _load_bound_provider_report(context, candidate)
     commit_message_value = value.get("commitMessage")
     if isinstance(commit_message_value, Mapping):
         commit_message = build_commit_message(
@@ -3061,6 +3141,10 @@ def _cmd_cleanup(args: argparse.Namespace) -> CommandOutput:
         repository_id_prefix=args.repository_id_prefix,
         git_common_dir=None,
         run_id=None,
+        allowed_run_statuses=(
+            RunStatus.ACTIVE.value,
+            RunStatus.BLOCKED.value,
+        ),
     )
     candidate = context.manager.registry.get(args.worktree)
     task = _active_candidate_task(
@@ -3071,6 +3155,7 @@ def _cmd_cleanup(args: argparse.Namespace) -> CommandOutput:
             TaskStatus.CANDIDATE_READY.value,
             TaskStatus.ACCEPTED.value,
             TaskStatus.COMMITTED.value,
+            TaskStatus.BLOCKED.value,
         ),
     )
     _require_candidate_matches_task(candidate, task)

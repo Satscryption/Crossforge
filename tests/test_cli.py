@@ -158,6 +158,92 @@ def runtime_task(
     return task
 
 
+def write_provider_report_fixture(
+    directory: Path,
+    *,
+    provider: str,
+    base_commit: str,
+    patch_bytes: bytes,
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    fixtures = {
+        "spec.md": b"task brief\n",
+        "context-manifest.json": b'{"files":[]}\n',
+        "runtime-manifest.json": (
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "providerExecutableIdentity": {
+                        "path": f"/usr/bin/{provider}",
+                        "sha256": "a" * 64,
+                    },
+                    "providerArgvSha256": "b" * 64,
+                }
+            ).encode()
+            + b"\n"
+        ),
+        "sandbox-policy.json": b'{"network":"deny"}\n',
+        "final.txt": b"done\n",
+        "candidate.patch": patch_bytes,
+        "stdout.raw": b"",
+        "stderr.raw": b"",
+        "tests.txt": b"ok\n",
+    }
+    for name, contents in fixtures.items():
+        atomic_write_bytes(directory / name, contents)
+    report = {
+        "schemaVersion": 1,
+        "status": "complete",
+        "provider": provider,
+        "requestedModel": "auto",
+        "resolvedModel": "test-model",
+        "cliVersion": "test-1",
+        "baseCommit": base_commit,
+        "objective": "Implement T1",
+        "taskBriefSha256": sha256_file(directory / "spec.md"),
+        "contextManifestSha256": sha256_file(
+            directory / "context-manifest.json"
+        ),
+        "runtimeManifestSha256": sha256_file(
+            directory / "runtime-manifest.json"
+        ),
+        "sandboxPolicySha256": sha256_file(
+            directory / "sandbox-policy.json"
+        ),
+        "startedAt": "2026-07-24T12:00:00Z",
+        "completedAt": "2026-07-24T12:00:01Z",
+        "durationMs": 1000,
+        "exitCode": 0,
+        "timedOut": False,
+        "changedFiles": [
+            {
+                "path": "app.txt",
+                "status": "modified",
+                "summary": "Updated behavior",
+            }
+        ],
+        "scopeCheck": {"passed": True, "violations": []},
+        "verification": [
+            {
+                "argv": ["python3", "-m", "unittest"],
+                "exitCode": 0,
+                "durationMs": 100,
+                "outputPath": "tests.txt",
+            }
+        ],
+        "gaps": [],
+        "risks": [],
+        "finalMessagePath": "final.txt",
+        "patchPath": "candidate.patch",
+        "patchSha256": sha256_file(directory / "candidate.patch"),
+        "rawStdoutPath": "stdout.raw",
+        "rawStderrPath": "stderr.raw",
+    }
+    report_path = directory / "report.json"
+    atomic_write_json(report_path, report)
+    return report_path
+
+
 def load_plan_value(value: dict):
     with tempfile.TemporaryDirectory() as temporary:
         path = Path(temporary) / "plan.json"
@@ -811,6 +897,10 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             result["invocationEvidenceSha256"],
             manager.registry.get(candidate.path).invocation_evidence_sha256,
         )
+        self.assertEqual(
+            Path(result["reportPath"]).resolve(),
+            manager.registry.get(candidate.path).invocation_evidence_path,
+        )
         self.assertEqual(["app.txt"], [item["path"] for item in report.data["changedFiles"]])
         self.assertEqual(1, store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"])
         self.assertTrue((candidate.path / ".git").is_file())
@@ -873,6 +963,30 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         self.assertEqual(
             2,
             store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"],
+        )
+        (candidate.path / "app.txt").write_text(
+            "provider change\n",
+            encoding="utf-8",
+        )
+        captured_patch = self.root / "invoke-bound.patch"
+        code, stdout, stderr = invoke_cli(
+            "capture-candidate",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--worktree",
+            str(candidate.path),
+            "--patch",
+            str(captured_patch),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        self.assertEqual(
+            report.data["patchSha256"],
+            json.loads(stdout)["result"]["capturedPatchSha256"],
         )
 
     def test_forged_capability_cannot_invoke_without_durable_boundary(self) -> None:
@@ -1442,21 +1556,37 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
             repository_id_prefix=identity[:12],
         )
         recorded = manager.registry.get(candidate_path)
+        forged_report = self.root / "forged-report.json"
+        forged_report.write_text('{"forged":true}\n', encoding="utf-8")
         manager.registry.update(
-            replace(recorded, invocation_evidence_sha256="a" * 64)
+            replace(
+                recorded,
+                invocation_evidence_sha256=sha256_file(forged_report),
+                invocation_evidence_path=forged_report,
+            )
         )
         code, stdout, stderr = invoke_cli(*capture_arguments)
-        self.assertEqual(0, code, stdout + stderr)
-        self.assertTrue(patch.is_file())
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "outside active run evidence",
+            stdout + stderr,
+        )
+        captured = manager.capture_patch(
+            manager.registry.get(candidate_path),
+            patch,
+        )
         store.transition_task(
             run_id,
             "T1",
             TaskStatus.CANDIDATE_READY,
-            updates={"selectedCandidate": "codex"},
-        )
-        captured = manager.registry.get(candidate_path)
-        manager.registry.update(
-            replace(captured, invocation_evidence_sha256=None)
+            updates={
+                "selectedCandidate": "codex",
+                "selectedCandidatePath": str(candidate_path.resolve()),
+                "selectedInvocationEvidencePath": str(forged_report.resolve()),
+                "selectedInvocationEvidenceSha256": (
+                    captured.invocation_evidence_sha256
+                ),
+            },
         )
         unattested_acceptance = self.root / "unattested-acceptance.json"
         atomic_write_json(
@@ -1479,25 +1609,100 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
         )
         self.assertNotEqual(0, code)
         self.assertIn(
-            "selected candidate has no invoke-bound provider evidence",
+            "outside active run evidence",
             stdout + stderr,
         )
 
-    def test_selection_report_must_match_invoke_bound_candidate(self) -> None:
+    def test_blocked_run_can_cleanup_a_captured_candidate(self) -> None:
+        task = runtime_task(self.commit, status="in_progress")
+        store, run_id = self.seed_state(tasks=[task], active_task="T1")
+        identity = repository_identity(self.discovered)
+        run = store.load_run(run_id)
+        run["repositoryIdentity"] = identity
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
         worktree_root = self.root / "worktrees"
-        registry = self.root / "worktrees.json"
+        registry = store.run_dir(run_id) / "worktrees.json"
+        atomic_write_json(
+            registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
         manager = WorktreeManager(
             self.repository,
             worktree_root,
             registry,
-            repository_id_prefix="test",
+            repository_id_prefix=identity[:12],
         )
         candidate = manager.create(
-            run_id="run",
+            run_id=run_id,
             task_id="T1",
             provider="codex",
             base_commit=self.commit,
-            evidence_dir=self.root / "evidence",
+            evidence_dir=store.run_dir(run_id) / "evidence" / "T1" / "worktree",
+        )
+        (candidate.path / "app.txt").write_text(
+            "provider change\n",
+            encoding="utf-8",
+        )
+        patch = self.root / "blocked-candidate.patch"
+        manager.capture_patch(candidate, patch)
+        store.transition_task(run_id, "T1", TaskStatus.BLOCKED)
+        run = store.load_run(run_id)
+        run["status"] = "blocked"
+        run["blockedReason"] = "provider attempts exhausted"
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+
+        code, stdout, stderr = invoke_cli(
+            "cleanup",
+            "--repository",
+            str(self.repository),
+            "--worktree-root",
+            str(worktree_root),
+            "--registry",
+            str(registry),
+            "--worktree",
+            str(candidate.path),
+            "--patch",
+            str(patch),
+            "--evidence-durable",
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        self.assertEqual("cleaned", json.loads(stdout)["result"]["status"])
+        self.assertFalse(candidate.path.exists())
+
+    def test_selection_report_must_match_invoke_bound_candidate(self) -> None:
+        task = runtime_task(self.commit, status="in_progress")
+        store, run_id = self.seed_state(tasks=[task], active_task="T1")
+        identity = repository_identity(self.discovered)
+        run = store.load_run(run_id)
+        run["repositoryIdentity"] = identity
+        atomic_write_json(store.run_dir(run_id) / "run.json", run)
+        worktree_root = self.root / "worktrees"
+        registry = store.run_dir(run_id) / "worktrees.json"
+        atomic_write_json(
+            registry,
+            {
+                "schemaVersion": 1,
+                "worktreeRoot": str(worktree_root.resolve()),
+                "entries": [],
+            },
+        )
+        manager = WorktreeManager(
+            self.repository,
+            worktree_root,
+            registry,
+            repository_id_prefix=identity[:12],
+        )
+        candidate = manager.create(
+            run_id=run_id,
+            task_id="T1",
+            provider="codex",
+            base_commit=self.commit,
+            evidence_dir=store.run_dir(run_id) / "evidence" / "T1" / "worktree",
         )
         self.addCleanup(
             lambda: subprocess.run(
@@ -1514,46 +1719,123 @@ class AcceptanceAndShippingCLIRegressionTests(CLITestCase):
                 check=False,
             )
         )
-        report_path = self.root / "report.json"
-        report_path.write_text('{"trusted":"bytes"}\n', encoding="utf-8")
-        patch_hash = "b" * 64
+        (candidate.path / "app.txt").write_text(
+            "provider change\n",
+            encoding="utf-8",
+        )
+        patch_path = self.root / "candidate.patch"
+        candidate = manager.capture_patch(candidate, patch_path)
+        canonical_report = write_provider_report_fixture(
+            (
+                store.run_dir(run_id)
+                / "evidence"
+                / "T1"
+                / "codex"
+                / "attempt-01"
+            ),
+            provider="codex",
+            base_commit=self.commit,
+            patch_bytes=patch_path.read_bytes(),
+        )
+        outside_report = write_provider_report_fixture(
+            self.root / "fabricated-report",
+            provider="codex",
+            base_commit=self.commit,
+            patch_bytes=patch_path.read_bytes(),
+        )
         candidate = replace(
             candidate,
-            status="captured",
-            captured_patch_sha256=patch_hash,
-            invocation_evidence_sha256=sha256_file(report_path),
+            invocation_evidence_sha256=sha256_file(canonical_report),
+            invocation_evidence_path=canonical_report,
         )
-        report = SimpleNamespace(
-            provider="codex",
-            data={
-                "baseCommit": self.commit,
-                "patchSha256": patch_hash,
+        manager.registry.update(candidate)
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("app.txt\n", encoding="utf-8")
+        request_path = self.root / "record-selection.json"
+        request = {
+            "repository": str(self.repository),
+            "gitCommonDir": str(self.common),
+            "worktreeRoot": str(worktree_root),
+            "registry": str(registry),
+            "repositoryIdPrefix": identity[:12],
+            "runId": run_id,
+            "taskId": "T1",
+            "candidatePath": str(candidate.path),
+            "allowlistPath": str(allowlist),
+            "approvedSymlinks": {},
+            "taskBaseCommit": self.commit,
+            "providerReport": str(outside_report),
+            "independentGateResults": [
+                {
+                    "passed": True,
+                    "provenance": "independent",
+                    "argv": ["python3", "-m", "unittest"],
+                    "exitCode": 0,
+                    "durationMs": 1,
+                    "outputPath": "tests.txt",
+                }
+            ],
+            "patchPath": str(patch_path),
+            "planGuardrailsPassed": True,
+            "publicContractApproved": True,
+            "generatedAndBinaryContentExplained": True,
+        }
+        atomic_write_json(request_path, request)
+        code, stdout, stderr = invoke_cli(
+            "record-selection",
+            "--request",
+            str(request_path),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn(
+            "differs from invoke-bound candidate evidence",
+            stdout + stderr,
+        )
+
+        request["providerReport"] = str(canonical_report)
+        atomic_write_json(request_path, request)
+        code, stdout, stderr = invoke_cli(
+            "record-selection",
+            "--request",
+            str(request_path),
+            "--json",
+        )
+        self.assertEqual(0, code, stdout + stderr)
+        selected = json.loads(stdout)["result"]["task"]
+        self.assertEqual(
+            sha256_file(canonical_report),
+            selected["selectedInvocationEvidenceSha256"],
+        )
+        self.assertEqual(
+            str(canonical_report.resolve()),
+            selected["selectedInvocationEvidencePath"],
+        )
+
+        raw = json.loads(canonical_report.read_text(encoding="utf-8"))
+        raw["objective"] = "forged after selection"
+        atomic_write_json(canonical_report, raw)
+        accept_request = self.root / "accept.json"
+        atomic_write_json(
+            accept_request,
+            {
+                "repository": str(self.repository),
+                "gitCommonDir": str(self.common),
+                "worktreeRoot": str(worktree_root),
+                "registry": str(registry),
+                "runId": run_id,
+                "taskId": "T1",
+                "candidatePath": str(candidate.path),
             },
         )
-        with mock.patch.object(
-            crossforge_cli,
-            "load_provider_report",
-            return_value=report,
-        ):
-            self.assertIs(
-                report,
-                crossforge_cli._load_bound_provider_report(
-                    candidate,
-                    str(report_path),
-                ),
-            )
-            report_path.write_text(
-                '{"forged":"replacement"}\n',
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(
-                StateInconsistencyError,
-                "invoke-bound candidate evidence",
-            ):
-                crossforge_cli._load_bound_provider_report(
-                    candidate,
-                    str(report_path),
-                )
+        code, stdout, stderr = invoke_cli(
+            "accept-candidate",
+            "--request",
+            str(accept_request),
+            "--json",
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn("invoke-bound evidence", stdout + stderr)
 
     def test_gate_executable_allowlist_is_bounded_by_the_approved_plan(
         self,
