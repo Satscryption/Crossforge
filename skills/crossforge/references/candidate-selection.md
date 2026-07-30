@@ -62,9 +62,10 @@ and supplies only sanitized output. After three failed attempts by one provider,
 block the task. A Claude micro-fix is allowed only after `check-micro-fix`
 returns mechanically eligible, its explicitly caller-attested inputs are
 independently inspected and recorded in `decisions.md`, and the user approves
-the recovery. The command result is not verified evidence and cannot authorize
-the exception alone. A micro-fix must use a fresh recorded candidate worktree
-and the normal capture, selection, and acceptance path.
+the recovery through a caller-attested decision. The command result is not
+verified evidence and cannot authorize the exception alone. A micro-fix must
+use a fresh recorded candidate worktree and the normal capture, selection, and
+acceptance path.
 
 See also [routing policy](routing-policy.md) and
 [worktree protocol](worktree-protocol.md).

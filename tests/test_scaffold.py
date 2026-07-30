@@ -61,6 +61,39 @@ class ScaffoldTests(unittest.TestCase):
         self.assertIn("Copyright (c) 2026 Dan McAteer", notices)
         self.assertIn("https://github.com/DannyMac180/fable-advisor", notices)
 
+    def test_assurance_docs_distinguish_binding_from_human_provenance(self) -> None:
+        threat_model = (PROJECT_ROOT / "docs/THREAT_MODEL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("## Assurance vocabulary and orchestrator boundary", threat_model)
+        self.assertIn("**Control-verified**", threat_model)
+        self.assertIn("**User-confirmed**", threat_model)
+        self.assertIn("**Caller-attested** or **model-attested**", threat_model)
+        self.assertIn("`planApproval`", threat_model)
+        self.assertIn("`--publication-requested`", threat_model)
+        self.assertNotIn(
+            "Neither can silently weaken deterministic invariants during a run",
+            threat_model,
+        )
+
+        assurance_docs = (
+            "README.md",
+            "CROSSFORGE_BUILD_SPEC.md",
+            "docs/ARCHITECTURE.md",
+            "docs/LIVE_TESTING.md",
+            "skills/crossforge/SKILL.md",
+            "skills/crossforge/references/plan-contract.md",
+            "skills/crossforge/references/recovery.md",
+            "skills/crossforge-ship/SKILL.md",
+            "skills/crossforge-ship/references/shipping-protocol.md",
+        )
+        for relative_path in assurance_docs:
+            with self.subTest(path=relative_path):
+                text = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertTrue(
+                    "caller-attested" in text or "model-attested" in text
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

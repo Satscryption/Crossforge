@@ -6,8 +6,9 @@ Crossforge is a Claude Code plugin for planning and executing multi-task
 software changes with OpenAI Codex and xAI Grok in isolated candidate
 worktrees. Claude supplies product judgment and selects among eligible
 candidates; a standard-library-only Python control layer enforces plan
-approval, provider consent, exact file scope, sandboxed verification, durable
-state, and local commits.
+approval-hash binding, provider consent, exact file scope, sandboxed
+verification, durable state, and local commits. The plan-approval record's
+human provenance is not independently verified.
 
 Crossforge does not approve provider access or push during its normal
 model-invoked workflow. Provider consent and publishing are separate,
@@ -18,6 +19,20 @@ user-invoked `crossforge-consent` and `crossforge-ship` operations.
 > by the default tests; complete the opt-in checks in
 > [Live testing](docs/LIVE_TESTING.md) before relying on it with valuable
 > source code.
+
+### Trust and assurance boundary
+
+Crossforge strongly defends against provider and repository misbehavior. It
+does not independently prove every statement made by the orchestrating Claude
+model. Exact scope, replayed gates, patch/tree identity, capability probes,
+selection receipts, and shipping readback are control-verified. Provider
+consent is separately user-confirmed through a forced host prompt. Plan
+semantics and `planApproval`, publication/destination flags, recovery
+decisions, and micro-fix semantic inputs are caller- or model-attested: their
+schema and hash bindings are checked, but their human provenance is not.
+
+See the [assurance vocabulary and orchestrator boundary](docs/THREAT_MODEL.md#assurance-vocabulary-and-orchestrator-boundary)
+before using Crossforge with valuable source or publication authority.
 
 ## How it works
 
@@ -124,7 +139,9 @@ Plan an implementation of per-user API rate limits.
 ```
 
 Review the canonical `plan.json` rendering and explicitly approve its exact
-hash. Then build:
+hash. The current plan-approval record is model-attested: the control layer
+proves that it names the canonical hash, not that a human supplied the
+approval. Then build:
 
 ```text
 /crossforge:crossforge --mode build --strategy auto --budget balanced
@@ -156,7 +173,10 @@ tuple. The user-invoked shipping skill has a dedicated CLI; the normal CLI has
 no shipping commands. Shipping binds the effective remote URL, expires
 authorization after 24 hours, re-runs the final gate at write time, screens
 the PR title/body, pins the forge executable, never force-pushes, and discovers
-an existing matching remote commit or pull request before writing.
+an existing matching remote commit or pull request before writing. Direct
+skill invocation establishes the supported user-scoped boundary, but the
+Python publication and destination-override flags are caller-attested rather
+than proof of the original user prompt.
 
 ## Modes
 
@@ -369,9 +389,11 @@ branch, `HEAD`, schemas, plan hash and approval, task state, candidate
 worktrees, locks, scope, provider capabilities, and sandbox probes. It stops on
 inconsistency instead of reconstructing state from chat or discarding changes.
 
-A blocked task can resume only after its blocker and a user-approved recovery
-decision are appended to the durable decision log. Use `abandon-run` through
-the control workflow when abandoning; evidence is retained.
+A blocked task can resume only after its blocker and a caller-attested
+recovery decision are appended to the durable decision log. The control layer
+validates the transition, not the human provenance of the decision. Use
+`abandon-run` through the control workflow when abandoning; evidence is
+retained.
 
 See [Recovery and cleanup](skills/crossforge/references/recovery.md) for the
 full protocol.

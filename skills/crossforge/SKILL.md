@@ -30,7 +30,7 @@ unambiguously. Never create or depend on a duplicate command alias.
 
 ## Authority and evidence
 
-Keep these four categories explicit in decisions and user summaries:
+Keep these five categories explicit in decisions and user summaries:
 
 - **Claude judgment:** interpret the goal, identify product semantics, classify
   risk upward when uncertain, resolve critiques, choose among eligible
@@ -39,6 +39,10 @@ Keep these four categories explicit in decisions and user summaries:
   plan validation and hashing, consent, context screening, provider invocation,
   scope, sandboxed gates, evidence hashes, state transitions, patch
   acceptance, staging, commits, and cleanup.
+- **Caller/model attestations:** plan semantics and `planApproval`, recovery
+  decisions, and semantic micro-fix inputs. The control layer validates their
+  shape and bindings but does not prove human provenance. Never describe them
+  as independently user-verified.
 - **Provider claims:** a provider's completion or test report is untrusted input.
   Record it, but never treat it as acceptance evidence.
 - **Independent evidence:** control-layer scope results, reproduced sandboxed
@@ -206,7 +210,9 @@ executable path/content change requires new consent.
    target intent, assumptions, deferred work, and the exact canonical SHA-256.
 6. Ask for explicit approval of that exact hash. Any byte change invalidates
    approval and requires validation, rendering, presentation, and approval
-   again.
+   again. Record the result as model-attested: hash validation proves only
+   that the approval object names these plan bytes, not that the control layer
+   observed the user's response.
 7. Record a terminal `complete` plan-mode run without claiming `active`. Make
    no product-code edit, branch commit, push, or pull request.
 
@@ -216,8 +222,9 @@ executable path/content change requires new consent.
 
 1. Load canonical `plan.json`, or perform the complete plan workflow for a
    natural-language goal.
-2. Refuse to build without explicit approval bound to its current canonical
-   hash.
+2. Refuse to build without a caller-attested approval record bound to its
+   current canonical hash. Do not present that record as independent proof of
+   human approval.
 3. Validate and materialize tasks again immediately before initialization.
 4. Use `init-run` to create durable state and a dedicated non-default branch.
    Record target, start commit, repository identity, orchestration Git
@@ -287,9 +294,9 @@ For each task:
 7. After three failures, block and report the impasse. Do not silently take
    over. `check-micro-fix` returns only a caller-attested mechanical result,
    not verified evidence. A Claude micro-fix additionally requires independent
-   inspection, a recorded recovery decision, and user approval, and must use a
-   fresh candidate worktree and the complete normal evidence and acceptance
-   path.
+   inspection, a recorded recovery decision, and a caller-attested
+   user-approval decision, and must use a fresh candidate worktree and the
+   complete normal evidence and acceptance path.
 
 ### Accept, commit, and advance
 
@@ -333,7 +340,8 @@ evidence, sandbox probes, and provider capabilities before changing anything.
 Report the exact recovery point. Continue through normal transition
 subcommands only when consistent. Otherwise stop without guessing or
 overwriting. Use `abandon-run` only after the user explicitly chooses
-abandonment; preserve evidence.
+abandonment; preserve evidence. Recovery and abandonment decisions are
+model-attested unless a separate forced user-confirmation surface is added.
 
 ## Status mode
 

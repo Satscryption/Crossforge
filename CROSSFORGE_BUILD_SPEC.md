@@ -157,6 +157,34 @@ Crossforge is not an LLM gateway. It does not replace Claude Code's backend or
 translate OAuth credentials. It invokes locally authenticated provider CLIs in
 controlled worktrees.
 
+### Assurance vocabulary
+
+Use these labels consistently in code, documentation, evidence, and user
+summaries:
+
+- **Control-verified:** derived by deterministic code from observed bytes,
+  process effects, repository state, or remote readback. Caller-authored
+  substitutes are rejected.
+- **User-confirmed:** the supported host forces a user prompt over a
+  control-generated disclosure and the control layer revalidates it. Provider
+  consent uses this assurance.
+- **Caller-attested/model-attested:** schema and internal consistency are
+  checked, but the control layer cannot prove human provenance or semantic
+  truth. This includes plan content and `planApproval`,
+  `--publication-requested`, `--target-change-approved`, recovery decisions,
+  and micro-fix semantic inputs.
+- **Provider claim:** untrusted provider-authored narrative or status.
+
+The non-model-invocable shipping skill provides a user-scoped host entry
+boundary, but its Python intent and destination-override flags remain
+caller-attested. Plan approval is exact-hash-bound but has no separate
+user-confirmation hook.
+
+Crossforge strongly defends against provider and repository misbehavior. It
+constrains a misaligned orchestrating model with deterministic invariants once
+policy is recorded, but relies on workflow convention for model-attested
+intent, plan semantics, and recovery assertions.
+
 ### Starting-point designs and provenance
 
 Crossforge is an independent implementation informed by:
@@ -258,7 +286,9 @@ orchestration checkout.
 ### CF-I07: No external publishing from the main skill
 
 `crossforge` may create local branches and commits. Only `crossforge-ship` may
-push or create a PR, and only when user intent authorizes it.
+push or create a PR. The skill requires direct user invocation; its Python
+publication-intent and destination-override flags are caller attestations, not
+independent proof of the original user prompt.
 
 ### CF-I08: Tokens remain provider-owned
 
@@ -499,8 +529,10 @@ The main skill supports these modes:
 - Read-only with respect to product code.
 - Produces an authoritative plan.
 - Produces canonical `plan.json` and rendered `plan.md`.
-- Shows the canonical plan to the user and records approval only after an
-  explicit affirmative response.
+- Shows the canonical plan to the user and instructs the orchestrator to record
+  approval only after an explicit affirmative response. The resulting
+  `planApproval` is model-attested; deterministic code validates its exact
+  hash binding but not its human provenance.
 - Writes a terminal `complete` plan-mode run directory but does not claim the
   repository `active` pointer.
 - Medium-risk plans receive one external read-only critique when available.
@@ -1047,7 +1079,7 @@ blocked -> in_progress
 ```
 
 `complete` is terminal. A task may leave `blocked` only after the blocker and
-the user-approved recovery decision are appended to `decisions.md`.
+the caller-attested recovery decision are appended to `decisions.md`.
 
 ### Provider report
 
@@ -1148,9 +1180,10 @@ deterministic human-readable rendering of the same data and is never parsed
 back into JSON.
 
 An externally supplied Markdown plan must first be converted by Claude into a
-candidate `plan.json`, shown to the user, and explicitly approved. The approval
-records the exact JSON SHA-256. Editing either representation after approval
-invalidates the approval.
+candidate `plan.json`, shown to the user, and explicitly approved according to
+the skill workflow. The model-attested approval record names the exact JSON
+SHA-256. Editing either representation after approval invalidates the binding;
+the binding does not prove who supplied the approval.
 
 Canonical schema:
 
@@ -1264,7 +1297,8 @@ Before build mode, every task must have:
 - A non-empty global verification gate for build mode.
 - A valid target branch. Remote may be `null` for local-only work; shipping then
   requires an explicit valid remote.
-- Explicit approval bound to the canonical `plan.json` hash.
+- A caller-attested approval record bound to the canonical `plan.json` hash;
+  this validates byte consistency, not human provenance.
 
 When `--no-commit` is selected, plan validation additionally requires exactly
 one task. Multi-task no-commit builds are rejected before run initialization.
@@ -2051,7 +2085,8 @@ The lock contains:
 
 Use atomic exclusive creation. A live lock blocks another writer. A stale lock
 may be cleared only after confirming the PID is absent on the same host or after
-explicit user approval when host identity differs.
+a caller-attested user-approval decision when host identity differs. The
+control layer does not authenticate that decision's human provenance.
 
 `repository.lock` uses the same ownership and stale-lock rules and serializes
 active-pointer changes, branch acceptance, provider-stat updates, cleanup, and
@@ -2716,7 +2751,8 @@ The body must:
 3. Resolve configuration and run local-only preflight.
 4. Obtain provider `probe` consent before any remote model/readiness call.
 5. Resolve provider capabilities and availability.
-6. Plan or load the canonical plan and obtain hash-bound approval.
+6. Plan or load the canonical plan and obtain a caller-attested, hash-bound
+   approval record; do not describe it as independently user-verified.
 7. Validate and materialize tasks.
 8. Initialize the build run and dedicated branch.
 9. Run tasks serially.
@@ -2732,6 +2768,7 @@ The skill must clearly distinguish:
 
 - Claude judgment.
 - Script-enforced invariants.
+- Caller/model attestations.
 - Provider claims.
 - Independently verified evidence.
 
@@ -2852,7 +2889,8 @@ A retry resumes from the last durable shipment checkpoint and always performs
 remote readback before a write. The authorization tuple—repository identity,
 run ID, remote, head, target, and final commit—is immutable after
 `authorize-shipment`; a mismatch requires cancellation before any write or a
-new shipment record after explicit user approval.
+new shipment record after a caller-attested destination approval within the
+user-invoked shipping workflow.
 
 `--dry-run` stops before authorization and external writes. If authorization
 exists but no external write occurred, `cancel-shipment` may clear it after
@@ -2935,7 +2973,8 @@ Create `docs/THREAT_MODEL.md` covering:
 - Mandatory provider-independent gate sandbox with network denial.
 - Separate worktrees and locks.
 - Argument-array subprocess execution.
-- Gate-command policy and explicit plan approval.
+- Gate-command policy and an exact-hash-bound, model-attested plan-approval
+  record.
 - Base-commit checks.
 - Atomic state writes.
 - Separate shipping skill.
@@ -3153,7 +3192,8 @@ Use fake executables to test:
 - Crash after push resumes without a second push.
 - Crash after PR creation discovers and reuses the existing PR.
 - Open and closed matching PR lookup.
-- Target mismatch requires explicit approval.
+- Target mismatch requires a caller-attested destination approval within the
+  user-invoked shipping workflow.
 - Shipment transition and remote-readback validation.
 
 ### Optional live smoke tests
@@ -3938,11 +3978,12 @@ Crossforge `0.1.0` is complete only when:
 18. Unavailable providers fail loudly.
 19. Multi-task `--no-commit` plans are rejected before initialization.
 20. Normal Crossforge execution cannot push or create a PR.
-21. `crossforge-ship` requires completed state and current explicit publication
-    intent.
+21. `crossforge-ship` requires completed state, its user-scoped host boundary,
+    and a fresh caller-attested publication-intent flag.
 22. Shipping retries cannot duplicate a push or pull request.
 23. Interrupted runs can be resumed from repository-common disk state.
-24. Canonical plan approval is bound to the exact structured plan hash.
+24. Canonical plan approval is bound to the exact structured plan hash and
+    documented as model-attested rather than proof of human provenance.
 25. Documentation describes actual implemented behavior.
 26. Third-party notices contain only verified provenance.
 27. No required Python runtime package exists outside the standard library;

@@ -261,7 +261,29 @@ argv, working directories, executable paths, and raw diagnostics.
 `check-micro-fix` remains a compatibility surface for mechanical policy
 checks, but its result is explicitly `caller-attested`. It is not verified
 evidence and cannot authorize a micro-fix without independent inspection, a
-durable recovery decision, and user approval.
+durable recovery decision, and a caller-attested user-approval decision.
+
+### DEV-010: Security documentation distinguishes binding from provenance
+
+Crossforge uses four assurance labels. Control-verified evidence is derived
+from observed bytes, process effects, repository state, or remote readback.
+User-confirmed consent is produced only after the supported host forces a
+prompt over a sealed control-generated disclosure. Caller/model attestations
+are schema- and hash-checked statements whose human provenance or semantic
+truth the Python layer cannot establish. Provider claims remain untrusted.
+
+Earlier documentation treated an exact hash binding as if it also proved who
+approved the bytes. It did not. `planApproval` remains model-attested because
+there is no separate user-only plan-approval hook. The user-invoked shipping
+skill establishes a host-level entry boundary, while
+`--publication-requested` and `--target-change-approved` remain caller
+assertions. Recovery decisions and micro-fix semantic inputs have the same
+caller-attested assurance.
+
+This framing does not downgrade controls added elsewhere: provider capability
+effects, consent request bindings, independent gate receipts, patch/tree
+identity, shipping authorization tuples, and remote readback are still
+control-derived or separately user-confirmed as documented.
 
 ## Verification limitations
 

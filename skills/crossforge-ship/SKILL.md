@@ -38,6 +38,12 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge-ship/scripts/crossforge_ship.py
 Reject unknown arguments. Read
 [the shipping protocol](references/shipping-protocol.md) before acting.
 
+Direct invocation of this non-model-invocable skill establishes the supported
+user-scoped entry boundary. The Python `--publication-requested` and
+`--target-change-approved` flags are nevertheless caller attestations: the
+control layer validates the authorization they create but cannot inspect the
+original prompt or authenticate who supplied each flag.
+
 ## Required sequence
 
 1. Confirm that the current user request explicitly asks for publication.
@@ -46,7 +52,8 @@ Reject unknown arguments. Read
    checkout, recreate isolated final verification, and run the canonical
    structured global gate in the gate sandbox.
 3. Resolve the remote and target from explicit arguments or the approved plan.
-   A mismatch requires explicit approval and a new preflight.
+   A mismatch requires a caller-attested destination approval and a new
+   preflight; report that assurance accurately.
 4. Let `ship-preflight` read the remote head and target. Stop on divergence;
    never pull, merge, rebase, or force push. `ship-preflight` itself creates a
    fresh verification worktree, runs the canonical global commands, and binds
