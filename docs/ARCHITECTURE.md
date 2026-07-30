@@ -125,11 +125,11 @@ normalized, credential-free origin URL (or `<no-origin>`). A fixed,
 source-free readiness prompt requires `probe` consent. Source-bearing
 operations require consent for their exact provider and operation class.
 
-Consent is also bound to expiry, the deny-policy hash, and the discovered
-managed-policy hash. Provider capability evidence must prove denial of network,
-outside-worktree access, common Git state, orchestration checkout, and
-credential directories. Failed or inconclusive proof marks the provider
-unavailable.
+Consent is also bound to expiry, the deny-policy hash, the discovered
+managed-policy hash, and the exact provider executable path and content hash.
+Provider capability evidence must prove denial of network, outside-worktree
+access, common Git state, orchestration checkout, and credential directories.
+Failed or inconclusive proof marks the provider unavailable.
 
 ### 3. Candidate creation and context preparation
 
@@ -224,11 +224,21 @@ Capability evidence must be fresh (no older than 24 hours), executable- and
 policy-bound, stored beneath the run's owner-private `evidence/preflight`
 directory, and hash-bound in `run.json.providers`. An arbitrary path supplied
 only by the invocation request is rejected. `record-capability` is the sole
-transaction that validates and atomically copies trusted platform/provider
-negative-probe output into that location and updates the run binding; if no
-such platform probe is available, the provider remains unavailable. Every provider attempt writes to
-an immutable `provider/attempt-NN/` directory containing its own brief,
-context, runtime, policy, raw output, patch, and validated report.
+producer and binding transaction: it resolves the installed provider from
+`PATH`, requires it to match the identity explicitly pinned by
+`record-consent`, rejects executable locations beneath repository, state, or
+temporary roots, creates nonce-bound protected sentinels, and requires
+repository-bound `probe` consent. Codex launches Crossforge's fixed helper
+directly through the CLI's stable sandbox command. Grok exposes only its
+command tool and must produce a parent-private control-host hook receipt for
+the exact sealed helper command. The trusted parent re-hashes the helper,
+specification, hook, and hook settings after execution, then derives schema-v2
+results from observed read, write, and loopback-network effects. Callers cannot
+supply booleans, an evidence path, or an executable override. Missing, forged,
+mutated, partial, failed, or inconclusive output is rejected and never bound.
+Every provider attempt writes to an immutable
+`provider/attempt-NN/` directory containing its own brief, context, runtime,
+policy, raw output, patch, and validated report.
 
 ### 6. Restoration, scope, and capture
 

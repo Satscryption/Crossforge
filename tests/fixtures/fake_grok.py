@@ -22,6 +22,21 @@ HELP = """usage: grok
 --sandbox PROFILE
 --prompt TEXT
 """
+CURRENT_HELP = """usage: grok
+--cwd DIR
+--model MODEL
+--output-format json
+--permission-mode dontAsk
+--sandbox PROFILE
+--disable-web-search
+--no-subagents
+--no-memory
+--max-turns N
+--tools TOOLS
+--allow RULE
+--deny RULE
+--single PROMPT
+"""
 
 
 def truthy(name: str) -> bool:
@@ -41,7 +56,12 @@ def main() -> int:
         print("grok-cli 0.9.1")
         return 0
     if args == ["--help"]:
-        print(HELP.replace("--sandbox PROFILE\n", "") if truthy("FAKE_UNSAFE_HELP") else HELP)
+        help_text = CURRENT_HELP if truthy("FAKE_CURRENT_HELP") else HELP
+        print(
+            help_text.replace("--sandbox PROFILE\n", "")
+            if truthy("FAKE_UNSAFE_HELP")
+            else help_text
+        )
         return 0
     if args == ["models"]:
         if truthy("FAKE_AUTH_FAIL"):
@@ -72,7 +92,13 @@ def main() -> int:
     if truthy("FAKE_INVOKE_FAIL"):
         print(f"failure in {os.getcwd()} api_key=do-not-return", file=sys.stderr)
         return 7
-    prompt = args[args.index("--prompt") + 1] if "--prompt" in args else ""
+    prompt = (
+        args[args.index("--single") + 1]
+        if "--single" in args
+        else args[args.index("--prompt") + 1]
+        if "--prompt" in args
+        else ""
+    )
     print(json.dumps({"provider": "grok", "prompt": prompt, "result": "ok"}))
     if child is not None:
         child.wait()

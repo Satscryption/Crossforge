@@ -22,20 +22,10 @@ from .base import (
     validate_evidence_path,
     write_final_from_output,
 )
+from .grok_policy import build_grok_argv, detect_grok_cli_shape
 
 CapabilitySource = Callable[[str], CapabilityProbe]
 _SAFE_PREFIX_PART = re.compile(r"^[A-Za-z0-9_./:=+@%,-]+$")
-_REQUIRED_HELP_FLAGS = (
-    "--no-auto-update",
-    "--cwd",
-    "--model",
-    "--output-format",
-    "--permission-mode",
-    "--allow",
-    "--disallow",
-    "--sandbox",
-    "--prompt",
-)
 
 
 class GrokCLIAdapter(ProviderAdapter):
@@ -60,6 +50,7 @@ class GrokCLIAdapter(ProviderAdapter):
         )
         self._probe_timeout = probe_timeout_seconds
         self._last_probe: ProviderProbe | None = None
+        self._cli_shape: str | None = None
 
     @staticmethod
     def _validate_prefix(prefix: Sequence[str]) -> tuple[str, ...]:
@@ -178,13 +169,14 @@ class GrokCLIAdapter(ProviderAdapter):
                 env=self._env,
             )
             help_text = help_result.stdout_preview.decode("utf-8", "replace")
-            missing = tuple(flag for flag in _REQUIRED_HELP_FLAGS if flag not in help_text)
-            if help_result.timed_out or help_result.exit_code != 0 or missing:
-                detail = (
-                    "missing required safe headless flags: " + ", ".join(missing)
-                    if missing
-                    else "Grok help inspection failed"
-                )
+            try:
+                cli_shape = detect_grok_cli_shape(help_text)
+            except ValueError as error:
+                cli_shape = None
+                detail = str(error)
+            if help_result.timed_out or help_result.exit_code != 0 or cli_shape is None:
+                if help_result.timed_out or help_result.exit_code != 0:
+                    detail = "Grok help inspection failed"
                 return self._failed_probe(
                     requested_model=requested_model,
                     effort=effort,
@@ -193,6 +185,7 @@ class GrokCLIAdapter(ProviderAdapter):
                     executable=executable,
                     version=version,
                 )
+            self._cli_shape = cli_shape
             if self._capability_source is None:
                 return self._failed_probe(
                     requested_model=requested_model,
@@ -276,30 +269,18 @@ class GrokCLIAdapter(ProviderAdapter):
         review: bool,
         prompt: str,
     ) -> tuple[str, ...]:
-        argv = [
-            str(executable),
-            "--no-auto-update",
-            "--cwd",
-            str(worktree.resolve()),
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "dontAsk",
-            "--sandbox",
-            "read-only" if review else "workspace-write",
-        ]
-        if requested_model != "auto":
-            argv.extend(("--model", requested_model))
-        for tool in ("Read", "Grep", "Glob"):
-            argv.extend(("--allow", tool))
-        if not review:
-            argv.extend(("--allow", "Edit"))
-            for prefix in self._verification_prefixes:
-                argv.extend(("--allow", f"Bash({' '.join(prefix)}:*)"))
-        for tool in ("WebSearch", "RemoteMCP", "Computer", "Network"):
-            argv.extend(("--disallow", tool))
-        argv.extend(("--prompt", prompt))
-        return tuple(argv)
+        if self._cli_shape is None:
+            raise ValueError("Grok CLI shape was not established by preflight")
+        return build_grok_argv(
+            executable,
+            shape=self._cli_shape,
+            worktree=worktree,
+            requested_model=requested_model,
+            sandbox="read-only" if review else "workspace-write",
+            prompt=prompt,
+            review=review,
+            verification_command_prefixes=self._verification_prefixes,
+        )
 
     def _invoke(
         self,

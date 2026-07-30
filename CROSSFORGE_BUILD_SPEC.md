@@ -597,7 +597,7 @@ The loader must reject unknown keys by default to catch misspellings.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "budget": "balanced",
   "strategy": "auto",
   "providers": {
@@ -1516,6 +1516,19 @@ negative probe is failed or inconclusive, Codex is unavailable. The candidate
 is already a valid Git worktree, so `--skip-git-repo-check` is neither required
 nor permitted.
 
+The control layer must produce this evidence itself with a fixed,
+nonce-bound, source-free probe contract. Public commands must not accept
+caller-authored capability booleans, an evidence file, or a provider
+executable override. The parent derives results from observed probe effects
+and atomically binds only complete producer-marked evidence. Codex must launch
+the helper through its direct sandbox command rather than ask a model to
+execute it. Where a provider lacks a direct sandbox command, the trusted CLI
+host must produce a parent-private receipt proving selection of the exact
+sealed helper command. Re-hash the helper, specification, hook, and hook
+settings after execution. A missing receipt, skipped helper, mutated contract,
+malformed result, unsafe or unapproved executable identity, or successful
+forbidden operation fails closed.
+
 `final_output_path` is an owner-only evidence path written by the trusted Codex
 CLI host process, not by model-generated tools. The probe must confirm that the
 path is not readable or writable through Codex tools. If the installed CLI
@@ -1873,6 +1886,8 @@ and explicit-port examples.
       ],
       "denyPolicySha256": "hex",
       "managedPolicySha256": "hex-or-no-managed-policy",
+      "providerExecutablePath": "/canonical/absolute/path",
+      "providerExecutableSha256": "hex",
       "approvedAt": "RFC3339 UTC",
       "expiresAt": "RFC3339 UTC"
     },
@@ -1885,6 +1900,8 @@ and explicit-port examples.
       ],
       "denyPolicySha256": "hex",
       "managedPolicySha256": "hex-or-no-managed-policy",
+      "providerExecutablePath": "/canonical/absolute/path",
+      "providerExecutableSha256": "hex",
       "approvedAt": "RFC3339 UTC",
       "expiresAt": "RFC3339 UTC"
     }
@@ -1898,9 +1915,11 @@ approval through normal interaction and then invokes an explicit
 provider availability.
 
 Before approval, show provider, operation classes, repository identity prefix,
-deny-policy hash prefix, managed-policy hash prefix, consent expiry, and—for
-source-bearing operations—the context-manifest file count and total bytes. Do
-not display secret findings or file contents in the consent prompt.
+deny-policy hash prefix, managed-policy hash prefix, provider executable path
+and content-hash prefix, consent expiry, and—for source-bearing operations—the
+context-manifest file count and total bytes. Persist the canonical executable
+identity in consent; any later path or byte change invalidates approval. Do not
+display secret findings or file contents in the consent prompt.
 
 Local executable discovery, version output, help inspection, and local login
 status may run before consent because they transmit no repository content and

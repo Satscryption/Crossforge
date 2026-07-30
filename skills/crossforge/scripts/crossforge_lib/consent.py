@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .errors import ConsentError
 from .util import atomic_write_json
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 VALID_OPERATION_CLASSES = frozenset({"probe", "plan", "review", "implement"})
 NO_MANAGED_POLICY = "no-managed-policy"
 
@@ -67,6 +67,12 @@ def _require_sha256(value: object, field: str, *, allow_literal: bool = False) -
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise ConsentError(f"{field} must be a lowercase SHA-256 hex digest")
+    return value
+
+
+def _require_nonempty_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConsentError(f"{field} must be a non-empty string")
     return value
 
 
@@ -152,6 +158,8 @@ def validate_consent(record: Mapping[str, object]) -> dict[str, Any]:
         "operationClasses",
         "denyPolicySha256",
         "managedPolicySha256",
+        "providerExecutablePath",
+        "providerExecutableSha256",
         "approvedAt",
         "expiresAt",
     }
@@ -179,6 +187,18 @@ def validate_consent(record: Mapping[str, object]) -> dict[str, Any]:
             ),
             "managedPolicySha256": _require_sha256(
                 raw_entry.get("managedPolicySha256"), "managedPolicySha256"
+            ),
+            "providerExecutablePath": str(
+                Path(
+                    _require_nonempty_string(
+                        raw_entry.get("providerExecutablePath"),
+                        "providerExecutablePath",
+                    )
+                ).expanduser().resolve()
+            ),
+            "providerExecutableSha256": _require_sha256(
+                raw_entry.get("providerExecutableSha256"),
+                "providerExecutableSha256",
             ),
             "approvedAt": _format_timestamp(approved_at),
             "expiresAt": _format_timestamp(expires_at),
@@ -214,6 +234,8 @@ def record_consent(
     operation_classes: Iterable[str],
     deny_policy_sha256: str,
     managed_policy_sha256: str,
+    provider_executable_path: str,
+    provider_executable_sha256: str,
     ttl_days: int,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -232,6 +254,16 @@ def record_consent(
     )
     managed_policy_sha256 = _require_sha256(
         managed_policy_sha256, "managedPolicySha256"
+    )
+    executable_path = str(
+        Path(
+            _require_nonempty_string(
+                provider_executable_path, "providerExecutablePath"
+            )
+        ).expanduser().resolve()
+    )
+    provider_executable_sha256 = _require_sha256(
+        provider_executable_sha256, "providerExecutableSha256"
     )
     if not isinstance(provider, str) or not provider:
         raise ConsentError("provider must be a non-empty string")
@@ -252,6 +284,8 @@ def record_consent(
         "operationClasses": operations,
         "denyPolicySha256": deny_policy_sha256,
         "managedPolicySha256": managed_policy_sha256,
+        "providerExecutablePath": executable_path,
+        "providerExecutableSha256": provider_executable_sha256,
         "approvedAt": _format_timestamp(approved_at),
         "expiresAt": _format_timestamp(expires_at),
     }
@@ -274,6 +308,8 @@ def check_consent(
     operation_class: str,
     deny_policy_sha256: str,
     managed_policy_sha256: str,
+    provider_executable_path: str,
+    provider_executable_sha256: str,
     now: datetime | None = None,
 ) -> ConsentCheck:
     """Check consent without mutating state or inferring approval."""
@@ -297,6 +333,12 @@ def check_consent(
         return ConsentCheck(False, "deny_policy_changed")
     if entry["managedPolicySha256"] != managed_policy_sha256:
         return ConsentCheck(False, "managed_policy_changed")
+    if entry["providerExecutablePath"] != str(
+        Path(provider_executable_path).expanduser().resolve()
+    ):
+        return ConsentCheck(False, "provider_executable_changed")
+    if entry["providerExecutableSha256"] != provider_executable_sha256:
+        return ConsentCheck(False, "provider_executable_changed")
     current_time = _as_utc(now or _utc_now())
     if current_time >= _parse_timestamp(entry["expiresAt"], "expiresAt"):
         return ConsentCheck(False, "consent_expired")
@@ -318,6 +360,8 @@ def consent_summary(
     operation_classes: Iterable[str],
     deny_policy_sha256: str,
     managed_policy_sha256: str,
+    provider_executable_path: str,
+    provider_executable_sha256: str,
     expires_at: datetime,
     context_manifest: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -330,6 +374,10 @@ def consent_summary(
         "repositoryIdentityPrefix": repository_identity[:12],
         "denyPolicySha256Prefix": deny_policy_sha256[:12],
         "managedPolicySha256Prefix": managed_policy_sha256[:12],
+        "providerExecutablePath": str(
+            Path(provider_executable_path).expanduser().resolve()
+        ),
+        "providerExecutableSha256Prefix": provider_executable_sha256[:12],
         "expiresAt": _format_timestamp(expires_at),
     }
     if any(operation != "probe" for operation in operations) and context_manifest:

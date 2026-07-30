@@ -23,6 +23,7 @@ if str(SCRIPTS) not in sys.path:
 import crossforge as crossforge_cli  # noqa: E402
 from crossforge_lib.config import load_config  # noqa: E402
 from crossforge_lib.consent import deny_policy_hash, record_consent  # noqa: E402
+from crossforge_lib.errors import InvalidInputError, PreconditionError  # noqa: E402
 from crossforge_lib.gates import ProbeCheck, SandboxProbeResult  # noqa: E402
 from crossforge_lib.git import (  # noqa: E402
     discover_repository,
@@ -395,17 +396,21 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
         )
         managed_hash = "b" * 64
         capability_record = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
+            "producer": crossforge_cli.CAPABILITY_PRODUCER_ID,
             "provider": "codex",
             "sourceFree": True,
-            # Capability evidence must fall inside the control layer's freshness
-            # window (crossforge.py: [-5min, +24h]); a fixed stamp made this test
-            # a time bomb that failed 24h after it was written. Stamp it at now.
             "recordedAt": utc_now(),
             "executablePath": str(executable),
             "executableSha256": sha256_file(executable),
-            "sandboxPolicySha256": "a" * 64,
+            "sandboxPolicySha256": crossforge_cli.provider_sandbox_policy_sha256(
+                "codex"
+            ),
             "managedPolicySha256": managed_hash,
+            "probeContractSha256": (
+                crossforge_cli.provider_capability_contract_sha256()
+            ),
+            "probeResultSha256": "d" * 64,
             "message": "all boundaries proven",
             "sandboxEnforced": True,
             "networkDenied": True,
@@ -417,25 +422,52 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             "finalOutputProtected": True,
             "conclusive": True,
         }
-        atomic_write_json(capability, capability_record)
-        capability_input = self.root / "trusted-platform-capability.json"
-        atomic_write_json(capability_input, capability_record)
-        code, stdout, stderr = invoke_cli(
-            "record-capability",
-            "--git-common-dir",
-            str(self.common),
-            "--run-id",
-            run_id,
-            "--provider",
-            "codex",
-            "--evidence",
-            str(capability_input),
-            "--executable",
-            str(executable),
-            "--json",
-        )
-        self.assertEqual(0, code, stdout + stderr)
         config = load_config()
+        deny_hash = deny_policy_hash(
+            config.deny_paths,
+            DETECTOR_NAMES,
+            (),
+            crossforge_cli._CONTEXT_POLICY,
+        )
+        record_consent(
+            store.root / "consent.json",
+            repository_identity=identity,
+            provider="codex",
+            operation_classes=["implement", "probe"],
+            deny_policy_sha256=deny_hash,
+            managed_policy_sha256=managed_hash,
+            provider_executable_path=str(executable),
+            provider_executable_sha256=sha256_file(executable),
+            ttl_days=90,
+        )
+        with mock.patch.object(
+            crossforge_cli,
+            "produce_provider_capability",
+            return_value=capability_record,
+        ), mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, sha256_file(executable)),
+        ), mock.patch.object(
+            crossforge_cli.shutil,
+            "which",
+            return_value=str(executable),
+        ):
+            code, stdout, stderr = invoke_cli(
+                "record-capability",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+                "--provider",
+                "codex",
+                "--managed-policy-sha256",
+                managed_hash,
+                "--json",
+            )
+        self.assertEqual(0, code, stdout + stderr)
         store.record_task_routing(
             run_id,
             "T1",
@@ -450,21 +482,6 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
                     }
                 },
             },
-        )
-        deny_hash = deny_policy_hash(
-            config.deny_paths,
-            DETECTOR_NAMES,
-            (),
-            crossforge_cli._CONTEXT_POLICY,
-        )
-        record_consent(
-            store.root / "consent.json",
-            repository_identity=identity,
-            provider="codex",
-            operation_classes=["implement", "probe"],
-            deny_policy_sha256=deny_hash,
-            managed_policy_sha256=managed_hash,
-            ttl_days=90,
         )
         class FakeAdapter:
             def probe(self, requested_model: str, effort: str) -> ProviderProbe:
@@ -622,6 +639,264 @@ class ProviderBoundaryCLIRegressionTests(CLITestCase):
             (worktree / ".git").is_file(),
             "a rejected invocation must leave the linked-worktree control file intact",
         )
+
+    def test_record_capability_rejects_caller_authored_evidence(self) -> None:
+        forged = self.root / "caller-authored-capability.json"
+        forged.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "producer": crossforge_cli.CAPABILITY_PRODUCER_ID,
+                    "provider": "codex",
+                    "sandboxEnforced": True,
+                    "conclusive": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code, stdout, stderr = invoke_cli(
+            "record-capability",
+            "--git-common-dir",
+            str(self.common),
+            "--run-id",
+            "20260724T120000Z-1234abcd",
+            "--provider",
+            "codex",
+            "--managed-policy-sha256",
+            "a" * 64,
+            "--evidence",
+            str(forged),
+            "--json",
+        )
+
+        self.assertEqual(2, code)
+        self.assertIn("unrecognized arguments: --evidence", stdout + stderr)
+
+    def test_record_capability_rejects_executable_override(self) -> None:
+        code, stdout, stderr = invoke_cli(
+            "record-capability",
+            "--repository",
+            str(self.repository),
+            "--git-common-dir",
+            str(self.common),
+            "--run-id",
+            "20260724T120000Z-1234abcd",
+            "--provider",
+            "codex",
+            "--managed-policy-sha256",
+            "a" * 64,
+            "--executable",
+            str(self.root / "caller-provider"),
+            "--json",
+        )
+
+        self.assertEqual(2, code)
+        self.assertIn("unrecognized arguments: --executable", stdout + stderr)
+
+    def test_failed_producer_result_is_never_durably_bound(self) -> None:
+        store, run_id = self.seed_state(
+            tasks=[runtime_task(self.commit)],
+            active_task=None,
+        )
+        executable = Path(sys.executable).resolve()
+        identity = repository_identity(self.discovered)
+        config = load_config()
+        deny_hash = deny_policy_hash(
+            config.deny_paths,
+            DETECTOR_NAMES,
+            (),
+            crossforge_cli._CONTEXT_POLICY,
+        )
+        record_consent(
+            store.root / "consent.json",
+            repository_identity=identity,
+            provider="codex",
+            operation_classes=["probe"],
+            deny_policy_sha256=deny_hash,
+            managed_policy_sha256="b" * 64,
+            provider_executable_path=str(executable),
+            provider_executable_sha256=sha256_file(executable),
+            ttl_days=90,
+        )
+        failed = {
+            "schemaVersion": 2,
+            "producer": crossforge_cli.CAPABILITY_PRODUCER_ID,
+            "provider": "codex",
+            "sourceFree": True,
+            "recordedAt": utc_now(),
+            "executablePath": str(executable),
+            "executableSha256": sha256_file(executable),
+            "sandboxPolicySha256": crossforge_cli.provider_sandbox_policy_sha256(
+                "codex"
+            ),
+            "managedPolicySha256": "b" * 64,
+            "probeContractSha256": (
+                crossforge_cli.provider_capability_contract_sha256()
+            ),
+            "probeResultSha256": "d" * 64,
+            "message": "credential read escaped",
+            "sandboxEnforced": True,
+            "networkDenied": True,
+            "outsideWriteDenied": True,
+            "credentialReadDenied": False,
+            "orchestrationReadDenied": True,
+            "gitCommonDirReadDenied": True,
+            "outsideSentinelReadDenied": True,
+            "finalOutputProtected": True,
+            "conclusive": True,
+        }
+        with mock.patch.object(
+            crossforge_cli,
+            "produce_provider_capability",
+            return_value=failed,
+        ), mock.patch.object(
+            crossforge_cli,
+            "resolve_provider_executable",
+            return_value=(executable, sha256_file(executable)),
+        ), mock.patch.object(
+            crossforge_cli.shutil,
+            "which",
+            return_value=str(executable),
+        ):
+            code, _stdout, _stderr = invoke_cli(
+                "record-capability",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+                "--provider",
+                "codex",
+                "--managed-policy-sha256",
+                "b" * 64,
+                "--json",
+            )
+
+        self.assertNotEqual(0, code)
+        self.assertFalse(
+            (
+                store.run_dir(run_id)
+                / "evidence"
+                / "preflight"
+                / "codex-capability.json"
+            ).exists()
+        )
+
+    def test_capability_probe_requires_consent_before_external_call(self) -> None:
+        store, run_id = self.seed_state(
+            tasks=[runtime_task(self.commit)],
+            active_task=None,
+        )
+        producer = mock.Mock()
+
+        with mock.patch.object(
+            crossforge_cli,
+            "produce_provider_capability",
+            producer,
+        ):
+            code, _stdout, _stderr = invoke_cli(
+                "record-capability",
+                "--repository",
+                str(self.repository),
+                "--git-common-dir",
+                str(self.common),
+                "--run-id",
+                run_id,
+                "--provider",
+                "codex",
+                "--managed-policy-sha256",
+                "b" * 64,
+                "--json",
+            )
+
+        self.assertNotEqual(0, code)
+        producer.assert_not_called()
+        self.assertFalse(
+            (
+                store.run_dir(run_id)
+                / "evidence"
+                / "preflight"
+                / "codex-capability.json"
+            ).exists()
+        )
+
+    def test_legacy_capability_schema_is_not_accepted_as_proof(self) -> None:
+        executable = Path(sys.executable).resolve()
+        legacy = {
+            "schemaVersion": 1,
+            "provider": "codex",
+            "sourceFree": True,
+            "recordedAt": utc_now(),
+            "executablePath": str(executable),
+            "executableSha256": sha256_file(executable),
+            "sandboxPolicySha256": "a" * 64,
+            "managedPolicySha256": "b" * 64,
+            "message": "caller says every boundary passed",
+            "sandboxEnforced": True,
+            "networkDenied": True,
+            "outsideWriteDenied": True,
+            "credentialReadDenied": True,
+            "orchestrationReadDenied": True,
+            "gitCommonDirReadDenied": True,
+            "outsideSentinelReadDenied": True,
+            "finalOutputProtected": True,
+            "conclusive": True,
+        }
+        path = self.root / "legacy-capability.json"
+        atomic_write_json(path, legacy)
+
+        with self.assertRaisesRegex(
+            InvalidInputError, "missing or unknown fields"
+        ):
+            crossforge_cli._capability_record(
+                str(path),
+                provider="codex",
+                executable=str(executable),
+            )
+
+    def test_stale_probe_contract_or_policy_is_not_accepted(self) -> None:
+        executable = Path(sys.executable).resolve()
+        record = {
+            "schemaVersion": 2,
+            "producer": crossforge_cli.CAPABILITY_PRODUCER_ID,
+            "provider": "codex",
+            "sourceFree": True,
+            "recordedAt": utc_now(),
+            "executablePath": str(executable),
+            "executableSha256": sha256_file(executable),
+            "sandboxPolicySha256": (
+                crossforge_cli.provider_sandbox_policy_sha256("codex")
+            ),
+            "managedPolicySha256": "b" * 64,
+            "probeContractSha256": (
+                crossforge_cli.provider_capability_contract_sha256()
+            ),
+            "probeResultSha256": "d" * 64,
+            "message": "all boundaries proven",
+            "sandboxEnforced": True,
+            "networkDenied": True,
+            "outsideWriteDenied": True,
+            "credentialReadDenied": True,
+            "orchestrationReadDenied": True,
+            "gitCommonDirReadDenied": True,
+            "outsideSentinelReadDenied": True,
+            "finalOutputProtected": True,
+            "conclusive": True,
+        }
+        for field in ("probeContractSha256", "sandboxPolicySha256"):
+            with self.subTest(field=field):
+                changed = dict(record)
+                changed[field] = "f" * 64
+                with self.assertRaisesRegex(
+                    PreconditionError, "different"
+                ):
+                    crossforge_cli._validate_capability_record(
+                        changed,
+                        provider="codex",
+                        executable=str(executable),
+                    )
 
     def test_source_free_provider_probe_excludes_repository_and_source(self) -> None:
         log = self.root / "probe.jsonl"

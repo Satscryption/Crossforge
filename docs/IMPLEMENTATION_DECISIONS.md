@@ -71,14 +71,15 @@ requirements, invariants, and schemas are not weakened by these decisions.
 ## ID-006: Fail-closed capability injection
 
 - **Status:** Accepted
-- **Decision:** Provider adapters require trusted sandbox capability evidence
-  to be supplied by preflight. An adapter with no capability source reports
-  `sandbox_inconclusive` and is unavailable.
+- **Decision:** Provider adapters require control-produced sandbox capability
+  evidence to be supplied by preflight. An adapter with no capability source
+  reports `sandbox_inconclusive` and is unavailable.
 - **Reason:** A CLI’s presence, authentication, or help text does not prove its
   model-issued tools are contained under the installed version and managed
   policy.
-- **Consequences:** Integrators and tests inject a capability result only after
-  the required negative probes. There is no permissive fallback.
+- **Consequences:** Runtime evidence comes only from `record-capability`'s
+  fixed negative-probe producer. Tests may inject deterministic observations;
+  production has no permissive or caller-authored fallback.
 
 ## ID-007: Repository-root plugin layout
 
@@ -103,11 +104,19 @@ alpha limitation pending dedicated durable non-build transaction state.
 
 ### DEV-002: Provider capability probe integration
 
-`record-capability` validates, copies, and atomically binds fresh capability
-evidence produced by the installed provider/platform negative-probe harness.
-The repository does not emulate or fabricate provider-specific model-tool
-containment results. If that trusted harness is unavailable, the provider is
-unavailable and build invocation fails closed.
+`record-capability` runs Crossforge's fixed, source-free negative-probe helper
+through the installed provider's workspace sandbox and atomically binds only
+the resulting producer-marked schema-v2 evidence. Codex uses its direct
+`sandbox` command; Grok requires a control-host hook receipt for the exact
+sealed helper command. The parent rechecks all contract bytes and observes a
+positive workspace control plus denied network, outside-write, credential,
+orchestration, Git-common, outside-sentinel, and final-output operations.
+`record-consent` pins the resolved executable path and hash. The capability
+command accepts no caller-authored evidence or executable override. A missing
+receipt or helper execution, contract mutation, malformed or partial result,
+unsafe or changed executable identity, or failed check leaves the provider
+unavailable. Repository-bound `probe` consent is checked before any external
+provider request.
 
 ## Verification limitations
 
