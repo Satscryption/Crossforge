@@ -382,13 +382,20 @@ authorization.
 
 ## Development and verification
 
-From this directory:
+From this directory, using a Python 3.11+ interpreter:
 
 ```text
-python3 -m unittest discover -s tests -v
-python3 -m json.tool .claude-plugin/plugin.json
-python3 -m json.tool .claude-plugin/marketplace.json
+python3.11 -m unittest discover -s tests -v
+python3.11 -m json.tool .claude-plugin/plugin.json
+python3.11 -m json.tool .claude-plugin/marketplace.json
 ```
+
+The sources use 3.10+ syntax, so a bare `python3` that resolves to an older
+interpreter (for example the 3.9 shipped with macOS Command Line Tools) fails
+to import the test modules. Invoke an explicit 3.11+ interpreter, or put one
+first on `PATH`, so both these commands and the plugin's own `python3` launcher
+resolve it. At runtime the control layer also fails closed with a clear
+"Python 3.11 or newer is required" message if the launcher is too old.
 
 The unit suite requires no provider credentials or network. Real-provider
 checks are opt-in; follow [Live testing](docs/LIVE_TESTING.md).
