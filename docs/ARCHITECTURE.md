@@ -73,13 +73,13 @@ library.
 | `git.py`, `scope.py` | Repository discovery and identity, dedicated branches, exact changed-path calculation, mode/symlink checks, and filter-free staging |
 | `state.py`, `locking.py` | Owner-private repository-common state, valid transitions, atomic pointers, and repository/run/writer locks |
 | `consent.py`, `secrets.py` | Byte-bound short-lived consent requests, expiring policy-bound provider consent, deny-path quarantine, complete readable-context manifests, binary controls, and secret screening |
-| `preflight.py`, `providers/` | Runtime discovery, version and authentication checks, capability evidence, safe Codex/Grok argv, bounded process execution, and sanitized errors |
+| `preflight.py`, `provider_capability.py`, provider capability helpers, `providers/` | Runtime discovery, version and authentication checks, control-produced capability evidence, safe Codex/Grok argv, bounded process execution, and sanitized errors |
 | `worktrees.py` | Recorded detached worktrees, sanitized one-commit Git projections, patch capture, restoration, and proof-driven cleanup |
 | `gates.py`, `evidence.py`, `reports.py` | Gate-command policy, executable identity, sandbox construction/probes, owner-only evidence, provider report validation, and independent eligibility |
 | `routing.py` | Risk/budget/provider routing and comparable provider statistics |
 | `acceptance.py` | Fresh-worktree patch verification, byte-identical application, filter-free staging, and task commit protocol |
 | `shipping.py` | Completed-run validation and idempotent publication checkpoints |
-| `crossforge.py` | Argument-array control CLI and stable operational exit codes |
+| `crossforge.py`, the consent/shipping launchers, `crossforge_boundary.py` | Shared argument-array handlers, three disjoint CLI surfaces, fail-closed skill boundaries, and stable operational exit codes |
 
 The Markdown agents under `agents/` are read-only advisors. They are not
 provider lane supervisors and cannot invoke Bash. Detailed skill protocols live
@@ -141,6 +141,11 @@ Executable version/help/login-status checks that make no model request may run
 without source consent. Remote readiness calls do not.
 
 ### 2. Consent and capability
+
+Release 0.1.0 creates provider capability evidence only after `init-run`
+establishes an active build, because the evidence path and its binding are
+run-scoped. Plan mode, standalone review, and status perform no external
+provider transaction.
 
 The repository identity is the SHA-256 of the canonical repository root and a
 normalized, credential-free origin URL (or `<no-origin>`). A fixed,
@@ -348,10 +353,12 @@ providers are enabled, available, consented, and policy-compatible. `auto`
 uses task risk/class, budget, and comparable repository-local history. Fixed
 strategies never fall back silently.
 
-High-risk planning uses the read-only commitment advisor and independent plan
-critiques where available. Claude-family review counts as independent only
-when a known different provider family authored the candidate. Unknown
-authorship is recorded rather than presented as independent.
+High-risk planning uses the read-only commitment advisor and local Claude
+critique. Release 0.1.0 does not call Codex or Grok for plan-mode critique or
+standalone review. During build work, Claude-family candidate review counts as
+independent only when a known different provider family authored the
+candidate. Unknown authorship is recorded rather than presented as
+independent.
 
 ## Durable state and locks
 
@@ -428,3 +435,5 @@ no authorization or write.
 Security assumptions, threats, controls, and residual risks are maintained in
 [THREAT_MODEL.md](THREAT_MODEL.md). Operational recovery is detailed in the
 skill’s [recovery reference](../skills/crossforge/references/recovery.md).
+The implementation status of security-review findings #3–#15 is indexed in
+[SECURITY_REVIEW_CLOSEOUT.md](SECURITY_REVIEW_CLOSEOUT.md).

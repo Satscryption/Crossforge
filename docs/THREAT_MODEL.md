@@ -474,6 +474,11 @@ host, which remain out of scope.
 
 ## Security verification
 
+The completed disposition of the review findings that shaped these controls is
+recorded in [SECURITY_REVIEW_CLOSEOUT.md](SECURITY_REVIEW_CLOSEOUT.md). That
+matrix is a traceability index, not substitute evidence: the implementation,
+tests, and live checks remain authoritative.
+
 The default test suite uses fake provider and sandbox executables and performs
 no network request:
 

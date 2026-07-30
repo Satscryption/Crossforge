@@ -33,6 +33,9 @@ schema and hash bindings are checked, but their human provenance is not.
 
 See the [assurance vocabulary and orchestrator boundary](docs/THREAT_MODEL.md#assurance-vocabulary-and-orchestrator-boundary)
 before using Crossforge with valuable source or publication authority.
+The completed remediation of security-review issues #3–#15 is traced from
+finding to control, documentation, and merged PR in the
+[security review closeout](docs/SECURITY_REVIEW_CLOSEOUT.md).
 
 ## How it works
 
@@ -229,16 +232,18 @@ changes. Provider-readable files count as transmitted context even if the
 prompt does not mention them.
 
 Provider capability evidence is not an operator-authored checklist.
-After repository-bound `probe` consent is valid, `record-capability` resolves
-the exact executable pinned when consent was recorded, runs a fresh source-free
-negative-probe transaction, and derives each sandbox result from observed
-filesystem and loopback-network effects. Codex runs the fixed helper directly
-through `codex sandbox`, with no model-authored result path. Grok requires an
-owner-private control-host hook receipt for the exact helper command. The
-parent also re-hashes the helper, sealed specification, hook, and hook settings
-after execution. It accepts neither an evidence file nor an executable
-override. Failed, skipped, forged, mutated, partial, or stale probe inputs
-leave the provider unavailable.
+After `init-run` creates an active build and repository-bound `probe` consent
+is valid, `record-capability` resolves the exact executable pinned when consent
+was recorded, runs a fresh source-free negative-probe transaction, and derives
+each sandbox result from observed filesystem and loopback-network effects.
+Codex runs the fixed helper directly through `codex sandbox`, with no
+model-authored result path. Grok requires an owner-private control-host hook
+receipt for the exact helper command. The parent also re-hashes the helper,
+sealed specification, hook, and hook settings after execution. It accepts
+neither an evidence file nor an executable override. Failed, skipped, forged,
+mutated, partial, or stale probe inputs leave the provider unavailable.
+Plan mode, standalone review, and status do not create this run-bound evidence
+or contact an external provider in 0.1.0.
 
 ## Configuration
 

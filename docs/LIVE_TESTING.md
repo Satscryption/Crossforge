@@ -4,14 +4,17 @@ Crossforge’s default test suite never uses real provider credentials, makes a
 model request, or pushes. Fake Codex, Grok, sandbox, and forge executables cover
 automated integration behavior.
 
-Live checks are optional, quota-consuming, and must be explicitly enabled:
+Live checks are optional and quota-consuming. This release provides the manual
+procedure below rather than a bundled credential-consuming live-test runner.
+Operators may set this marker while following the procedure:
 
 ```text
 CROSSFORGE_LIVE_TESTS=1
 ```
 
-Setting the variable is necessary but not sufficient authorization. Provider
-consent through `/crossforge:crossforge-consent` and publication through
+No Crossforge 0.1.0 test or control command reads this variable, so it is not a
+technical gate and grants no authority. Provider consent through
+`/crossforge:crossforge-consent` and publication through
 `/crossforge:crossforge-ship` remain separate user-invoked surfaces.
 Consent additionally forces a user confirmation over a sealed disclosure.
 Shipping's Python publication/destination flags remain caller-attested even
@@ -87,12 +90,33 @@ prove:
 A failed or inconclusive negative test is a failure. Do not “temporarily”
 relax the profile.
 
-### 4. Run a source-free readiness probe
+### 4. Initialize a one-task build locally
+
+Create and approve the canonical one-task plan, then let the build workflow
+initialize its active run before provider capability work. Confirm that no
+Codex/Grok model request occurred during plan mode or before provider consent.
+`record-capability` is run-bound and must reject a missing, completed, or
+otherwise non-active run.
+
+### 5. Approve probe consent, capability, and readiness
 
 Approve only the `probe` operation class for the disposable repository. The
-probe must send a fixed prompt requesting `READY` (or the active model
-identifier when checking an explicit model) and must contain no repository
-path, remote URL, file name, source, Git metadata, or prior output.
+normal skill must first produce a sealed request and stop for direct invocation
+of `/crossforge:crossforge-consent`. Confirm that the forced host prompt shows
+the exact non-sensitive disclosure and that a declined or mutated request
+writes no consent.
+
+After consent, run `record-capability` for the active run. Verify that the
+result is stored beneath that run's owner-private preflight evidence and is
+derived from observed positive/negative effects, not caller-authored
+booleans. Codex must use the fixed direct sandbox helper. Grok must have the
+matching owner-private control-host receipt. Missing, forged, partial, stale,
+or mutated helper/specification/hook evidence must fail closed.
+
+Only after capability evidence is bound may the source-free readiness request
+run. It must send a fixed prompt requesting `READY` (or the active model
+identifier when checking an explicit model) and contain no repository path,
+remote URL, file name, source, Git metadata, or prior output.
 
 Record that this request may consume provider quota. Verify the resulting
 probe evidence includes:
@@ -100,13 +124,13 @@ probe evidence includes:
 - executable path and CLI version;
 - authentication result without credential values;
 - requested model and resolved model or `cli-default`;
-- safe capability-probe results;
+- the bound safe capability-evidence digest;
 - a sanitized failure category when unavailable.
 
 Run Codex and Grok separately. Do not interpret one provider’s result as proof
 for the other.
 
-### 5. Run one minimal source-bearing task
+### 6. Run one minimal source-bearing task
 
 Review the exact `context-manifest.json` file count and byte total, then approve
 only the required provider and `implement` operation for the disposable
@@ -128,7 +152,7 @@ Verify:
 For a race smoke test, use separate Codex and Grok worktrees and confirm each
 has a distinct writer lock and evidence directory.
 
-### 6. Exercise failure paths
+### 7. Exercise failure paths
 
 Using disposable data only, confirm:
 
@@ -146,7 +170,7 @@ Using disposable data only, confirm:
 Do not ask a real model to seek secrets or attack the host. Use fixed benign
 sentinels created inside the disposable test hierarchy.
 
-### 7. Shipping dry-run only
+### 8. Shipping dry-run only
 
 For routine live validation, use `crossforge-ship --dry-run`. It may perform
 remote read-only preflight but must create no shipment authorization, push, or

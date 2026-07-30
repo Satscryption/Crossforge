@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import re
 import tomllib
 import unittest
+from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -168,6 +169,103 @@ class ScaffoldTests(unittest.TestCase):
             "needs explicit approval",
         ):
             self.assertNotIn(overclaim, combined)
+
+    def test_security_review_closeout_matches_implemented_surfaces(self) -> None:
+        closeout = (PROJECT_ROOT / "docs/SECURITY_REVIEW_CLOSEOUT.md").read_text(
+            encoding="utf-8"
+        )
+        for issue_number in range(3, 16):
+            with self.subTest(issue=issue_number):
+                self.assertIn(
+                    f"https://github.com/Satscryption/Crossforge/issues/{issue_number}",
+                    closeout,
+                )
+        for pull_request in range(17, 27):
+            with self.subTest(pull_request=pull_request):
+                self.assertIn(
+                    f"https://github.com/Satscryption/Crossforge/pull/{pull_request}",
+                    closeout,
+                )
+
+        linked_docs = (
+            "README.md",
+            "docs/ARCHITECTURE.md",
+            "docs/IMPLEMENTATION_DECISIONS.md",
+            "docs/THREAT_MODEL.md",
+        )
+        for relative_path in linked_docs:
+            with self.subTest(path=relative_path):
+                text = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn("SECURITY_REVIEW_CLOSEOUT.md", text)
+
+        specification = (PROJECT_ROOT / "CROSSFORGE_BUILD_SPEC.md").read_text(
+            encoding="utf-8"
+        )
+        config_schema = specification.split(
+            "### Configuration schema", maxsplit=1
+        )[1].split("### Required config validation", maxsplit=1)[0]
+        self.assertIn(
+            "**Target product:** Claude Code plugin with three user-facing skills",
+            specification,
+        )
+        self.assertIn('"schemaVersion": 1', config_schema)
+        self.assertIn(
+            "`record-shipment` to the dedicated shipping CLI, not the normal CLI",
+            specification,
+        )
+        live_testing = (PROJECT_ROOT / "docs/LIVE_TESTING.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "No Crossforge 0.1.0 test or control command reads this variable",
+            live_testing,
+        )
+        self.assertNotIn(
+            "Setting the variable is necessary",
+            live_testing,
+        )
+
+        release_contract = "\n".join(
+            (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+            for relative_path in (
+                "CROSSFORGE_BUILD_SPEC.md",
+                "docs/ARCHITECTURE.md",
+                "skills/crossforge/SKILL.md",
+                "skills/crossforge/references/routing-policy.md",
+            )
+        )
+        for stale_claim in (
+            "**Target product:** Claude Code plugin with two user-facing skills",
+            "Medium-risk plans receive one external read-only critique",
+            "High-risk plans receive independent Codex and Grok critiques",
+            "Obtain independent read-only Codex and Grok plan critiques",
+            "cross-vendor planning, isolated coding",
+        ):
+            self.assertNotIn(stale_claim, release_contract)
+
+    def test_local_markdown_links_resolve(self) -> None:
+        link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+        for document in PROJECT_ROOT.rglob("*.md"):
+            text = document.read_text(encoding="utf-8")
+            for raw_target in link_pattern.findall(text):
+                target = raw_target.strip().strip("<>")
+                if (
+                    not target
+                    or target.startswith("#")
+                    or "://" in target
+                    or target.startswith("mailto:")
+                ):
+                    continue
+                relative_target = target.split("#", maxsplit=1)[0]
+                resolved = (document.parent / relative_target).resolve()
+                with self.subTest(
+                    document=document.relative_to(PROJECT_ROOT),
+                    target=raw_target,
+                ):
+                    self.assertTrue(
+                        resolved.is_file(),
+                        f"{document}: local Markdown link does not resolve: {raw_target}",
+                    )
 
 
 if __name__ == "__main__":

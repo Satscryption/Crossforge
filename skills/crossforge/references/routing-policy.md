@@ -18,9 +18,11 @@ fixed lane.
 - **Medium risk:** use one implementation lane and, when available, a different
   provider family for read-only review. Quality may race when gates provide a
   strong oracle.
-- **High risk:** consult the commitment advisor and obtain independent Codex
-  and Grok plan critiques when available. Race only with objective comparison;
-  otherwise use one implementation lane and two independent reviews.
+- **High risk:** consult the commitment advisor and use a local read-only
+  Claude plan critique. Release 0.1.0 does not call Codex or Grok in plan mode.
+  During build execution, race only with objective comparison; otherwise use
+  one implementation lane and the independently eligible review strategy
+  recorded for the task.
 
 The control layer directly invokes Codex and Grok. Do not route through a
 Bash-capable Claude subagent. The Claude independent reviewer is used only when
