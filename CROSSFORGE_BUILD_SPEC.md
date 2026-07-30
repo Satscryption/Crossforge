@@ -774,6 +774,7 @@ code.
         ├── decisions.md
         ├── worktrees.json
         ├── shipment.json
+        ├── attempt-block-transaction.json  # present only during a transaction
         ├── locks/
         │   └── run.lock
         ├── allowlists/
@@ -815,6 +816,17 @@ All JSON and Markdown state updates must:
 4. `fsync` the containing directory on platforms that support directory
    descriptors.
 5. Never leave a partially written canonical file.
+
+Any mutation spanning both `run.json` and `tasks.json` is serialized under
+`repository.lock` then `run.lock`. Before a canonical record changes, the
+control layer writes a versioned transaction journal containing the operation
+and exact before/after records, including the interface ledger when task
+completion changes it. Recovery takes the same locks, validates the recorded
+run and task transitions, and applies the after-images only when each durable
+record still equals its bound before- or after-image and `active` still names
+the run. A stale, malformed, unknown, or divergent journal fails closed without
+rewriting canonical state. Legacy after-image-only journals may be removed only
+when all canonical records already equal their target; they are never replayed.
 
 Create state and evidence directories with mode `0700` and files with mode
 `0600`, subject to the platform umask. Refuse to use an existing state path
@@ -2810,6 +2822,11 @@ After a successful push or discovery of the exact commit, atomically record the
 remote ref and observed commit before attempting PR creation. After PR creation
 or discovery, atomically record its URL and number. `record-shipment` changes
 the run to `shipped` only when readback proves the recorded remote and PR state.
+Authorization, reconciliation, cancellation, shipment recording, and the final
+run transition are serialized under `repository.lock` then `run.lock`. If a
+process stops after the terminal shipment checkpoint but before the run
+transition, a retry preserves `completedAt` and completes the transition
+without issuing another external write.
 A retry resumes from the last durable shipment checkpoint and always performs
 remote readback before a write. The authorization tuple—repository identity,
 run ID, remote, head, target, and final commit—is immutable after

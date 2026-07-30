@@ -166,6 +166,39 @@ class FileLockTests(unittest.TestCase):
             ).path,
         )
 
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_forked_child_cannot_release_parent_lock(self) -> None:
+        lock = repository_lock(self.root)
+        lock.acquire()
+        child_pid = os.fork()
+        if child_pid == 0:
+            lock.release()
+            os._exit(0)
+        _, status = os.waitpid(child_pid, 0)
+        self.assertEqual(0, status)
+        self.assertTrue(lock.path.exists())
+        lock.release()
+        self.assertFalse(lock.path.exists())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_lock_constructed_before_fork_records_child_pid(self) -> None:
+        lock = repository_lock(self.root)
+        read_fd, write_fd = os.pipe()
+        child_pid = os.fork()
+        if child_pid == 0:
+            os.close(read_fd)
+            with lock:
+                persisted = json.loads(lock.path.read_text(encoding="utf-8"))
+                os.write(write_fd, str(persisted["pid"]).encode("ascii"))
+            os.close(write_fd)
+            os._exit(0)
+        os.close(write_fd)
+        recorded_pid = int(os.read(read_fd, 64).decode("ascii"))
+        os.close(read_fd)
+        _, status = os.waitpid(child_pid, 0)
+        self.assertEqual(0, status)
+        self.assertEqual(child_pid, recorded_pid)
+
 
 if __name__ == "__main__":
     unittest.main()

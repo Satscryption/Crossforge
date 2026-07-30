@@ -699,7 +699,7 @@ def _active_candidate_context(
         raise PreconditionError(
             "candidate operation is not bound to the active run"
         )
-    run = store.load_run(active_run_id)
+    run, task_record = store.load_state(active_run_id)
     identity = repository_identity(repository)
     head_matches_run = (
         resolve_commit(repository, "HEAD") == run["currentCommit"]
@@ -708,7 +708,7 @@ def _active_candidate_context(
     if not head_matches_run and acceptance_recovery_task_id is not None:
         matches = [
             task
-            for task in store.load_tasks(active_run_id)["tasks"]
+            for task in task_record["tasks"]
             if task["id"] == acceptance_recovery_task_id
         ]
         recoverable_acceptance = (
@@ -1524,14 +1524,17 @@ def _cmd_status(args: argparse.Namespace) -> CommandOutput:
             {"activeRunId": None, "latestCompleteRunId": None, "run": None},
         )
     run_id = args.run_id or store.active_run_id() or store.latest_complete_run_id()
-    run = store.load_run(run_id) if run_id else None
+    if run_id:
+        run, tasks = store.load_state(run_id)
+    else:
+        run, tasks = None, None
     data: dict[str, Any] = {
         "activeRunId": store.active_run_id(),
         "latestCompleteRunId": store.latest_complete_run_id(),
         "run": run,
     }
     if run_id:
-        data["tasks"] = store.load_tasks(run_id)
+        data["tasks"] = tasks
     return CommandOutput(
         f"Run {run_id}: {run['status']}" if run else "No active or completed run",
         data,
@@ -2911,8 +2914,7 @@ def _cmd_invoke(args: argparse.Namespace) -> CommandOutput:
     store = StateStore(common_dir)
     run_id = _request_value(value, "runId", str)
     task_id = _request_value(value, "taskId", str)
-    run = store.load_run(run_id)
-    tasks = store.load_tasks(run_id)
+    run, tasks = store.load_state(run_id)
     matches = [item for item in tasks["tasks"] if item["id"] == task_id]
     if len(matches) != 1:
         raise StateInconsistencyError(f"unknown or duplicate task ID: {task_id}")
@@ -3612,14 +3614,15 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> CommandOutput:
         verified_tree_sha256: str,
         quarantine_paths_sha256: str,
     ) -> None:
+        fresh_run, fresh_task_record = store.load_state(run_id)
         if (
             store.active_run_id() != run_id
-            or store.load_run(run_id) != run
+            or fresh_run != run
         ):
             raise StateInconsistencyError(
                 "active run changed during acceptance"
             )
-        fresh_tasks = store.load_tasks(run_id)["tasks"]
+        fresh_tasks = fresh_task_record["tasks"]
         fresh_matches = [
             item for item in fresh_tasks if item["id"] == task_id
         ]

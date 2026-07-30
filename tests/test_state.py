@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
+import threading
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "crossforge" / "scripts"
@@ -13,7 +17,14 @@ if str(SCRIPTS) not in sys.path:
 
 
 from crossforge_lib.errors import PreconditionError, StateInconsistencyError
+from crossforge_lib.locking import (
+    LockHeldError,
+    current_thread_holds_lock,
+    repository_lock,
+    run_lock,
+)
 from crossforge_lib.models import RunStatus, TaskStatus
+import crossforge_lib.state as state_module
 from crossforge_lib.state import StateStore, generate_run_id, plan_sha256
 from crossforge_lib.util import atomic_write_json
 
@@ -163,6 +174,36 @@ class StateStoreTests(unittest.TestCase):
         )
         return run_id, run
 
+    def make_start_transaction(self, run_id: str) -> dict:
+        before_run = self.store.load_run(run_id)
+        before_tasks = self.store.load_tasks(run_id)
+        after_run = deepcopy(before_run)
+        after_tasks = deepcopy(before_tasks)
+        task = after_tasks["tasks"][0]
+        task["status"] = "in_progress"
+        task["baseCommit"] = before_run["currentCommit"]
+        task["updatedAt"] = "2026-07-24T12:01:00Z"
+        after_run["activeTaskId"] = task["id"]
+        after_run["updatedAt"] = task["updatedAt"]
+        return {
+            "schemaVersion": 2,
+            "operation": "start_task",
+            "runId": run_id,
+            "taskId": task["id"],
+            "provider": None,
+            "beforeRun": before_run,
+            "beforeTasks": before_tasks,
+            "beforeInterfaces": None,
+            "run": after_run,
+            "tasks": after_tasks,
+            "interfaces": None,
+        }
+
+    def write_transaction(self, run_id: str, transaction: dict) -> Path:
+        path = self.store.run_dir(run_id) / "attempt-block-transaction.json"
+        atomic_write_json(path, transaction)
+        return path
+
     def test_initialize_uses_common_git_directory_and_private_modes(self) -> None:
         run_id, _ = self.create_run()
         self.assertEqual(run_id, self.store.active_run_id())
@@ -197,6 +238,42 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(run_id, self.store.latest_complete_run_id())
         repeated = self.store.complete_run(run_id)
         self.assertEqual(completed, repeated)
+
+    def test_old_completion_retry_does_not_replace_newer_latest_run(self) -> None:
+        first, _ = self.create_run()
+        self.store.complete_run(first)
+        second, _ = self.create_run()
+        self.store.complete_run(second)
+
+        self.store.complete_run(first)
+
+        self.assertEqual(second, self.store.latest_complete_run_id())
+
+    def test_completion_retry_repairs_interrupted_pointer_update(self) -> None:
+        run_id, _ = self.create_run()
+        original_write_pointer = self.store._write_pointer
+
+        def fail_latest_pointer(name: str, value: str) -> None:
+            if name == "latest-complete":
+                raise OSError("simulated completion pointer crash")
+            original_write_pointer(name, value)
+
+        with patch.object(
+            self.store,
+            "_write_pointer",
+            side_effect=fail_latest_pointer,
+        ):
+            with self.assertRaisesRegex(
+                OSError, "simulated completion pointer crash"
+            ):
+                self.store.complete_run(run_id)
+
+        self.assertEqual("complete", self.store.load_run(run_id)["status"])
+        self.assertEqual(run_id, self.store.active_run_id())
+        repaired = self.store.complete_run(run_id)
+        self.assertEqual("complete", repaired["status"])
+        self.assertEqual(run_id, self.store.latest_complete_run_id())
+        self.assertIsNone(self.store.active_run_id())
 
     def test_abandonment_clears_active_and_invalid_transition_fails(self) -> None:
         run_id, _ = self.create_run()
@@ -288,16 +365,17 @@ class StateStoreTests(unittest.TestCase):
             "commitMessageSha256": "7" * 64,
             "noCommit": False,
         }
-        selected_with_intent = (
-            self.store.record_candidate_acceptance_intent_in_transaction(
-                run_id,
-                "T1",
-                expected_run=run,
-                expected_task=selected,
-                intent=intent,
-                validate_evidence=lambda: validated.append("intent"),
+        with repository_lock(self.store.root):
+            selected_with_intent = (
+                self.store.record_candidate_acceptance_intent_in_transaction(
+                    run_id,
+                    "T1",
+                    expected_run=run,
+                    expected_task=selected,
+                    intent=intent,
+                    validate_evidence=lambda: validated.append("intent"),
+                )
             )
-        )
         accepted = self.store.bind_candidate_acceptance(
             run_id,
             "T1",
@@ -476,14 +554,15 @@ class StateStoreTests(unittest.TestCase):
             "commitMessageSha256": "6" * 64,
             "noCommit": False,
         }
-        selected = self.store.record_candidate_acceptance_intent_in_transaction(
-            run_id,
-            "T1",
-            expected_run=run,
-            expected_task=selected,
-            intent=intent,
-            validate_evidence=lambda: None,
-        )
+        with repository_lock(self.store.root):
+            selected = self.store.record_candidate_acceptance_intent_in_transaction(
+                run_id,
+                "T1",
+                expected_run=run,
+                expected_task=selected,
+                intent=intent,
+                validate_evidence=lambda: None,
+            )
         self.store.bind_candidate_acceptance(
             run_id,
             "T1",
@@ -494,11 +573,62 @@ class StateStoreTests(unittest.TestCase):
             expected_intent=intent,
             validate_evidence=lambda: None,
         )
-        task, run = self.store.finish_task(
-            run_id,
-            "T1",
-            interface_ledger_append="- T1: state interface\n",
+        interface_path = self.store.run_dir(run_id) / "interfaces.md"
+        interface_path.write_text("- prior: existing interface\n", encoding="utf-8")
+        real_atomic_write = state_module.atomic_write_json
+
+        def fail_finish_run_write(
+            path: Path,
+            value: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            destination = Path(path)
+            journal = self.store.run_dir(run_id) / "attempt-block-transaction.json"
+            if destination.name == "run.json" and journal.exists():
+                transaction = json.loads(journal.read_text(encoding="utf-8"))
+                if transaction.get("operation") == "finish_task":
+                    raise OSError("simulated finish crash")
+            real_atomic_write(destination, value, *args, **kwargs)
+
+        with patch.object(
+            state_module,
+            "atomic_write_json",
+            side_effect=fail_finish_run_write,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated finish crash"):
+                self.store.finish_task(
+                    run_id,
+                    "T1",
+                    interface_ledger_append="- T1: state interface\n",
+                )
+        journal_path = (
+            self.store.run_dir(run_id) / "attempt-block-transaction.json"
         )
+        valid_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        forged_journal = deepcopy(valid_journal)
+        forged_journal["interfaces"] = "- replacement: forged\n"
+        atomic_write_json(journal_path, forged_journal)
+        state_bytes = (
+            (self.store.run_dir(run_id) / "run.json").read_bytes(),
+            (self.store.run_dir(run_id) / "tasks.json").read_bytes(),
+            interface_path.read_bytes(),
+        )
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "does not append interfaces"
+        ):
+            self.store.load_state(run_id)
+        self.assertEqual(
+            state_bytes,
+            (
+                (self.store.run_dir(run_id) / "run.json").read_bytes(),
+                (self.store.run_dir(run_id) / "tasks.json").read_bytes(),
+                interface_path.read_bytes(),
+            ),
+        )
+        atomic_write_json(journal_path, valid_journal)
+        run, tasks = self.store.load_state(run_id)
+        task = tasks["tasks"][0]
         self.assertEqual("complete", task["status"])
         self.assertIsNone(run["activeTaskId"])
         self.assertEqual(["T1"], run["completedTaskIds"])
@@ -506,6 +636,15 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn(
             "state interface",
             (self.store.run_dir(run_id) / "interfaces.md").read_text(),
+        )
+        repeated_task, repeated_run = self.store.finish_task(run_id, "T1")
+        self.assertEqual(task, repeated_task)
+        self.assertEqual(run, repeated_run)
+        self.assertEqual(
+            1,
+            (self.store.run_dir(run_id) / "interfaces.md")
+            .read_text(encoding="utf-8")
+            .count("state interface"),
         )
 
     def test_race_invocation_budget_reservation_is_all_or_none(self) -> None:
@@ -542,6 +681,341 @@ class StateStoreTests(unittest.TestCase):
             3,
             self.store.load_tasks(run_id)["tasks"][0]["attempts"]["codex"],
         )
+
+    def test_recovery_waits_for_repository_and_run_locks(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        transaction = self.make_start_transaction(run_id)
+        journal = self.write_transaction(run_id, transaction)
+        run_path = self.store.run_dir(run_id) / "run.json"
+        tasks_path = self.store.run_dir(run_id) / "tasks.json"
+        before_bytes = (run_path.read_bytes(), tasks_path.read_bytes())
+        outcome: list[BaseException] = []
+
+        def read_while_locked() -> None:
+            try:
+                self.store.load_run(run_id)
+            except BaseException as exc:
+                outcome.append(exc)
+
+        with repository_lock(self.store.root):
+            with run_lock(self.store.run_dir(run_id)):
+                worker = threading.Thread(target=read_while_locked)
+                worker.start()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(1, len(outcome))
+                self.assertIsInstance(outcome[0], LockHeldError)
+                self.assertTrue(journal.exists())
+                self.assertEqual(
+                    before_bytes,
+                    (run_path.read_bytes(), tasks_path.read_bytes()),
+                )
+
+        recovered = self.store.load_run(run_id)
+        self.assertEqual("T1", recovered["activeTaskId"])
+        self.assertEqual(
+            "in_progress",
+            self.store.load_tasks(run_id)["tasks"][0]["status"],
+        )
+        self.assertFalse(journal.exists())
+
+    def test_coherent_state_read_takes_locks_without_a_journal(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        outcome: list[BaseException] = []
+
+        def read_while_locked() -> None:
+            try:
+                self.store.load_state(run_id)
+            except BaseException as exc:
+                outcome.append(exc)
+
+        with repository_lock(self.store.root):
+            with run_lock(self.store.run_dir(run_id)):
+                worker = threading.Thread(target=read_while_locked)
+                worker.start()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(1, len(outcome))
+                self.assertIsInstance(outcome[0], LockHeldError)
+
+    def test_recovery_rejects_terminal_run_resurrection_without_writing(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        transaction = self.make_start_transaction(run_id)
+        self.store.abandon_run(run_id, reason="cancelled")
+        journal = self.write_transaction(run_id, transaction)
+        run_path = self.store.run_dir(run_id) / "run.json"
+        tasks_path = self.store.run_dir(run_id) / "tasks.json"
+        before_bytes = (run_path.read_bytes(), tasks_path.read_bytes())
+
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "active pointer differs|durable run changed"
+        ):
+            self.store.load_run(run_id)
+
+        self.assertEqual(
+            before_bytes,
+            (run_path.read_bytes(), tasks_path.read_bytes()),
+        )
+        self.assertEqual("abandoned", json.loads(run_path.read_text())["status"])
+        self.assertIsNone(self.store.active_run_id())
+        self.assertTrue(journal.exists())
+
+    def test_recovery_rejects_terminal_task_resurrection_without_writing(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        transaction = self.make_start_transaction(run_id)
+        tasks_path = self.store.run_dir(run_id) / "tasks.json"
+        durable_tasks = deepcopy(transaction["beforeTasks"])
+        durable_tasks["tasks"][0]["status"] = "complete"
+        atomic_write_json(tasks_path, durable_tasks)
+        journal = self.write_transaction(run_id, transaction)
+        run_path = self.store.run_dir(run_id) / "run.json"
+        before_bytes = (run_path.read_bytes(), tasks_path.read_bytes())
+
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "durable tasks changed"
+        ):
+            self.store.load_tasks(run_id)
+
+        self.assertEqual(
+            before_bytes,
+            (run_path.read_bytes(), tasks_path.read_bytes()),
+        )
+        self.assertTrue(journal.exists())
+
+    def test_recovery_rejects_missing_or_conflicting_active_pointer(self) -> None:
+        for pointer in (None, "20260724T120000Z-deadbeef"):
+            with self.subTest(pointer=pointer):
+                self.tearDown()
+                self.setUp()
+                run_id, _ = self.create_run(tasks=[make_task()])
+                transaction = self.make_start_transaction(run_id)
+                journal = self.write_transaction(run_id, transaction)
+                active = self.store.root / "active"
+                if pointer is None:
+                    active.unlink()
+                else:
+                    active.write_text(pointer + "\n", encoding="ascii")
+                run_path = self.store.run_dir(run_id) / "run.json"
+                tasks_path = self.store.run_dir(run_id) / "tasks.json"
+                before_bytes = (run_path.read_bytes(), tasks_path.read_bytes())
+
+                with self.assertRaisesRegex(
+                    StateInconsistencyError, "active pointer differs"
+                ):
+                    self.store.load_state(run_id)
+
+                self.assertEqual(
+                    before_bytes,
+                    (run_path.read_bytes(), tasks_path.read_bytes()),
+                )
+                self.assertTrue(journal.exists())
+
+    def test_recovery_converges_from_every_partial_v2_snapshot(self) -> None:
+        for run_after, tasks_after in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(run_after=run_after, tasks_after=tasks_after):
+                self.tearDown()
+                self.setUp()
+                run_id, _ = self.create_run(tasks=[make_task()])
+                transaction = self.make_start_transaction(run_id)
+                if run_after:
+                    atomic_write_json(
+                        self.store.run_dir(run_id) / "run.json",
+                        transaction["run"],
+                    )
+                if tasks_after:
+                    atomic_write_json(
+                        self.store.run_dir(run_id) / "tasks.json",
+                        transaction["tasks"],
+                    )
+                journal = self.write_transaction(run_id, transaction)
+
+                self.assertEqual(transaction["run"], self.store.load_run(run_id))
+                self.assertEqual(
+                    transaction["tasks"], self.store.load_tasks(run_id)
+                )
+                self.assertFalse(journal.exists())
+                self.assertEqual(transaction["run"], self.store.load_run(run_id))
+
+    def test_legacy_recovery_only_cleans_an_exact_completed_replay(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        transaction = self.make_start_transaction(run_id)
+        legacy = {
+            "schemaVersion": 1,
+            "run": transaction["run"],
+            "tasks": transaction["tasks"],
+        }
+        journal = self.write_transaction(run_id, legacy)
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "cannot be replayed safely"
+        ):
+            self.store.load_run(run_id)
+        self.assertTrue(journal.exists())
+
+        atomic_write_json(
+            self.store.run_dir(run_id) / "tasks.json", legacy["tasks"]
+        )
+        atomic_write_json(
+            self.store.run_dir(run_id) / "run.json", legacy["run"]
+        )
+        self.assertEqual(legacy["run"], self.store.load_run(run_id))
+        self.assertFalse(journal.exists())
+
+    def test_legacy_journal_cannot_resurrect_a_shipped_run(self) -> None:
+        run_id, _ = self.create_run()
+        self.store.complete_run(run_id)
+        target_run, target_tasks = self.store.load_state(run_id)
+        self.store.mark_shipped(run_id)
+        legacy = {
+            "schemaVersion": 1,
+            "run": target_run,
+            "tasks": target_tasks,
+        }
+        journal = self.write_transaction(run_id, legacy)
+        run_path = self.store.run_dir(run_id) / "run.json"
+        tasks_path = self.store.run_dir(run_id) / "tasks.json"
+        before_bytes = (run_path.read_bytes(), tasks_path.read_bytes())
+
+        with self.assertRaisesRegex(
+            StateInconsistencyError, "cannot be replayed safely"
+        ):
+            self.store.load_state(run_id)
+
+        self.assertEqual(
+            before_bytes,
+            (run_path.read_bytes(), tasks_path.read_bytes()),
+        )
+        self.assertEqual("shipped", json.loads(run_path.read_text())["status"])
+        self.assertIsNone(self.store.latest_complete_run_id())
+        self.assertTrue(journal.exists())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_forked_child_cannot_inherit_recovery_lock_ownership(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        transaction = self.make_start_transaction(run_id)
+        journal = self.write_transaction(run_id, transaction)
+        run_path = self.store.run_dir(run_id) / "run.json"
+        tasks_path = self.store.run_dir(run_id) / "tasks.json"
+        before_bytes = (run_path.read_bytes(), tasks_path.read_bytes())
+        read_fd, write_fd = os.pipe()
+
+        with repository_lock(self.store.root):
+            with run_lock(self.store.run_dir(run_id)):
+                child_pid = os.fork()
+                if child_pid == 0:
+                    os.close(read_fd)
+                    inherited = current_thread_holds_lock(
+                        self.store.root / "repository.lock"
+                    )
+                    try:
+                        self.store.load_state(run_id)
+                    except BaseException as exc:
+                        outcome = f"{int(inherited)}:{type(exc).__name__}"
+                    else:
+                        outcome = f"{int(inherited)}:recovered"
+                    os.write(write_fd, outcome.encode("ascii"))
+                    os.close(write_fd)
+                    os._exit(0)
+                os.close(write_fd)
+                outcome = os.read(read_fd, 128).decode("ascii")
+                os.close(read_fd)
+                _, status = os.waitpid(child_pid, 0)
+                self.assertEqual(0, status)
+                self.assertEqual("0:LockHeldError", outcome)
+                self.assertTrue(journal.exists())
+                self.assertEqual(
+                    before_bytes,
+                    (run_path.read_bytes(), tasks_path.read_bytes()),
+                )
+
+    def test_run_lock_mutator_recovers_without_nested_lock_failure(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        transaction = self.make_start_transaction(run_id)
+        self.write_transaction(run_id, transaction)
+
+        reservations = self.store.reserve_provider_invocations(
+            run_id, "T1", ("codex",)
+        )
+
+        self.assertEqual(1, reservations[0]["providerAttempt"])
+        self.assertFalse(
+            (self.store.run_dir(run_id) / "attempt-block-transaction.json").exists()
+        )
+
+    def test_exhausted_attempt_transaction_recovers_after_partial_write(self) -> None:
+        run_id, _ = self.create_run(tasks=[make_task()])
+        self.store.start_task(run_id, "T1")
+        self.store.reserve_provider_invocations(run_id, "T1", ("codex",))
+        self.store.reserve_provider_invocations(run_id, "T1", ("codex",))
+        self.store.reserve_provider_invocations(run_id, "T1", ("codex",))
+        real_atomic_write = state_module.atomic_write_json
+
+        def fail_run_write(path: Path, value: object, *args: object, **kwargs: object) -> None:
+            destination = Path(path)
+            journal = self.store.run_dir(run_id) / "attempt-block-transaction.json"
+            if destination.name == "run.json" and journal.exists():
+                raise OSError("simulated crash")
+            real_atomic_write(destination, value, *args, **kwargs)
+
+        with patch.object(
+            state_module, "atomic_write_json", side_effect=fail_run_write
+        ):
+            with self.assertRaisesRegex(OSError, "simulated crash"):
+                self.store.block_exhausted_provider_attempt(
+                    run_id, "T1", "codex"
+                )
+
+        journal = self.store.run_dir(run_id) / "attempt-block-transaction.json"
+        self.assertTrue(journal.exists())
+        recovered_run = self.store.load_run(run_id)
+        recovered_task = self.store.load_tasks(run_id)["tasks"][0]
+        self.assertEqual("blocked", recovered_run["status"])
+        self.assertEqual("blocked", recovered_task["status"])
+        self.assertFalse(journal.exists())
+
+    def test_transaction_held_shipped_transition_updates_pointers(self) -> None:
+        run_id, _ = self.create_run()
+        self.store.complete_run(run_id)
+        run_directory = self.store.run_dir(run_id)
+
+        with repository_lock(self.store.root):
+            with run_lock(run_directory):
+                shipped = self.store.mark_shipped_in_transaction(run_id)
+
+        self.assertEqual("shipped", shipped["status"])
+        self.assertIsNone(self.store.latest_complete_run_id())
+        with repository_lock(self.store.root):
+            with run_lock(run_directory):
+                repeated = self.store.mark_shipped_in_transaction(run_id)
+        self.assertEqual(shipped, repeated)
+
+    def test_shipped_transition_retry_repairs_interrupted_pointer_update(self) -> None:
+        run_id, _ = self.create_run()
+        self.store.complete_run(run_id)
+        run_directory = self.store.run_dir(run_id)
+
+        with patch.object(
+            self.store,
+            "_remove_pointer",
+            side_effect=OSError("simulated pointer crash"),
+        ):
+            with repository_lock(self.store.root):
+                with run_lock(run_directory):
+                    with self.assertRaisesRegex(
+                        OSError, "simulated pointer crash"
+                    ):
+                        self.store.mark_shipped_in_transaction(run_id)
+
+        self.assertEqual("shipped", self.store.load_run(run_id)["status"])
+        self.assertEqual(run_id, self.store.latest_complete_run_id())
+        with repository_lock(self.store.root):
+            with run_lock(run_directory):
+                self.store.mark_shipped_in_transaction(run_id)
+        self.assertIsNone(self.store.latest_complete_run_id())
 
 
 if __name__ == "__main__":

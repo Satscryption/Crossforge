@@ -9,12 +9,13 @@ import secrets
 import shutil
 import stat
 import tempfile
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .errors import PreconditionError, StateInconsistencyError
-from .locking import repository_lock, run_lock
+from .locking import current_thread_holds_lock, repository_lock, run_lock
 from .models import RunMode, RunStatus, TaskStatus
 from .util import (
     atomic_write_bytes,
@@ -673,7 +674,10 @@ class StateStore:
         return self._read_pointer("latest-complete")
 
     def load_run(self, run_id: str) -> dict[str, Any]:
-        self._recover_block_transaction(run_id)
+        run, _ = self.load_state(run_id)
+        return run
+
+    def _load_run_unlocked(self, run_id: str) -> dict[str, Any]:
         path = self.run_dir(run_id) / "run.json"
         run = validate_run_record(self._read_json(path))
         if run["runId"] != run_id:
@@ -681,32 +685,488 @@ class StateStore:
         return run
 
     def load_tasks(self, run_id: str) -> dict[str, Any]:
-        self._recover_block_transaction(run_id)
+        _, tasks = self.load_state(run_id)
+        return tasks
+
+    def _load_tasks_unlocked(self, run_id: str) -> dict[str, Any]:
         return validate_tasks_record(self._read_json(self.run_dir(run_id) / "tasks.json"))
 
-    def _recover_block_transaction(self, run_id: str) -> None:
-        """Finish an interrupted two-record exhausted-attempt transition."""
+    def load_state(
+        self, run_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Load a coherent run/tasks snapshot under repository and run locks."""
 
+        def load_locked() -> tuple[dict[str, Any], dict[str, Any]]:
+            self._recover_block_transaction_locked(run_id)
+            return (
+                self._load_run_unlocked(run_id),
+                self._load_tasks_unlocked(run_id),
+            )
+
+        return self._with_state_transaction_locks(run_id, load_locked)
+
+    def _with_state_transaction_locks(
+        self,
+        run_id: str,
+        operation: Callable[[], Any],
+    ) -> Any:
+        run_directory = self.run_dir(run_id)
+        repository_held = current_thread_holds_lock(
+            self.root / "repository.lock"
+        )
+        run_held = current_thread_holds_lock(
+            run_directory / "locks" / "run.lock"
+        )
+        if run_held and not repository_held:
+            raise PreconditionError(
+                "state access requires repository then run lock order"
+            )
+        if repository_held and run_held:
+            return operation()
+        if repository_held:
+            with run_lock(run_directory, timeout=self.lock_timeout):
+                return operation()
+        with repository_lock(self.root, timeout=self.lock_timeout):
+            with run_lock(run_directory, timeout=self.lock_timeout):
+                return operation()
+
+    def _recover_block_transaction(self, run_id: str) -> None:
+        """Recover an interrupted bound run/tasks state transaction."""
+
+        self._with_state_transaction_locks(
+            run_id,
+            lambda: self._recover_block_transaction_locked(run_id),
+        )
+
+    def _recover_block_transaction_locked(self, run_id: str) -> None:
         transaction = self.run_dir(run_id) / "attempt-block-transaction.json"
         if not transaction.exists() and not transaction.is_symlink():
             return
         value = self._read_json(transaction)
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"schemaVersion", "run", "tasks"}
-            or value.get("schemaVersion") != 1
-        ):
+        if not isinstance(value, dict):
             raise StateInconsistencyError(
                 "invalid exhausted-attempt transaction journal"
             )
-        run = validate_run_record(value["run"])
-        tasks = validate_tasks_record(value["tasks"])
-        if run["runId"] != run_id:
-            raise StateInconsistencyError(
-                "attempt-block transaction run ID differs"
+        if value.get("schemaVersion") == 1:
+            self._recover_legacy_block_transaction_locked(
+                run_id, transaction, value
             )
-        atomic_write_json(self.run_dir(run_id) / "tasks.json", tasks)
-        atomic_write_json(self.run_dir(run_id) / "run.json", run)
+            return
+        expected_fields = {
+            "schemaVersion",
+            "operation",
+            "runId",
+            "taskId",
+            "provider",
+            "beforeRun",
+            "beforeTasks",
+            "beforeInterfaces",
+            "run",
+            "tasks",
+            "interfaces",
+        }
+        if set(value) != expected_fields or value.get("schemaVersion") != 2:
+            raise StateInconsistencyError(
+                "invalid state transaction journal"
+            )
+        before_run = validate_run_record(value["beforeRun"])
+        before_tasks = validate_tasks_record(value["beforeTasks"])
+        after_run = validate_run_record(value["run"])
+        after_tasks = validate_tasks_record(value["tasks"])
+        before_interfaces = value["beforeInterfaces"]
+        after_interfaces = value["interfaces"]
+        if (
+            before_interfaces is not None
+            and not isinstance(before_interfaces, str)
+        ) or (
+            after_interfaces is not None
+            and not isinstance(after_interfaces, str)
+        ):
+            raise StateInconsistencyError(
+                "state transaction interface ledger is invalid"
+            )
+        if (
+            value["runId"] != run_id
+            or before_run["runId"] != run_id
+            or after_run["runId"] != run_id
+        ):
+            raise StateInconsistencyError(
+                "state transaction run ID differs"
+            )
+        self._validate_state_transaction(
+            value,
+            before_run=before_run,
+            before_tasks=before_tasks,
+            after_run=after_run,
+            after_tasks=after_tasks,
+            before_interfaces=before_interfaces,
+            after_interfaces=after_interfaces,
+        )
+        if self._read_pointer("active") != run_id:
+            raise StateInconsistencyError(
+                "state transaction active pointer differs"
+            )
+        current_run = self._load_run_unlocked(run_id)
+        current_tasks = self._load_tasks_unlocked(run_id)
+        if current_run not in (before_run, after_run):
+            raise StateInconsistencyError(
+                "durable run changed after state transaction began"
+            )
+        if current_tasks not in (before_tasks, after_tasks):
+            raise StateInconsistencyError(
+                "durable tasks changed after state transaction began"
+            )
+        if value["operation"] == "finish_task":
+            interface_path = self.run_dir(run_id) / "interfaces.md"
+            self._validate_private_path(interface_path, directory=False)
+            current_interfaces = interface_path.read_text(encoding="utf-8")
+            if current_interfaces not in (
+                before_interfaces,
+                after_interfaces,
+            ):
+                raise StateInconsistencyError(
+                    "interface ledger changed after state transaction began"
+                )
+            if current_interfaces == before_interfaces:
+                atomic_write_text(interface_path, after_interfaces)
+        if current_tasks == before_tasks:
+            atomic_write_json(self.run_dir(run_id) / "tasks.json", after_tasks)
+        if current_run == before_run:
+            atomic_write_json(self.run_dir(run_id) / "run.json", after_run)
+        transaction.unlink()
+        self._fsync_directory(self.run_dir(run_id))
+
+    def _recover_legacy_block_transaction_locked(
+        self,
+        run_id: str,
+        transaction: Path,
+        value: Mapping[str, Any],
+    ) -> None:
+        if set(value) != {"schemaVersion", "run", "tasks"}:
+            raise StateInconsistencyError(
+                "invalid legacy state transaction journal"
+            )
+        target_run = validate_run_record(value["run"])
+        target_tasks = validate_tasks_record(value["tasks"])
+        if target_run["runId"] != run_id:
+            raise StateInconsistencyError(
+                "legacy state transaction run ID differs"
+            )
+        current_run = self._load_run_unlocked(run_id)
+        current_tasks = self._load_tasks_unlocked(run_id)
+        if (
+            target_run["status"] in {
+                RunStatus.ACTIVE.value,
+                RunStatus.BLOCKED.value,
+            }
+            and self._read_pointer("active") != run_id
+        ):
+            raise StateInconsistencyError(
+                "legacy state transaction active pointer differs"
+            )
+        if current_run != target_run or current_tasks != target_tasks:
+            raise StateInconsistencyError(
+                "legacy state transaction cannot be replayed safely"
+            )
+        transaction.unlink()
+        self._fsync_directory(self.run_dir(run_id))
+
+    def _validate_state_transaction(
+        self,
+        value: Mapping[str, Any],
+        *,
+        before_run: Mapping[str, Any],
+        before_tasks: Mapping[str, Any],
+        after_run: Mapping[str, Any],
+        after_tasks: Mapping[str, Any],
+        before_interfaces: str | None,
+        after_interfaces: str | None,
+    ) -> None:
+        operation = value["operation"]
+        task_id = value["taskId"]
+        provider = value["provider"]
+        if not isinstance(task_id, str) or not task_id:
+            raise StateInconsistencyError("state transaction task ID is invalid")
+        before_by_id = {task["id"]: task for task in before_tasks["tasks"]}
+        after_by_id = {task["id"]: task for task in after_tasks["tasks"]}
+        if (
+            len(before_by_id) != len(before_tasks["tasks"])
+            or len(after_by_id) != len(after_tasks["tasks"])
+            or before_by_id.keys() != after_by_id.keys()
+            or task_id not in before_by_id
+        ):
+            raise StateInconsistencyError(
+                "state transaction task set changed"
+            )
+        before_run_status = before_run["status"]
+        after_run_status = after_run["status"]
+        if (
+            before_run_status != after_run_status
+            and after_run_status not in RUN_TRANSITIONS[before_run_status]
+        ):
+            raise StateInconsistencyError(
+                "state transaction contains an invalid run transition"
+            )
+        for identifier, before_task in before_by_id.items():
+            before_status = before_task["status"]
+            after_status = after_by_id[identifier]["status"]
+            if (
+                before_status != after_status
+                and after_status not in TASK_TRANSITIONS[before_status]
+            ):
+                raise StateInconsistencyError(
+                    "state transaction contains an invalid task transition"
+                )
+        if operation == "start_task":
+            if (
+                provider is not None
+                or before_interfaces is not None
+                or after_interfaces is not None
+            ):
+                raise StateInconsistencyError(
+                    "start-task transaction has unexpected metadata"
+                )
+            self._validate_start_task_transaction(
+                task_id,
+                before_run=before_run,
+                before_by_id=before_by_id,
+                after_run=after_run,
+                after_by_id=after_by_id,
+            )
+            return
+        if operation == "block_exhausted_provider_attempt":
+            if (
+                not isinstance(provider, str)
+                or provider not in before_by_id[task_id]["attempts"]
+                or before_interfaces is not None
+                or after_interfaces is not None
+            ):
+                raise StateInconsistencyError(
+                    "block transaction provider is invalid"
+                )
+            self._validate_block_transaction(
+                task_id,
+                provider,
+                before_run=before_run,
+                before_by_id=before_by_id,
+                after_run=after_run,
+                after_by_id=after_by_id,
+            )
+            return
+        if operation == "finish_task":
+            if (
+                provider is not None
+                or not isinstance(before_interfaces, str)
+                or not isinstance(after_interfaces, str)
+            ):
+                raise StateInconsistencyError(
+                    "finish-task transaction metadata is invalid"
+                )
+            append_prefix = (
+                before_interfaces
+                if not before_interfaces or before_interfaces.endswith("\n")
+                else before_interfaces + "\n"
+            )
+            if (
+                after_interfaces != before_interfaces
+                and not after_interfaces.startswith(append_prefix)
+            ):
+                raise StateInconsistencyError(
+                    "finish-task transaction does not append interfaces"
+                )
+            self._validate_finish_task_transaction(
+                task_id,
+                before_run=before_run,
+                before_by_id=before_by_id,
+                after_run=after_run,
+                after_by_id=after_by_id,
+            )
+            return
+        raise StateInconsistencyError(
+            "state transaction operation is unsupported"
+        )
+
+    @staticmethod
+    def _validate_start_task_transaction(
+        task_id: str,
+        *,
+        before_run: Mapping[str, Any],
+        before_by_id: Mapping[str, Mapping[str, Any]],
+        after_run: Mapping[str, Any],
+        after_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        before_task = before_by_id[task_id]
+        after_task = after_by_id[task_id]
+        if (
+            before_run["mode"] != RunMode.BUILD.value
+            or before_run["status"] != RunStatus.ACTIVE.value
+            or before_run["activeTaskId"] is not None
+            or after_run["status"] != RunStatus.ACTIVE.value
+            or after_run["activeTaskId"] != task_id
+            or before_task["status"] not in {
+                TaskStatus.PENDING.value,
+                TaskStatus.BLOCKED.value,
+            }
+            or after_task["status"] != TaskStatus.IN_PROGRESS.value
+            or after_task["baseCommit"] != before_run["currentCommit"]
+        ):
+            raise StateInconsistencyError(
+                "invalid start-task transaction transition"
+            )
+        expected_run = deepcopy(before_run)
+        expected_run["activeTaskId"] = task_id
+        expected_run["updatedAt"] = after_run["updatedAt"]
+        expected_task = deepcopy(before_task)
+        expected_task["baseCommit"] = after_task["baseCommit"]
+        expected_task["status"] = TaskStatus.IN_PROGRESS.value
+        expected_task["updatedAt"] = after_task["updatedAt"]
+        if expected_run != after_run or expected_task != after_task:
+            raise StateInconsistencyError(
+                "start-task transaction changes unrelated state"
+            )
+        for other_id, before_task_value in before_by_id.items():
+            if other_id != task_id and before_task_value != after_by_id[other_id]:
+                raise StateInconsistencyError(
+                    "start-task transaction changes another task"
+                )
+
+    @staticmethod
+    def _validate_block_transaction(
+        task_id: str,
+        provider: str,
+        *,
+        before_run: Mapping[str, Any],
+        before_by_id: Mapping[str, Mapping[str, Any]],
+        after_run: Mapping[str, Any],
+        after_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        before_task = before_by_id[task_id]
+        after_task = after_by_id[task_id]
+        reason = f"{provider} exhausted three correction attempts"
+        if (
+            before_task["attempts"].get(provider, 0) < 3
+            or before_task["status"] not in {
+                TaskStatus.IN_PROGRESS.value,
+                TaskStatus.BLOCKED.value,
+            }
+            or before_run["status"] not in {
+                RunStatus.ACTIVE.value,
+                RunStatus.BLOCKED.value,
+            }
+        ):
+            raise StateInconsistencyError(
+                "invalid exhausted-attempt transaction source"
+            )
+        expected_task = deepcopy(before_task)
+        if before_task["status"] == TaskStatus.IN_PROGRESS.value:
+            expected_task["status"] = TaskStatus.BLOCKED.value
+            expected_task["updatedAt"] = after_task["updatedAt"]
+        expected_run = deepcopy(before_run)
+        if before_run["status"] == RunStatus.ACTIVE.value:
+            expected_run["status"] = RunStatus.BLOCKED.value
+            expected_run["blockedReason"] = reason
+            expected_run["updatedAt"] = after_run["updatedAt"]
+        if expected_task != after_task or expected_run != after_run:
+            raise StateInconsistencyError(
+                "exhausted-attempt transaction changes unrelated state"
+            )
+        for other_id, before_task_value in before_by_id.items():
+            if other_id != task_id and before_task_value != after_by_id[other_id]:
+                raise StateInconsistencyError(
+                    "exhausted-attempt transaction changes another task"
+                )
+
+    @staticmethod
+    def _validate_finish_task_transaction(
+        task_id: str,
+        *,
+        before_run: Mapping[str, Any],
+        before_by_id: Mapping[str, Mapping[str, Any]],
+        after_run: Mapping[str, Any],
+        after_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        before_task = before_by_id[task_id]
+        after_task = after_by_id[task_id]
+        if (
+            before_run["mode"] != RunMode.BUILD.value
+            or before_run["status"] != RunStatus.ACTIVE.value
+            or before_run["activeTaskId"] != task_id
+            or before_task["status"] not in {
+                TaskStatus.ACCEPTED.value,
+                TaskStatus.COMMITTED.value,
+            }
+            or after_task["status"] != TaskStatus.COMPLETE.value
+        ):
+            raise StateInconsistencyError(
+                "invalid finish-task transaction transition"
+            )
+        expected_task = deepcopy(before_task)
+        expected_task["status"] = TaskStatus.COMPLETE.value
+        expected_task["updatedAt"] = after_task["updatedAt"]
+        expected_run = deepcopy(before_run)
+        completed = list(expected_run["completedTaskIds"])
+        if task_id not in completed:
+            completed.append(task_id)
+        expected_run["completedTaskIds"] = completed
+        expected_run["activeTaskId"] = None
+        if after_task.get("commit") is not None:
+            expected_run["currentCommit"] = after_task["commit"]
+        expected_run["updatedAt"] = after_run["updatedAt"]
+        if expected_task != after_task or expected_run != after_run:
+            raise StateInconsistencyError(
+                "finish-task transaction changes unrelated state"
+            )
+        for other_id, before_task_value in before_by_id.items():
+            if other_id != task_id and before_task_value != after_by_id[other_id]:
+                raise StateInconsistencyError(
+                    "finish-task transaction changes another task"
+                )
+
+    def _commit_state_transaction_locked(
+        self,
+        run_id: str,
+        *,
+        operation: str,
+        task_id: str,
+        provider: str | None,
+        before_run: Mapping[str, Any],
+        before_tasks: Mapping[str, Any],
+        after_run: Mapping[str, Any],
+        after_tasks: Mapping[str, Any],
+        before_interfaces: str | None = None,
+        after_interfaces: str | None = None,
+    ) -> None:
+        transaction = self.run_dir(run_id) / "attempt-block-transaction.json"
+        journal = {
+            "schemaVersion": 2,
+            "operation": operation,
+            "runId": run_id,
+            "taskId": task_id,
+            "provider": provider,
+            "beforeRun": dict(before_run),
+            "beforeTasks": dict(before_tasks),
+            "beforeInterfaces": before_interfaces,
+            "run": dict(after_run),
+            "tasks": dict(after_tasks),
+            "interfaces": after_interfaces,
+        }
+        self._validate_state_transaction(
+            journal,
+            before_run=before_run,
+            before_tasks=before_tasks,
+            after_run=after_run,
+            after_tasks=after_tasks,
+            before_interfaces=before_interfaces,
+            after_interfaces=after_interfaces,
+        )
+        atomic_write_json(transaction, journal)
+        if before_interfaces is not None:
+            atomic_write_text(
+                self.run_dir(run_id) / "interfaces.md",
+                after_interfaces,
+            )
+        atomic_write_json(self.run_dir(run_id) / "tasks.json", after_tasks)
+        atomic_write_json(self.run_dir(run_id) / "run.json", after_run)
         transaction.unlink()
         self._fsync_directory(self.run_dir(run_id))
 
@@ -853,24 +1313,42 @@ class StateStore:
         run_directory = self.run_dir(run_id)
         with repository_lock(self.root, timeout=self.lock_timeout):
             with run_lock(run_directory, timeout=self.lock_timeout):
-                current = self.load_run(run_id)
-                result = self._transition_run_locked(run_id, target, updates or {})
-                if (
-                    current["mode"] == RunMode.BUILD.value
-                    and target == RunStatus.COMPLETE.value
-                ):
+                return self._transition_run_with_pointers_locked(
+                    run_id, target, updates or {}
+                )
+
+    def _transition_run_with_pointers_locked(
+        self,
+        run_id: str,
+        target: str,
+        updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        current = self.load_run(run_id)
+        result = self._transition_run_locked(run_id, target, updates)
+        if (
+            current["mode"] == RunMode.BUILD.value
+            and target == RunStatus.COMPLETE.value
+        ):
+            if current["status"] != RunStatus.COMPLETE.value:
+                self._write_pointer("latest-complete", run_id)
+                self._remove_pointer("active", expected=run_id)
+            else:
+                # Repair an interrupted first completion without allowing an
+                # old idempotent retry to displace a newer completed run.
+                if self._read_pointer("latest-complete") is None:
                     self._write_pointer("latest-complete", run_id)
+                if self._read_pointer("active") == run_id:
                     self._remove_pointer("active", expected=run_id)
-                elif target == RunStatus.ABANDONED.value:
-                    self._remove_pointer("active", expected=run_id)
-                elif target == RunStatus.SHIPPED.value:
-                    if self._read_pointer("latest-complete") == run_id:
-                        replacement = self._newest_unshipped_complete(exclude=run_id)
-                        if replacement is None:
-                            self._remove_pointer("latest-complete", expected=run_id)
-                        else:
-                            self._write_pointer("latest-complete", replacement)
-                return result
+        elif target == RunStatus.ABANDONED.value:
+            self._remove_pointer("active", expected=run_id)
+        elif target == RunStatus.SHIPPED.value:
+            if self._read_pointer("latest-complete") == run_id:
+                replacement = self._newest_unshipped_complete(exclude=run_id)
+                if replacement is None:
+                    self._remove_pointer("latest-complete", expected=run_id)
+                else:
+                    self._write_pointer("latest-complete", replacement)
+        return result
 
     def complete_run(
         self, run_id: str, *, updates: Mapping[str, Any] | None = None
@@ -885,6 +1363,21 @@ class StateStore:
 
     def mark_shipped(self, run_id: str) -> dict[str, Any]:
         return self.transition_run(run_id, RunStatus.SHIPPED)
+
+    def mark_shipped_in_transaction(self, run_id: str) -> dict[str, Any]:
+        """Mark a run shipped while the caller owns repository and run locks."""
+
+        run_directory = self.run_dir(run_id)
+        if not (
+            current_thread_holds_lock(self.root / "repository.lock")
+            and current_thread_holds_lock(run_directory / "locks" / "run.lock")
+        ):
+            raise PreconditionError(
+                "in-transaction shipment requires repository and run locks"
+            )
+        return self._transition_run_with_pointers_locked(
+            run_id, RunStatus.SHIPPED.value, {}
+        )
 
     def _newest_unshipped_complete(self, *, exclude: str) -> str | None:
         candidates: list[tuple[str, str]] = []
@@ -996,7 +1489,7 @@ class StateStore:
                     "selection run is no longer active"
                 )
             with run_lock(run_directory, timeout=self.lock_timeout):
-                run = self.load_run(run_id)
+                run, record = self.load_state(run_id)
                 if (
                     run != dict(expected_run)
                     or run["mode"] != RunMode.BUILD.value
@@ -1006,7 +1499,6 @@ class StateStore:
                     raise StateInconsistencyError(
                         "selection run changed during gate verification"
                     )
-                record = self.load_tasks(run_id)
                 matches = [
                     task for task in record["tasks"] if task["id"] == task_id
                 ]
@@ -1055,6 +1547,10 @@ class StateStore:
         """Persist acceptance intent while the caller holds repository lock."""
 
         run_directory = self.run_dir(run_id)
+        if not current_thread_holds_lock(self.root / "repository.lock"):
+            raise PreconditionError(
+                "acceptance intent transaction requires repository lock"
+            )
         validated_intent = _validate_acceptance_intent(
             dict(intent),
             label="acceptance intent",
@@ -1066,7 +1562,7 @@ class StateStore:
                 "acceptance run is no longer active"
             )
         with run_lock(run_directory, timeout=self.lock_timeout):
-            run = self.load_run(run_id)
+            run, record = self.load_state(run_id)
             if (
                 run != dict(expected_run)
                 or run["mode"] != RunMode.BUILD.value
@@ -1076,7 +1572,6 @@ class StateStore:
                 raise StateInconsistencyError(
                     "acceptance run changed during verification"
                 )
-            record = self.load_tasks(run_id)
             matches = [
                 task for task in record["tasks"] if task["id"] == task_id
             ]
@@ -1147,12 +1642,16 @@ class StateStore:
         """Bind acceptance while the caller holds the repository lock."""
 
         run_directory = self.run_dir(run_id)
+        if not current_thread_holds_lock(self.root / "repository.lock"):
+            raise PreconditionError(
+                "acceptance transaction requires repository lock"
+            )
         if self.active_run_id() != run_id:
             raise StateInconsistencyError(
                 "acceptance run is no longer active"
             )
         with run_lock(run_directory, timeout=self.lock_timeout):
-            run = self.load_run(run_id)
+            run, record = self.load_state(run_id)
             if (
                 run != dict(expected_run)
                 or run["mode"] != RunMode.BUILD.value
@@ -1162,7 +1661,6 @@ class StateStore:
                 raise StateInconsistencyError(
                     "acceptance run changed during verification"
                 )
-            record = self.load_tasks(run_id)
             matches = [
                 task for task in record["tasks"] if task["id"] == task_id
             ]
@@ -1207,8 +1705,7 @@ class StateStore:
         run_directory = self.run_dir(run_id)
         with repository_lock(self.root, timeout=self.lock_timeout):
             with run_lock(run_directory, timeout=self.lock_timeout):
-                run = self.load_run(run_id)
-                record = self.load_tasks(run_id)
+                run, record = self.load_state(run_id)
                 if run["status"] != RunStatus.ACTIVE.value:
                     raise PreconditionError("task can start only in an active build run")
                 if run["activeTaskId"] not in (None, task_id):
@@ -1242,6 +1739,8 @@ class StateStore:
                     raise StateInconsistencyError(
                         "materialized task baseCommit differs from run currentCommit"
                     )
+                before_run = deepcopy(run)
+                before_record = deepcopy(record)
                 timestamp = utc_now()
                 task["status"] = TaskStatus.IN_PROGRESS.value
                 task["updatedAt"] = timestamp
@@ -1249,19 +1748,16 @@ class StateStore:
                 run["updatedAt"] = timestamp
                 validate_tasks_record(record)
                 validate_run_record(run)
-                transaction = run_directory / "attempt-block-transaction.json"
-                atomic_write_json(
-                    transaction,
-                    {
-                        "schemaVersion": 1,
-                        "run": run,
-                        "tasks": record,
-                    },
+                self._commit_state_transaction_locked(
+                    run_id,
+                    operation="start_task",
+                    task_id=task_id,
+                    provider=None,
+                    before_run=before_run,
+                    before_tasks=before_record,
+                    after_run=run,
+                    after_tasks=record,
                 )
-                atomic_write_json(run_directory / "tasks.json", record)
-                atomic_write_json(run_directory / "run.json", run)
-                transaction.unlink()
-                self._fsync_directory(run_directory)
                 return task, run
 
     def reserve_provider_invocation(
@@ -1285,26 +1781,26 @@ class StateStore:
         """Atomically bind a routing decision to an in-progress task."""
 
         run_directory = self.run_dir(run_id)
-        with run_lock(run_directory, timeout=self.lock_timeout):
-            run = self.load_run(run_id)
-            record = self.load_tasks(run_id)
-            if run["status"] != RunStatus.ACTIVE.value:
-                raise PreconditionError("routing requires an active run")
-            matches = [item for item in record["tasks"] if item["id"] == task_id]
-            if len(matches) != 1:
-                raise StateInconsistencyError(f"unknown or duplicate task ID: {task_id}")
-            task = matches[0]
-            if task["status"] != TaskStatus.IN_PROGRESS.value:
-                raise PreconditionError("routing requires an in-progress task")
-            if task["routing"] is not None and task["routing"] != dict(routing):
-                raise StateInconsistencyError(
-                    "task already has a different durable routing decision"
-                )
-            task["routing"] = dict(routing)
-            task["updatedAt"] = utc_now()
-            validate_tasks_record(record)
-            atomic_write_json(run_directory / "tasks.json", record)
-            return task
+        with repository_lock(self.root, timeout=self.lock_timeout):
+            with run_lock(run_directory, timeout=self.lock_timeout):
+                run, record = self.load_state(run_id)
+                if run["status"] != RunStatus.ACTIVE.value:
+                    raise PreconditionError("routing requires an active run")
+                matches = [item for item in record["tasks"] if item["id"] == task_id]
+                if len(matches) != 1:
+                    raise StateInconsistencyError(f"unknown or duplicate task ID: {task_id}")
+                task = matches[0]
+                if task["status"] != TaskStatus.IN_PROGRESS.value:
+                    raise PreconditionError("routing requires an in-progress task")
+                if task["routing"] is not None and task["routing"] != dict(routing):
+                    raise StateInconsistencyError(
+                        "task already has a different durable routing decision"
+                    )
+                task["routing"] = dict(routing)
+                task["updatedAt"] = utc_now()
+                validate_tasks_record(record)
+                atomic_write_json(run_directory / "tasks.json", record)
+                return task
 
     def bind_provider_capability(
         self,
@@ -1321,7 +1817,7 @@ class StateStore:
         run_directory = self.run_dir(run_id)
         with repository_lock(self.root, timeout=self.lock_timeout):
             with run_lock(run_directory, timeout=self.lock_timeout):
-                run = self.load_run(run_id)
+                run, _ = self.load_state(run_id)
                 if run["status"] != RunStatus.ACTIVE.value:
                     raise PreconditionError(
                         "capability binding requires an active run"
@@ -1358,8 +1854,7 @@ class StateStore:
         run_directory = self.run_dir(run_id)
         with repository_lock(self.root, timeout=self.lock_timeout):
             with run_lock(run_directory, timeout=self.lock_timeout):
-                run = self.load_run(run_id)
-                record = self.load_tasks(run_id)
+                run, record = self.load_state(run_id)
                 matches = [item for item in record["tasks"] if item["id"] == task_id]
                 if len(matches) != 1:
                     raise StateInconsistencyError(
@@ -1370,6 +1865,8 @@ class StateStore:
                     raise PreconditionError(
                         "provider has not exhausted three attempts"
                     )
+                before_run = deepcopy(run)
+                before_record = deepcopy(record)
                 reason = f"{provider} exhausted three correction attempts"
                 if task["status"] == TaskStatus.IN_PROGRESS.value:
                     task["status"] = TaskStatus.BLOCKED.value
@@ -1380,8 +1877,17 @@ class StateStore:
                     run["updatedAt"] = utc_now()
                 validate_tasks_record(record)
                 validate_run_record(run)
-                atomic_write_json(run_directory / "tasks.json", record)
-                atomic_write_json(run_directory / "run.json", run)
+                if run != before_run or record != before_record:
+                    self._commit_state_transaction_locked(
+                        run_id,
+                        operation="block_exhausted_provider_attempt",
+                        task_id=task_id,
+                        provider=provider,
+                        before_run=before_run,
+                        before_tasks=before_record,
+                        after_run=run,
+                        after_tasks=record,
+                    )
                 return task, run
 
     def reserve_provider_invocations(
@@ -1404,65 +1910,65 @@ class StateStore:
         ):
             raise StateInconsistencyError(
                 "provider invocation reservation is empty, duplicated, or unsupported"
-            )
+        )
         run_directory = self.run_dir(run_id)
-        with run_lock(run_directory, timeout=self.lock_timeout):
-            run = self.load_run(run_id)
-            record = self.load_tasks(run_id)
-            if (
-                run["status"] != RunStatus.ACTIVE.value
-                or run["mode"] != RunMode.BUILD.value
-                or run["activeTaskId"] != task_id
-            ):
-                raise PreconditionError(
-                    "provider invocation requires the active task of an active build run"
-                )
-            matches = [item for item in record["tasks"] if item["id"] == task_id]
-            if len(matches) != 1:
-                raise StateInconsistencyError(
-                    f"unknown or duplicate task ID: {task_id}"
-                )
-            task = matches[0]
-            if task["status"] != TaskStatus.IN_PROGRESS.value:
-                raise PreconditionError(
-                    "provider invocation requires an in-progress task"
-                )
-            maximum = run["maximumProviderInvocationsPerTask"]
-            used = sum(int(count) for count in task["attempts"].values())
-            if maximum is not None and used + len(providers) > maximum:
-                raise PreconditionError(
-                    "provider invocation budget is exhausted",
-                    details={
-                        "used": used,
-                        "requested": len(providers),
-                        "maximum": maximum,
-                    },
-                )
-            reservations: list[dict[str, Any]] = []
-            for offset, provider in enumerate(providers, start=1):
-                if task["attempts"][provider] >= 3:
+        with repository_lock(self.root, timeout=self.lock_timeout):
+            with run_lock(run_directory, timeout=self.lock_timeout):
+                run, record = self.load_state(run_id)
+                if (
+                    run["status"] != RunStatus.ACTIVE.value
+                    or run["mode"] != RunMode.BUILD.value
+                    or run["activeTaskId"] != task_id
+                ):
                     raise PreconditionError(
-                        "provider correction-attempt limit is exhausted",
+                        "provider invocation requires the active task of an active build run"
+                    )
+                matches = [item for item in record["tasks"] if item["id"] == task_id]
+                if len(matches) != 1:
+                    raise StateInconsistencyError(
+                        f"unknown or duplicate task ID: {task_id}"
+                    )
+                task = matches[0]
+                if task["status"] != TaskStatus.IN_PROGRESS.value:
+                    raise PreconditionError(
+                        "provider invocation requires an in-progress task"
+                    )
+                maximum = run["maximumProviderInvocationsPerTask"]
+                used = sum(int(count) for count in task["attempts"].values())
+                if maximum is not None and used + len(providers) > maximum:
+                    raise PreconditionError(
+                        "provider invocation budget is exhausted",
                         details={
-                            "provider": provider,
-                            "attempts": task["attempts"][provider],
-                            "maximum": 3,
+                            "used": used,
+                            "requested": len(providers),
+                            "maximum": maximum,
                         },
                     )
-            for offset, provider in enumerate(providers, start=1):
-                task["attempts"][provider] += 1
-                reservations.append(
-                    {
-                        "provider": provider,
-                        "providerAttempt": task["attempts"][provider],
-                        "totalAttempts": used + offset,
-                        "maximum": maximum,
-                    }
-                )
-            task["updatedAt"] = utc_now()
-            validate_tasks_record(record)
-            atomic_write_json(run_directory / "tasks.json", record)
-            return reservations
+                reservations: list[dict[str, Any]] = []
+                for offset, provider in enumerate(providers, start=1):
+                    if task["attempts"][provider] >= 3:
+                        raise PreconditionError(
+                            "provider correction-attempt limit is exhausted",
+                            details={
+                                "provider": provider,
+                                "attempts": task["attempts"][provider],
+                                "maximum": 3,
+                            },
+                        )
+                for offset, provider in enumerate(providers, start=1):
+                    task["attempts"][provider] += 1
+                    reservations.append(
+                        {
+                            "provider": provider,
+                            "providerAttempt": task["attempts"][provider],
+                            "totalAttempts": used + offset,
+                            "maximum": maximum,
+                        }
+                    )
+                task["updatedAt"] = utc_now()
+                validate_tasks_record(record)
+                atomic_write_json(run_directory / "tasks.json", record)
+                return reservations
 
     def finish_task(
         self,
@@ -1476,8 +1982,7 @@ class StateStore:
         run_directory = self.run_dir(run_id)
         with repository_lock(self.root, timeout=self.lock_timeout):
             with run_lock(run_directory, timeout=self.lock_timeout):
-                run = self.load_run(run_id)
-                record = self.load_tasks(run_id)
+                run, record = self.load_state(run_id)
                 matches = [item for item in record["tasks"] if item["id"] == task_id]
                 if len(matches) != 1:
                     raise StateInconsistencyError(f"unknown or duplicate task ID: {task_id}")
@@ -1499,6 +2004,24 @@ class StateStore:
                     interface_ledger_append, str
                 ):
                     raise StateInconsistencyError("interface ledger update must be text")
+                before_run = deepcopy(run)
+                before_record = deepcopy(record)
+                ledger_path = run_directory / "interfaces.md"
+                self._validate_private_path(ledger_path, directory=False)
+                before_interfaces = ledger_path.read_text(encoding="utf-8")
+                after_interfaces = before_interfaces
+                if interface_ledger_append:
+                    separator = (
+                        ""
+                        if not before_interfaces
+                        or before_interfaces.endswith("\n")
+                        else "\n"
+                    )
+                    after_interfaces = (
+                        before_interfaces
+                        + separator
+                        + interface_ledger_append
+                    )
                 timestamp = utc_now()
                 task["status"] = TaskStatus.COMPLETE.value
                 task["updatedAt"] = timestamp
@@ -1512,17 +2035,18 @@ class StateStore:
                 run["updatedAt"] = timestamp
                 validate_tasks_record(record)
                 validate_run_record(run)
-                if interface_ledger_append:
-                    ledger_path = run_directory / "interfaces.md"
-                    self._validate_private_path(ledger_path, directory=False)
-                    existing = ledger_path.read_text(encoding="utf-8")
-                    separator = "" if not existing or existing.endswith("\n") else "\n"
-                    atomic_write_text(
-                        ledger_path,
-                        existing + separator + interface_ledger_append,
-                    )
-                atomic_write_json(run_directory / "tasks.json", record)
-                atomic_write_json(run_directory / "run.json", run)
+                self._commit_state_transaction_locked(
+                    run_id,
+                    operation="finish_task",
+                    task_id=task_id,
+                    provider=None,
+                    before_run=before_run,
+                    before_tasks=before_record,
+                    after_run=run,
+                    after_tasks=record,
+                    before_interfaces=before_interfaces,
+                    after_interfaces=after_interfaces,
+                )
                 return task, run
 
     def validate_resume(
@@ -1542,8 +2066,7 @@ class StateStore:
         run_directory = self.run_dir(run_id)
         with repository_lock(self.root, timeout=self.lock_timeout):
             with run_lock(run_directory, timeout=self.lock_timeout):
-                run = self.load_run(run_id)
-                tasks = self.load_tasks(run_id)
+                run, tasks = self.load_state(run_id)
                 if run["mode"] != RunMode.BUILD.value or run["status"] not in {
                     RunStatus.ACTIVE.value,
                     RunStatus.BLOCKED.value,

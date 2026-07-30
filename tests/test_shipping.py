@@ -8,11 +8,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from unittest.mock import patch
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = PACKAGE_ROOT / "skills" / "crossforge" / "scripts"
@@ -43,6 +45,8 @@ from crossforge_lib.shipping import (  # noqa: E402
     record_shipment,
     ship_preflight,
 )
+import crossforge_lib.shipping as shipping_module  # noqa: E402
+from crossforge_lib.locking import LockHeldError  # noqa: E402
 from crossforge_lib.util import canonical_json_bytes  # noqa: E402
 
 RUN_ID = "20260724T120000Z-1234abcd"
@@ -75,6 +79,9 @@ class FakeStore:
         self.assert_run(run_id)
         return {"schemaVersion": 1, "tasks": [dict(item) for item in self._tasks["tasks"]]}
 
+    def load_state(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.load_run(run_id), self.load_tasks(run_id)
+
     def latest_complete_run_id(self) -> str:
         return RUN_ID
 
@@ -83,6 +90,9 @@ class FakeStore:
         self.mark_calls += 1
         self._run["status"] = "shipped"
         return dict(self._run)
+
+    def mark_shipped_in_transaction(self, run_id: str) -> dict[str, Any]:
+        return self.mark_shipped(run_id)
 
 
 class FakeRemote:
@@ -1055,6 +1065,133 @@ class ShippingTests(unittest.TestCase):
                 final_gate=lambda _run: forged,
                 inspect_remote=self.remote.inspect,
             )
+
+    def test_record_shipment_lock_wrapper_is_exclusive(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
+        outcomes: list[object] = []
+
+        def blocked_record(*args: object, **kwargs: object) -> dict[str, str]:
+            calls.append("entered")
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("test did not release shipment recorder")
+            return {"status": "recorded"}
+
+        def first_call() -> None:
+            try:
+                outcomes.append(
+                    record_shipment(
+                        self.store,  # type: ignore[arg-type]
+                        self.repository,
+                        run_id=RUN_ID,
+                        inspect_remote=self.remote.inspect,
+                        push_only=True,
+                        publication_requested=True,
+                        runner=self.remote.runner,
+                    )
+                )
+            except BaseException as exc:
+                outcomes.append(exc)
+
+        with patch.object(
+            shipping_module,
+            "_record_shipment_unlocked",
+            side_effect=blocked_record,
+        ):
+            worker = threading.Thread(target=first_call)
+            worker.start()
+            self.assertTrue(entered.wait(timeout=5))
+            with self.assertRaises(LockHeldError):
+                record_shipment(
+                    self.store,  # type: ignore[arg-type]
+                    self.repository,
+                    run_id=RUN_ID,
+                    inspect_remote=self.remote.inspect,
+                    push_only=True,
+                    publication_requested=True,
+                    runner=self.remote.runner,
+                )
+            self.assertEqual(["entered"], calls)
+            release.set()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual([{"status": "recorded"}], outcomes)
+            retry = record_shipment(
+                self.store,  # type: ignore[arg-type]
+                self.repository,
+                run_id=RUN_ID,
+                inspect_remote=self.remote.inspect,
+                push_only=True,
+                publication_requested=True,
+                runner=self.remote.runner,
+            )
+            self.assertEqual("recorded", retry["status"])
+            self.assertEqual(["entered", "entered"], calls)
+
+    def test_record_shipment_retry_finishes_run_after_transition_crash(self) -> None:
+        authorize_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            self._plan(),
+            idempotency_key=KEY,
+            publication_requested=True,
+        )
+        reconcile_push(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            publication_requested=True,
+            final_gate=self._gate_evidence,
+            push_only=True,
+            runner=self.remote.runner,
+        )
+        with patch.object(
+            self.store,
+            "mark_shipped_in_transaction",
+            side_effect=OSError("simulated transition crash"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated transition crash"):
+                record_shipment(
+                    self.store,  # type: ignore[arg-type]
+                    self.repository,
+                    run_id=RUN_ID,
+                    inspect_remote=self.remote.inspect,
+                    push_only=True,
+                    publication_requested=True,
+                    runner=self.remote.runner,
+                )
+
+        shipment_path = self.store.run_dir(RUN_ID) / "shipment.json"
+        interrupted = json.loads(shipment_path.read_text(encoding="utf-8"))
+        self.assertEqual("push_only_recorded", interrupted["status"])
+        self.assertEqual("complete", self.store._run["status"])
+
+        recovered = record_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            push_only=True,
+            publication_requested=True,
+            runner=self.remote.runner,
+        )
+        self.assertEqual("shipped", self.store._run["status"])
+        self.assertEqual(interrupted["completedAt"], recovered["completedAt"])
+        self.assertEqual(1, self.store.mark_calls)
+        repeated = record_shipment(
+            self.store,  # type: ignore[arg-type]
+            self.repository,
+            run_id=RUN_ID,
+            inspect_remote=self.remote.inspect,
+            push_only=True,
+            publication_requested=True,
+            runner=self.remote.runner,
+        )
+        self.assertEqual(recovered["completedAt"], repeated["completedAt"])
+        self.assertEqual(2, self.store.mark_calls)
 
 
 if __name__ == "__main__":
