@@ -37,7 +37,7 @@ The license notice for `fable-advisor` is reproduced below:
 ## Provenance boundary
 
 The `codex-build` name previously used as a design reference has no unique,
-verified source in the Crossforge specification. Crossforge 0.1.0 does not copy
+verified source in the Crossforge specification. Crossforge does not copy
 its code or closely reproduce its text, and no attribution is claimed for that
 name. Introducing material from a subsequently identified source requires a
 separate implementation decision and license review.

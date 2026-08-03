@@ -19,7 +19,7 @@ fixed lane.
   provider family for read-only review. Quality may race when gates provide a
   strong oracle.
 - **High risk:** consult the commitment advisor and use a local read-only
-  Claude plan critique. Release 0.1.0 does not call Codex or Grok in plan mode.
+  Claude plan critique. Release 0.1.1 does not call Codex or Grok in plan mode.
   During build execution, race only with objective comparison; otherwise use
   one implementation lane and the independently eligible review strategy
   recorded for the task.
@@ -39,7 +39,7 @@ that fact and do not claim family independence.
 
 External implementation, correction, and build-task review calls count. Local
 Claude advisors do not count as provider invocations. The serialized
-`planCritiqueLanes` compatibility field remains empty in 0.1.0 because no
+`planCritiqueLanes` compatibility field remains empty in 0.1.1 because no
 external plan transaction exists. Stop before the limit. This is a
 call/quality profile, not a monetary guarantee.
 

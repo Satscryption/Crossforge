@@ -175,7 +175,7 @@ from crossforge_lib.util import (
 from crossforge_lib.worktrees import WorktreeEntry, WorktreeManager
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 COMMANDS = (
     "version",
     "activate-boundary",

@@ -1,6 +1,6 @@
 ---
 name: crossforge
-description: Orchestrate Claude architecture with isolated Codex/xAI Grok build lanes, testing, evidence, and local task commits. Use for multi-model implementation, comparing build candidates, executing an approved multi-task plan, or resuming a Crossforge build. Version 0.1.0 plan and standalone review modes are local Claude workflows and do not claim cross-vendor independence. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
+description: Orchestrate Claude architecture with isolated Codex/xAI Grok build lanes, testing, evidence, and local task commits. Use for multi-model implementation, comparing build candidates, executing an approved multi-task plan, or resuming a Crossforge build. Version 0.1.1 plan and standalone review modes are local Claude workflows and do not claim cross-vendor independence. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
 compatibility: Requires Claude Code 2.1.216+, Python 3.11+, Git 2.39+, a supported local gate-sandbox backend, and at least one authenticated external provider CLI for cross-vendor execution.
 hooks:
   PreToolUse:
@@ -186,7 +186,7 @@ Read only the references required for the selected mode:
 5. Resolve the canonical repository identity and the discovered managed-policy
    hash from control-layer output.
 6. Stop at local checks in plan, standalone review, and status modes. Release
-   0.1.0 makes no external provider call in those modes.
+   0.1.1 makes no external provider call in those modes.
 7. Provider capability evidence is bound to an active build run. In build
    mode, complete the plan and `init-run` sequence before requesting `probe`
    consent or calling `record-capability`; never invent a placeholder run or
@@ -197,7 +197,7 @@ the control-layer candidate projection, then `prepare-consent` with that exact
 manifest. Show the returned operation class, context file count and total
 bytes, policy hashes, and expiry—never findings or contents—and stop for the
 user-only consent skill.
-Version 0.1.0 records `implement` or build-task `review` consent for external
+Version 0.1.1 records `implement` or build-task `review` consent for external
 lanes; `plan` and standalone `review` are local-only. A provider change,
 expanded operation, repository change, expiry, policy-hash change, or provider
 executable path/content change requires new consent.
@@ -210,7 +210,7 @@ executable path/content change requires new consent.
    structure; Claude owns semantic completeness, exact file scopes, risks,
    interfaces, `doneWhen`, and verification intent.
 3. For medium/high risk, use the read-only commitment advisor and local
-   independent-reviewer as appropriate. In 0.1.0, do not claim Codex/Grok or
+   independent-reviewer as appropriate. In 0.1.1, do not claim Codex/Grok or
    cross-vendor plan critique; dedicated durable non-build provider
    transactions are deferred.
 4. Resolve critiques yourself. Do not silently let a provider rewrite product
@@ -281,7 +281,7 @@ For each task:
    this decision. Stay within the selected budget's total provider-call limit.
 4. For high-risk tasks, use the read-only commitment advisor before execution.
    Perform plan critique locally. The compatibility `planCritiqueLanes` field
-   remains empty in 0.1.0; use only external build-task review lanes recorded
+   remains empty in 0.1.1; use only external build-task review lanes recorded
    by `route-task`. Claude subagents never supervise Codex or Grok lanes and
    never receive Bash for lane execution.
 5. Call `create-candidate` for each selected lane. Race lanes may run
@@ -362,7 +362,7 @@ State plainly that nothing was pushed.
 ## Review mode
 
 Use a disposable read-only review worktree with deny quarantine, context scan,
-and a sandbox that permits no edit tools. Version 0.1.0 uses the local
+and a sandbox that permits no edit tools. Version 0.1.1 uses the local
 independent-reviewer only and must not claim cross-vendor independence.
 Validate every reported finding against source and independent evidence and
 report only actionable findings. Do not fix, commit, or ship. Record a terminal

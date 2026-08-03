@@ -9,7 +9,7 @@
       "name": "crossforge",
       "source": "./",
       "description": "Claude architects while Codex and Grok build in isolated lanes; evidence decides.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "license": "MIT"
     }
   ]

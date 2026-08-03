@@ -14,7 +14,7 @@ Crossforge does not approve provider access or push during its normal
 model-invoked workflow. Provider consent and publishing are separate,
 user-invoked `crossforge-consent` and `crossforge-ship` operations.
 
-> Crossforge 0.1.0 is an alpha release. Its offline suite uses fake provider,
+> Crossforge 0.1.1 is an alpha release. Its offline suite uses fake provider,
 > sandbox, and forge executables. No real provider call or publication is made
 > by the default tests; complete the opt-in checks in
 > [Live testing](docs/LIVE_TESTING.md) before relying on it with valuable
@@ -123,6 +123,18 @@ names are:
 Bare aliases may appear when no installed skill collides with them; automation
 should use the canonical names.
 
+Claude Code caches explicitly versioned plugins. To upgrade an existing
+installation after pulling this repository, refresh the marketplace and then
+update Crossforge:
+
+```text
+claude plugin marketplace update crossforge
+claude plugin update crossforge@crossforge
+```
+
+Confirm that `claude plugin list` reports `0.1.1`; restart Claude Code or reload
+plugins if an older cached version remains active.
+
 Authenticate provider CLIs separately. Crossforge invokes their existing
 sessions and never reads, copies, or refreshes their tokens:
 
@@ -191,7 +203,7 @@ unrelated Claude Code turn.
 
 | Mode | Purpose |
 | --- | --- |
-| `plan` | Produce, validate, render, and hash a canonical structured plan; 0.1.0 uses local Claude critique only. |
+| `plan` | Produce, validate, render, and hash a canonical structured plan; 0.1.1 uses local Claude critique only. |
 | `build` | Execute an approved plan in isolated lanes and make local commits. |
 | `review` | Perform an evidence-backed local read-only review; cross-vendor standalone review is deferred. |
 | `resume` | Validate durable state and continue an interrupted build. |
@@ -214,7 +226,7 @@ Budgets are call/quality profiles, not spending guarantees:
 Provider installation or authentication is not consent. Crossforge requests
 repository-bound, provider-specific, expiring approval for operation classes:
 `probe`, `plan`, `review`, and `implement`. The `plan` value is reserved for a
-future transaction type: no 0.1.0 workflow requests or executes it.
+future transaction type: no 0.1.1 workflow requests or executes it.
 `review` applies only to an external review lane for an active build task;
 standalone review mode remains local.
 
@@ -252,7 +264,7 @@ sealed specification, hook, and hook settings after execution. It accepts
 neither an evidence file nor an executable override. Failed, skipped, forged,
 mutated, partial, or stale probe inputs leave the provider unavailable.
 Plan mode, standalone review, and status do not create this run-bound evidence
-or contact an external provider in 0.1.0.
+or contact an external provider in 0.1.1.
 
 ## Configuration
 
