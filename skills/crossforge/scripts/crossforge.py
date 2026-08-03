@@ -3,6 +3,17 @@
 
 from __future__ import annotations
 
+import sys
+
+
+if sys.version_info[:2] < (3, 11):
+    detected_python = ".".join(str(part) for part in sys.version_info[:2])
+    raise SystemExit(
+        f"Crossforge: Python 3.11 or newer is required (found Python "
+        f"{detected_python} at {sys.executable}). Put a 3.11+ interpreter "
+        "first on PATH, or invoke this script with one."
+    )
+
 import argparse
 import concurrent.futures
 import hashlib
@@ -14,7 +25,6 @@ import secrets as random_secrets
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, is_dataclass, replace

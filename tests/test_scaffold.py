@@ -249,12 +249,22 @@ class ScaffoldTests(unittest.TestCase):
         main_script = (
             PROJECT_ROOT / "skills/crossforge/scripts/crossforge.py"
         )
+        consent_script = (
+            PROJECT_ROOT
+            / "skills/crossforge-consent/scripts/crossforge_consent.py"
+        )
         shipping_script = (
             PROJECT_ROOT
             / "skills/crossforge-ship/scripts/crossforge_ship.py"
         )
         main_help = subprocess.run(
             [sys.executable, str(main_script), "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        consent_help = subprocess.run(
+            [sys.executable, str(consent_script), "--help"],
             check=True,
             capture_output=True,
             text=True,
@@ -274,6 +284,8 @@ class ScaffoldTests(unittest.TestCase):
             with self.subTest(command=shipping_command):
                 self.assertNotIn(shipping_command, main_help)
                 self.assertIn(shipping_command, shipping_help)
+        self.assertNotIn("record-consent", main_help)
+        self.assertIn("record-consent", consent_help)
 
         control_source = main_script.read_text(encoding="utf-8")
         self.assertIn(
@@ -289,6 +301,53 @@ class ScaffoldTests(unittest.TestCase):
             for path in root.rglob("*.py")
         )
         self.assertNotIn("CROSSFORGE_LIVE_TESTS", runtime_source)
+
+    def test_launchers_fail_clearly_on_unsupported_python(self) -> None:
+        launchers = (
+            PROJECT_ROOT / "skills/crossforge/scripts/crossforge.py",
+            PROJECT_ROOT
+            / "skills/crossforge-consent/scripts/crossforge_consent.py",
+            PROJECT_ROOT
+            / "skills/crossforge-ship/scripts/crossforge_ship.py",
+        )
+        simulated_unsupported_runtime = (
+            "import runpy, sys; "
+            "sys.version_info = (3, 9, 6, 'final', 0); "
+            "runpy.run_path(sys.argv[1], run_name='__main__')"
+        )
+        for launcher in launchers:
+            with self.subTest(launcher=launcher.relative_to(PROJECT_ROOT)):
+                launcher_source = launcher.read_text(encoding="utf-8")
+                package_import = (
+                    "from crossforge_lib"
+                    if launcher.name == "crossforge.py"
+                    else "from crossforge import"
+                )
+                self.assertLess(
+                    launcher_source.index("if sys.version_info"),
+                    launcher_source.index(package_import),
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        simulated_unsupported_runtime,
+                        str(launcher),
+                        "--help",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(1, result.returncode)
+                self.assertEqual("", result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn(
+                    "Python 3.11 or newer is required",
+                    result.stderr,
+                )
+                self.assertIn("found Python 3.9", result.stderr)
+                self.assertIn(str(Path(sys.executable)), result.stderr)
+                self.assertIn("first on PATH", result.stderr)
 
     def test_local_markdown_links_resolve(self) -> None:
         link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
