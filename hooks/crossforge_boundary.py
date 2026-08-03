@@ -48,6 +48,10 @@ SHIP_COMMANDS = frozenset(
 MAIN_READ_TOOLS = frozenset({"Read", "Grep", "Glob", "AskUserQuestion"})
 MAIN_FILE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
 MAIN_AGENT_TYPES = frozenset({"commitment-advisor", "independent-reviewer"})
+REVIEW_RECOVERY_MESSAGE = (
+    "Return the complete Crossforge review report now. Use the required "
+    "REVIEW_STATUS contract and do not end with a tool call."
+)
 FORBIDDEN_SHELL_SYNTAX = (
     "&&",
     "||",
@@ -213,6 +217,20 @@ def _main_non_bash(payload: dict[str, object], tool_name: str) -> int:
                 raise ValueError("Agent is missing subagent_type")
             if agent_type.rsplit(":", 1)[-1] not in MAIN_AGENT_TYPES:
                 raise ValueError("Agent type is outside the read-only allowlist")
+        except ValueError as error:
+            return deny(str(error))
+        return 0
+    if tool_name == "SendMessage":
+        try:
+            tool_input = _tool_input(payload)
+            recipient = tool_input.get("to")
+            message = tool_input.get("message")
+            if not isinstance(recipient, str) or not recipient.strip():
+                raise ValueError("SendMessage is missing its reviewer recipient")
+            if message != REVIEW_RECOVERY_MESSAGE:
+                raise ValueError(
+                    "SendMessage is limited to the fixed reviewer recovery request"
+                )
         except ValueError as error:
             return deny(str(error))
         return 0

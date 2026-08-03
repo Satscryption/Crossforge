@@ -301,19 +301,25 @@ For each task:
    Claude's `independent-reviewer` is read-only and only family-independent
    when the author is not Claude. Never claim independence when authorship is
    unknown.
-3. Exclude ineligible candidates before qualitative comparison.
-4. Compare eligible candidates using requirement completeness, correctness,
+3. Require the reviewer's final response to satisfy its `REVIEW_STATUS`
+   contract. If the agent invocation returns no compliant report, send exactly
+   `Return the complete Crossforge review report now. Use the required
+   REVIEW_STATUS contract and do not end with a tool call.` to that reviewer
+   once. If recovery still produces no compliant report, mark the review
+   blocked; never interpret missing output as approval.
+4. Exclude ineligible candidates before qualitative comparison.
+5. Compare eligible candidates using requirement completeness, correctness,
    tests, security, interface fidelity, repository conventions,
    maintainability, complexity, performance, and finally diff economy.
-5. Write the required `selection.md`; do not invent a numeric score. Call
+6. Write the required `selection.md`; do not invent a numeric score. Call
    `record-selection`, which requires the supplied report bytes, provider,
    base, and patch hash to match the selected candidate's `invoke` binding and
    independently reruns every durable task gate against that exact patch.
    Combining candidates requires a newly approved integration task.
-6. A correction brief names the exact failed command, sanitized relevant
+7. A correction brief names the exact failed command, sanitized relevant
    output, expected behavior, unchanged constraints, and current allowlist.
    Allow at most three attempts per provider.
-7. After three failures, block and report the impasse. Do not silently take
+8. After three failures, block and report the impasse. Do not silently take
    over. `check-micro-fix` returns only a caller-attested mechanical result,
    not verified evidence. A Claude micro-fix additionally requires independent
    inspection, a recorded recovery decision, and a caller-attested
