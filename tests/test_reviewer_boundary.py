@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,21 @@ RECOVERY_MESSAGE = (
 
 
 class ReviewerBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary_repository = tempfile.TemporaryDirectory()
+        self.repository = Path(self._temporary_repository.name) / "repository"
+        self.repository.mkdir()
+        subprocess.run(
+            ("git", "init", "-b", "main"),
+            cwd=self.repository,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+    def tearDown(self) -> None:
+        self._temporary_repository.cleanup()
+
     def _review(self, message: object) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             (sys.executable, str(HOOK)),
@@ -33,6 +49,30 @@ class ReviewerBoundaryTests(unittest.TestCase):
         )
 
     def _message(self, message: str) -> subprocess.CompletedProcess[str]:
+        activation = subprocess.run(
+            (sys.executable, str(BOUNDARY), "main"),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "permission_mode": "default",
+                    "tool_input": {
+                        "command": (
+                            'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/'
+                            'scripts/crossforge.py" activate-boundary '
+                            "--repository ."
+                        )
+                    },
+                    "cwd": str(self.repository),
+                    "session_id": "session-1",
+                    "prompt_id": "prompt-1",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, activation.returncode, activation.stderr)
         return subprocess.run(
             (sys.executable, str(BOUNDARY), "main"),
             input=json.dumps(
@@ -40,7 +80,9 @@ class ReviewerBoundaryTests(unittest.TestCase):
                     "tool_name": "SendMessage",
                     "permission_mode": "default",
                     "tool_input": {"to": "reviewer-1", "message": message},
-                    "cwd": str(PROJECT_ROOT),
+                    "cwd": str(self.repository),
+                    "session_id": "session-1",
+                    "prompt_id": "prompt-1",
                 }
             ),
             text=True,

@@ -181,6 +181,12 @@ skill invocation establishes the supported user-scoped boundary, but the
 Python publication and destination-override flags are caller-attested rather
 than proof of the original user prompt.
 
+The normal skill activates a private prompt lease before using its restricted
+tool surface. A durable run keeps that boundary active across prompts. With no
+active run, the lease is explicitly released on exit or automatically expires
+when a later prompt arrives, so an old skill invocation cannot lock down an
+unrelated Claude Code turn.
+
 ## Modes
 
 | Mode | Purpose |
@@ -456,6 +462,14 @@ Retry the same shipping request. Shipment authorization and remote/PR
 checkpoints are idempotent; Crossforge reads remote state before another
 write. Do not change remote, head, target, or commit under an existing
 authorization.
+
+### Ordinary tools are still restricted after Crossforge
+
+Run the canonical `release-boundary --repository .` control command if the
+current prompt stopped before normal cleanup. Release fails while a durable run
+is active; complete or explicitly abandon that run first. If there is no
+active run, the installed hook also discards the stale lease automatically on
+the next prompt.
 
 ## Development and verification
 

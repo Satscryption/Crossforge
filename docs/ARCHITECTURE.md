@@ -38,6 +38,14 @@ skill requires a fresh caller-attested publication-intent flag, an unexpired
 authorization, a completed build, a fresh final gate, a URL-bound remote, and
 remote readback.
 
+The normal hook's strict surface is bounded by an owner-private lease keyed by
+hashes of the host session and prompt IDs. `activate-boundary` establishes the
+lease before orchestration. An active durable-run pointer keeps enforcement
+strict even after the invoking prompt. Without that pointer, a different
+prompt expires the lease before evaluating the requested tool, while direct
+writes to durable Crossforge state and `consent.json` remain blocked. Explicit
+release is idempotent and is refused while a durable run remains active.
+
 ## Judgment and enforcement
 
 | Concern | Owner |

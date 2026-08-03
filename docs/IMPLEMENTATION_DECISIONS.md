@@ -308,6 +308,23 @@ their merged remediation PRs are indexed in
 manual live-smoke procedure. No 0.1.0 test or control command consumes it, and
 it never substitutes for provider consent or publication intent.
 
+### DEV-012: The normal tool boundary is prompt-leased
+
+The main skill's wildcard hook remains installed for deterministic coverage,
+but strict enforcement is no longer treated as an unbounded session property.
+The skill begins with `activate-boundary`, which causes the hook to atomically
+write an owner-private lease containing only SHA-256 hashes of the host session
+and prompt IDs. The CLI command itself is an acknowledgement; the hook owns the
+lease transition so a model cannot bypass it by calling another executable.
+
+An active durable-run pointer overrides prompt expiry and keeps the boundary
+strict. Otherwise, a different prompt ID removes the stale lease before the
+requested tool is evaluated. `release-boundary` is idempotent when no run is
+active and fails closed while the active pointer exists. Even while inactive,
+the hook continues to block direct file-tool writes to repository-common
+Crossforge state and any file named `consent.json`; all other tools return to
+the host's ordinary permission flow.
+
 ## Verification limitations
 
 - The default release suite uses fake provider, sandbox, and forge

@@ -178,6 +178,8 @@ from crossforge_lib.worktrees import WorktreeEntry, WorktreeManager
 VERSION = "0.1.0"
 COMMANDS = (
     "version",
+    "activate-boundary",
+    "release-boundary",
     "config",
     "preflight",
     "init-run",
@@ -1416,6 +1418,22 @@ def _trusted_gate_specification(
 
 def _cmd_version(_args: argparse.Namespace) -> CommandOutput:
     return CommandOutput(f"Crossforge {VERSION}", {"version": VERSION})
+
+
+def _cmd_activate_boundary(args: argparse.Namespace) -> CommandOutput:
+    repository = discover_repository(args.repository)
+    return CommandOutput(
+        "Crossforge boundary is active for this prompt",
+        {"repositoryRoot": str(repository.root), "active": True},
+    )
+
+
+def _cmd_release_boundary(args: argparse.Namespace) -> CommandOutput:
+    repository = discover_repository(args.repository)
+    return CommandOutput(
+        "Crossforge boundary release acknowledged",
+        {"repositoryRoot": str(repository.root), "active": False},
+    )
 
 
 def _cmd_config(args: argparse.Namespace) -> CommandOutput:
@@ -4469,6 +4487,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     command("version", "show the Crossforge version")
 
+    item = command("activate-boundary", "activate the prompt-scoped tool boundary")
+    _add_repository(item)
+
+    item = command("release-boundary", "release the prompt-scoped tool boundary")
+    _add_repository(item)
+
     item = command("config", "load, normalize, and validate configuration")
     item.add_argument("--user-config")
     item.add_argument("--project-config")
@@ -4666,6 +4690,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     handlers = {
         "version": _cmd_version,
+        "activate-boundary": _cmd_activate_boundary,
+        "release-boundary": _cmd_release_boundary,
         "config": _cmd_config,
         "preflight": _cmd_preflight,
         "init-run": _cmd_init_run,
