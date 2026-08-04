@@ -1,6 +1,6 @@
 {
   "name": "crossforge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude architects while Codex and Grok build in isolated lanes; exact scope, tests, evidence, and explicit shipping decide what lands.",
   "author": {
     "name": "Sadiq Jaffer"

@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RELEASE_VERSION = "0.1.0"
+RELEASE_VERSION = "0.1.1"
 
 
 def load_json(relative_path: str) -> dict[str, object]:
@@ -32,6 +32,22 @@ class ScaffoldTests(unittest.TestCase):
         self.assertEqual(RELEASE_VERSION, project["version"])
         self.assertEqual(">=3.11", project["requires-python"])
         self.assertEqual([], project["dependencies"])
+
+    def test_all_runtime_version_sources_match_release(self) -> None:
+        control = (
+            PROJECT_ROOT / "skills/crossforge/scripts/crossforge.py"
+        ).read_text(encoding="utf-8")
+        package = (
+            PROJECT_ROOT / "skills/crossforge/scripts/crossforge_lib/__init__.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f'VERSION = "{RELEASE_VERSION}"', control)
+        self.assertIn(f'__version__ = "{RELEASE_VERSION}"', package)
+        changelog = (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{RELEASE_VERSION}]", changelog)
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"Crossforge {RELEASE_VERSION} is an alpha release", readme)
+        self.assertIn("claude plugin marketplace update crossforge", readme)
+        self.assertIn("claude plugin update crossforge@crossforge", readme)
 
     def test_plugin_manifest_matches_release(self) -> None:
         plugin = load_json(".claude-plugin/plugin.json")
@@ -219,7 +235,7 @@ class ScaffoldTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            "No Crossforge 0.1.0 test or control command reads this variable",
+            "No Crossforge test or control command reads this variable",
             live_testing,
         )
         self.assertNotIn(

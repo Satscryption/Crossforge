@@ -15,6 +15,21 @@ HOOK = PROJECT_ROOT / "hooks" / "crossforge_boundary.py"
 
 
 class ShippingBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary_repository = tempfile.TemporaryDirectory()
+        self.repository = Path(self._temporary_repository.name) / "repository"
+        self.repository.mkdir()
+        subprocess.run(
+            ("git", "init", "-b", "main"),
+            cwd=self.repository,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+    def tearDown(self) -> None:
+        self._temporary_repository.cleanup()
+
     def _run(
         self,
         mode: str,
@@ -24,8 +39,11 @@ class ShippingBoundaryTests(unittest.TestCase):
         permission_mode: str = "default",
         tool_name: str = "Bash",
         tool_input: dict[str, object] | None = None,
-        cwd: Path = PROJECT_ROOT,
+        cwd: Path | None = None,
+        session_id: str = "session-1",
+        prompt_id: str = "prompt-1",
     ) -> subprocess.CompletedProcess[str]:
+        working_directory = cwd or self.repository
         return subprocess.run(
             (sys.executable, str(HOOK), mode),
             input=json.dumps(
@@ -37,7 +55,9 @@ class ShippingBoundaryTests(unittest.TestCase):
                         if tool_input is None
                         else tool_input
                     ),
-                    "cwd": str(cwd),
+                    "cwd": str(working_directory),
+                    "session_id": session_id,
+                    "prompt_id": prompt_id,
                 }
             ),
             text=True,
@@ -48,6 +68,15 @@ class ShippingBoundaryTests(unittest.TestCase):
         )
 
     def test_main_skill_allows_only_local_control_surface(self) -> None:
+        activate = (
+            'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/scripts/'
+            'crossforge.py" activate-boundary --repository .'
+        )
+        release = (
+            'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/scripts/'
+            'crossforge.py" release-boundary --repository .'
+        )
+        self.assertEqual(0, self._run("main", activate).returncode)
         local = (
             'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/scripts/'
             'crossforge.py" status --repository .'
@@ -59,12 +88,12 @@ class ShippingBoundaryTests(unittest.TestCase):
                 "main",
                 "",
                 tool_name="Write",
-                tool_input={"file_path": str(PROJECT_ROOT / "selection.md")},
+                tool_input={"file_path": str(self.repository / "selection.md")},
             ).returncode,
         )
         common = subprocess.run(
             ("git", "rev-parse", "--path-format=absolute", "--git-common-dir"),
-            cwd=PROJECT_ROOT,
+            cwd=self.repository,
             text=True,
             stdout=subprocess.PIPE,
             check=True,
@@ -75,8 +104,8 @@ class ShippingBoundaryTests(unittest.TestCase):
             Path(common).with_name(Path(common).name.upper())
             / "crossforge"
             / "run.json",
-            PROJECT_ROOT / "consent.json",
-            PROJECT_ROOT / "Consent.JSON",
+            self.repository / "consent.json",
+            self.repository / "Consent.JSON",
         ):
             self.assertEqual(
                 2,
@@ -159,6 +188,77 @@ class ShippingBoundaryTests(unittest.TestCase):
                 "main",
                 f"/tmp/python3 {PROJECT_ROOT}/skills/crossforge/scripts/"
                 "crossforge.py status",
+            ).returncode,
+        )
+        self.assertEqual(0, self._run("main", release).returncode)
+
+    def test_main_boundary_stands_down_on_a_later_prompt(self) -> None:
+        activate = (
+            'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/scripts/'
+            'crossforge.py" activate-boundary --repository .'
+        )
+        self.assertEqual(0, self._run("main", activate).returncode)
+        leases = list(
+            (self.repository / ".git" / "crossforge" / "boundary-leases").glob(
+                "*.json"
+            )
+        )
+        self.assertEqual(1, len(leases))
+        self.assertEqual(0, leases[0].stat().st_mode & 0o077)
+        lease_text = leases[0].read_text(encoding="utf-8")
+        self.assertNotIn("session-1", lease_text)
+        self.assertNotIn("prompt-1", lease_text)
+        self.assertEqual(2, self._run("main", "git diff").returncode)
+        later = self._run("main", "git diff", prompt_id="prompt-2")
+        self.assertEqual(0, later.returncode, later.stderr)
+        lease_root = self.repository / ".git" / "crossforge" / "boundary-leases"
+        self.assertEqual([], list(lease_root.glob("*.json")))
+
+    def test_release_is_explicit_and_active_runs_remain_strict(self) -> None:
+        activate = (
+            'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/scripts/'
+            'crossforge.py" activate-boundary --repository .'
+        )
+        release = (
+            'python3 "${CLAUDE_PLUGIN_ROOT}/skills/crossforge/scripts/'
+            'crossforge.py" release-boundary --repository .'
+        )
+        self.assertEqual(0, self._run("main", activate).returncode)
+        active = self.repository / ".git" / "crossforge" / "active"
+        active.write_text("run-id\n", encoding="utf-8")
+        self.assertEqual(
+            2,
+            self._run("main", release, prompt_id="prompt-2").returncode,
+        )
+        self.assertEqual(
+            2,
+            self._run("main", "git diff", prompt_id="prompt-2").returncode,
+        )
+        active.unlink()
+        self.assertEqual(
+            0,
+            self._run("main", release, prompt_id="prompt-2").returncode,
+        )
+
+    def test_inactive_boundary_still_protects_control_state(self) -> None:
+        protected = self.repository / ".git" / "crossforge" / "forged.json"
+        self.assertEqual(
+            2,
+            self._run(
+                "main",
+                "",
+                tool_name="Write",
+                tool_input={"file_path": str(protected)},
+            ).returncode,
+        )
+        self.assertEqual(0, self._run("main", "git diff").returncode)
+        self.assertEqual(
+            0,
+            self._run(
+                "main",
+                "",
+                tool_name="mcp__filesystem__write_file",
+                tool_input={"path": str(self.repository / "ordinary.txt")},
             ).returncode,
         )
 

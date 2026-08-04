@@ -196,6 +196,10 @@ files, binary artifacts, or unrelated source to a provider.
   consent request. Its fail-closed hook permits only known tools, blocks writes
   to durable Crossforge state or any `consent.json`, and allows only the two
   bundled read-only agent types.
+- Strict normal-skill enforcement is leased to the invoking prompt and remains
+  active whenever the repository has a durable active-run pointer. With no
+  active run, a later prompt removes the private hashed lease before allowing
+  ordinary tools. Explicit release is denied while an active pointer exists.
 - Only a directly user-invoked, non-model-invocable consent skill can record
   the request. It permits only the canonical consent transaction; its host
   hook recomputes live bindings and forces a user permission prompt containing
@@ -215,6 +219,12 @@ or sensitivity category. Consent presents file count and byte volume, and the
 user remains responsible for repository classification. An agent run outside
 the installed Crossforge skill hooks shares the user's operating-system
 identity and is outside this plugin-enforced approval boundary.
+
+**Residual risk:** Prompt leasing depends on the host supplying stable session
+and prompt identifiers to skill hooks. Missing identifiers fail closed when an
+active run exists and prevent explicit activation; without an active run or a
+valid lease, the hook preserves durable-state protections but leaves ordinary
+tool authorization to Claude Code's normal permission system.
 
 ### Repository-controlled policy weakening
 

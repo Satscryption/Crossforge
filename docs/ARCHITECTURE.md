@@ -38,6 +38,14 @@ skill requires a fresh caller-attested publication-intent flag, an unexpired
 authorization, a completed build, a fresh final gate, a URL-bound remote, and
 remote readback.
 
+The normal hook's strict surface is bounded by an owner-private lease keyed by
+hashes of the host session and prompt IDs. `activate-boundary` establishes the
+lease before orchestration. An active durable-run pointer keeps enforcement
+strict even after the invoking prompt. Without that pointer, a different
+prompt expires the lease before evaluating the requested tool, while direct
+writes to durable Crossforge state and `consent.json` remain blocked. Explicit
+release is idempotent and is refused while a durable run remains active.
+
 ## Judgment and enforcement
 
 | Concern | Owner |
@@ -142,7 +150,7 @@ without source consent. Remote readiness calls do not.
 
 ### 2. Consent and capability
 
-Release 0.1.0 creates provider capability evidence only after `init-run`
+Release 0.1.1 creates provider capability evidence only after `init-run`
 establishes an active build, because the evidence path and its binding are
 run-scoped. Plan mode, standalone review, and status perform no external
 provider transaction.
@@ -151,7 +159,7 @@ The repository identity is the SHA-256 of the canonical repository root and a
 normalized, credential-free origin URL (or `<no-origin>`). A fixed,
 source-free readiness prompt requires `probe` consent. Source-bearing
 operations require consent for their exact provider and operation class.
-The schema-reserved `plan` operation is not prepared or invoked in 0.1.0.
+The schema-reserved `plan` operation is not prepared or invoked in 0.1.1.
 External `review` operations belong only to active build tasks; standalone
 review is local.
 
@@ -357,7 +365,7 @@ uses task risk/class, budget, and comparable repository-local history. Fixed
 strategies never fall back silently.
 
 High-risk planning uses the read-only commitment advisor and local Claude
-critique. Release 0.1.0 does not call Codex or Grok for plan-mode critique or
+critique. Release 0.1.1 does not call Codex or Grok for plan-mode critique or
 standalone review. During build work, Claude-family candidate review counts as
 independent only when a known different provider family authored the
 candidate. Unknown authorship is recorded rather than presented as

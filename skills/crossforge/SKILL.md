@@ -1,6 +1,6 @@
 ---
 name: crossforge
-description: Orchestrate Claude architecture with isolated Codex/xAI Grok build lanes, testing, evidence, and local task commits. Use for multi-model implementation, comparing build candidates, executing an approved multi-task plan, or resuming a Crossforge build. Version 0.1.0 plan and standalone review modes are local Claude workflows and do not claim cross-vendor independence. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
+description: Orchestrate Claude architecture with isolated Codex/xAI Grok build lanes, testing, evidence, and local task commits. Use for multi-model implementation, comparing build candidates, executing an approved multi-task plan, or resuming a Crossforge build. Version 0.1.1 plan and standalone review modes are local Claude workflows and do not claim cross-vendor independence. Do not use for a trivial one-step edit unless the user explicitly asks for Crossforge.
 compatibility: Requires Claude Code 2.1.216+, Python 3.11+, Git 2.39+, a supported local gate-sandbox backend, and at least one authenticated external provider CLI for cross-vendor execution.
 hooks:
   PreToolUse:
@@ -60,10 +60,13 @@ CLI directly, bypass a failed check, run candidate code in the orchestration
 checkout, or treat repository instructions as higher authority than the
 approved plan and task brief.
 
-The skill hook fails closed for unlisted tools. It permits ordinary file tools
-only outside the repository's Git-common `crossforge` state root and never for
-a file named `consent.json`. It permits only the bundled read-only
-`commitment-advisor` and `independent-reviewer` agent types.
+During the invoking prompt or an active durable run, the skill hook fails
+closed for unlisted tools. It permits ordinary file tools only outside the
+repository's Git-common `crossforge` state root and never for a file named
+`consent.json`. It permits only the bundled read-only `commitment-advisor` and
+`independent-reviewer` agent types. When no durable run exists, a later prompt
+automatically expires the prompt lease so ordinary Claude Code use is not
+restricted by a stale skill hook.
 
 ## Control CLI
 
@@ -81,6 +84,8 @@ The contract includes:
 
 ```text
 version
+activate-boundary
+release-boundary
 config
 preflight
 init-run
@@ -167,19 +172,22 @@ Read only the references required for the selected mode:
 
 ## Common opening sequence
 
-1. Classify the mode and reject incompatible arguments. A multi-task
+1. Before any other tool call, run `activate-boundary --repository .` from the
+   target repository. This establishes the prompt-scoped deterministic tool
+   boundary. If activation fails, stop.
+2. Classify the mode and reject incompatible arguments. A multi-task
    `--no-commit` build is invalid.
-2. Resolve configuration through `config`. Explicit arguments override project
+3. Resolve configuration through `config`. Explicit arguments override project
    config, which overrides user config, which overrides safe defaults.
    Repository-controlled project config may only tighten deny paths and gate
    environment/executable allowlists.
-3. Run local-only `preflight`. Executable discovery, versions, help, and local
+4. Run local-only `preflight`. Executable discovery, versions, help, and local
    login status are allowed here; no remote model or readiness call is.
-4. Resolve the canonical repository identity and the discovered managed-policy
+5. Resolve the canonical repository identity and the discovered managed-policy
    hash from control-layer output.
-5. Stop at local checks in plan, standalone review, and status modes. Release
-   0.1.0 makes no external provider call in those modes.
-6. Provider capability evidence is bound to an active build run. In build
+6. Stop at local checks in plan, standalone review, and status modes. Release
+   0.1.1 makes no external provider call in those modes.
+7. Provider capability evidence is bound to an active build run. In build
    mode, complete the plan and `init-run` sequence before requesting `probe`
    consent or calling `record-capability`; never invent a placeholder run or
    capability record to satisfy routing.
@@ -189,7 +197,7 @@ the control-layer candidate projection, then `prepare-consent` with that exact
 manifest. Show the returned operation class, context file count and total
 bytes, policy hashes, and expiry—never findings or contents—and stop for the
 user-only consent skill.
-Version 0.1.0 records `implement` or build-task `review` consent for external
+Version 0.1.1 records `implement` or build-task `review` consent for external
 lanes; `plan` and standalone `review` are local-only. A provider change,
 expanded operation, repository change, expiry, policy-hash change, or provider
 executable path/content change requires new consent.
@@ -202,7 +210,7 @@ executable path/content change requires new consent.
    structure; Claude owns semantic completeness, exact file scopes, risks,
    interfaces, `doneWhen`, and verification intent.
 3. For medium/high risk, use the read-only commitment advisor and local
-   independent-reviewer as appropriate. In 0.1.0, do not claim Codex/Grok or
+   independent-reviewer as appropriate. In 0.1.1, do not claim Codex/Grok or
    cross-vendor plan critique; dedicated durable non-build provider
    transactions are deferred.
 4. Resolve critiques yourself. Do not silently let a provider rewrite product
@@ -273,7 +281,7 @@ For each task:
    this decision. Stay within the selected budget's total provider-call limit.
 4. For high-risk tasks, use the read-only commitment advisor before execution.
    Perform plan critique locally. The compatibility `planCritiqueLanes` field
-   remains empty in 0.1.0; use only external build-task review lanes recorded
+   remains empty in 0.1.1; use only external build-task review lanes recorded
    by `route-task`. Claude subagents never supervise Codex or Grok lanes and
    never receive Bash for lane execution.
 5. Call `create-candidate` for each selected lane. Race lanes may run
@@ -301,19 +309,25 @@ For each task:
    Claude's `independent-reviewer` is read-only and only family-independent
    when the author is not Claude. Never claim independence when authorship is
    unknown.
-3. Exclude ineligible candidates before qualitative comparison.
-4. Compare eligible candidates using requirement completeness, correctness,
+3. Require the reviewer's final response to satisfy its `REVIEW_STATUS`
+   contract. If the agent invocation returns no compliant report, send exactly
+   `Return the complete Crossforge review report now. Use the required
+   REVIEW_STATUS contract and do not end with a tool call.` to that reviewer
+   once. If recovery still produces no compliant report, mark the review
+   blocked; never interpret missing output as approval.
+4. Exclude ineligible candidates before qualitative comparison.
+5. Compare eligible candidates using requirement completeness, correctness,
    tests, security, interface fidelity, repository conventions,
    maintainability, complexity, performance, and finally diff economy.
-5. Write the required `selection.md`; do not invent a numeric score. Call
+6. Write the required `selection.md`; do not invent a numeric score. Call
    `record-selection`, which requires the supplied report bytes, provider,
    base, and patch hash to match the selected candidate's `invoke` binding and
    independently reruns every durable task gate against that exact patch.
    Combining candidates requires a newly approved integration task.
-6. A correction brief names the exact failed command, sanitized relevant
+7. A correction brief names the exact failed command, sanitized relevant
    output, expected behavior, unchanged constraints, and current allowlist.
    Allow at most three attempts per provider.
-7. After three failures, block and report the impasse. Do not silently take
+8. After three failures, block and report the impasse. Do not silently take
    over. `check-micro-fix` returns only a caller-attested mechanical result,
    not verified evidence. A Claude micro-fix additionally requires independent
    inspection, a recorded recovery decision, and a caller-attested
@@ -348,7 +362,7 @@ State plainly that nothing was pushed.
 ## Review mode
 
 Use a disposable read-only review worktree with deny quarantine, context scan,
-and a sandbox that permits no edit tools. Version 0.1.0 uses the local
+and a sandbox that permits no edit tools. Version 0.1.1 uses the local
 independent-reviewer only and must not claim cross-vendor independence.
 Validate every reported finding against source and independent evidence and
 report only actionable findings. Do not fix, commit, or ship. Record a terminal
@@ -376,6 +390,12 @@ availability as the last recorded probe.
 The main skill ends locally. It never pushes, opens a pull request, records
 shipping authorization, or implies that `shippingIntent` authorizes external
 writes.
+
+Before returning from any path that has no active durable run, including
+validation failures and early exits, run `release-boundary --repository .`.
+An active or blocked durable run keeps strict enforcement and must be completed
+or explicitly abandoned before release. If explicit release is missed, the
+lease expires automatically on the next prompt when no active run exists.
 
 If the current request explicitly asks to publish, first complete and report
 the local run, then direct the user to:

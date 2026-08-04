@@ -12,7 +12,7 @@ Operators may set this marker while following the procedure:
 CROSSFORGE_LIVE_TESTS=1
 ```
 
-No Crossforge 0.1.0 test or control command reads this variable, so it is not a
+No Crossforge test or control command reads this variable, so it is not a
 technical gate and grants no authority. Provider consent through
 `/crossforge:crossforge-consent` and publication through
 `/crossforge:crossforge-ship` remain separate user-invoked surfaces.
@@ -215,7 +215,7 @@ provider’s own CLI.
 
 ## Current release evidence
 
-The 0.1.0 repository is delivered with offline fake-provider coverage. A real
+The 0.1.1 repository is delivered with offline fake-provider coverage. A real
 Codex/Grok live call is intentionally not part of the normal build or unit-test
 run. Record live results separately before promoting this alpha for sensitive
 production use.

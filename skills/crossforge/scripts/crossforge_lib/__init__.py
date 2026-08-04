@@ -3,4 +3,4 @@
 from .errors import CrossforgeError, ExitCode
 
 __all__ = ["CrossforgeError", "ExitCode"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"

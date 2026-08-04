@@ -386,7 +386,7 @@ def route_task(
             reason = "auto Codex cold-start default"
 
     primary = implementation[0]
-    # Kept in the serialized decision for schema compatibility. Release 0.1.0
+    # Kept in the serialized decision for schema compatibility. Release 0.1.1
     # performs plan critique locally and has no executable external plan lane.
     plan_critiques: tuple[str, ...] = ()
     commitment = request.risk is Risk.HIGH
